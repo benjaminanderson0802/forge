@@ -246,3 +246,63 @@ class R17SchemaTests(unittest.TestCase):
         self.assertTrue(_shape_ok({"files": []}, schema))
         self.assertFalse(_shape_ok({"summary": "missing files"}, schema))
         self.assertTrue(FakeAgent(lambda p, c: ('{"files":[]}', 1)).run("tests", Path("."), schema).ok)
+
+
+class R30StrictSchemaTests(unittest.TestCase):
+    def test_R30_optional_enum_accepts_null_without_mutating_input(self):
+        """R30: an optional enum permits null in both its type and its enum."""
+        import copy
+        from core.agents import strict_schema
+        schema = {"type": "object", "required": ["required_status"], "properties": {
+            "status": {"type": "string", "enum": ["ready", "blocked"]},
+            "required_status": {"type": "string", "enum": ["ready", "blocked"]}}}
+        before = copy.deepcopy(schema)
+        strict = strict_schema(schema)
+        optional = strict["properties"]["status"]
+        self.assertIn("null", optional["type"])
+        self.assertIn(None, optional["enum"])
+        self.assertEqual(set(optional["enum"]), {"ready", "blocked", None})
+        self.assertEqual(strict["properties"]["required_status"]["enum"], ["ready", "blocked"])
+        self.assertEqual(schema, before)
+
+    def test_R30_anyof_objects_are_converted_recursively(self):
+        """R30: anyOf object branches become strict, including nested array items."""
+        import copy
+        from core.agents import strict_schema
+        schema = {"anyOf": [{"type": "object", "properties": {
+            "rows": {"type": "array", "items": {"type": "object", "properties": {
+                "label": {"type": "string"}}}}}}, {"type": "null"}]}
+        before = copy.deepcopy(schema)
+        strict = strict_schema(schema)
+        branch = strict["anyOf"][0]
+        self.assertIs(branch.get("additionalProperties"), False)
+        self.assertEqual(branch["required"], ["rows"])
+        self.assertIn("null", branch["properties"]["rows"]["type"])
+        item = branch["properties"]["rows"]["items"]
+        self.assertIs(item.get("additionalProperties"), False)
+        self.assertEqual(item["required"], ["label"])
+        self.assertIn("null", item["properties"]["label"]["type"])
+        self.assertEqual(schema, before)
+
+    def test_R30_defs_and_definitions_are_converted_recursively(self):
+        """R30: both definition containers recursively convert objects and enums."""
+        import copy
+        from core.agents import strict_schema
+        for container in ("$defs", "definitions"):
+            with self.subTest(container=container):
+                schema = {container: {"Choice": {"type": "object", "properties": {
+                    "status": {"type": "string", "enum": ["ok"]},
+                    "child": {"anyOf": [{"type": "object", "properties": {
+                        "value": {"type": "integer"}}}, {"type": "null"}]}}}},
+                    "$ref": f"#/{container}/Choice"}
+                before = copy.deepcopy(schema)
+                strict = strict_schema(schema)
+                choice = strict[container]["Choice"]
+                self.assertIs(choice.get("additionalProperties"), False)
+                self.assertEqual(set(choice["required"]), {"status", "child"})
+                self.assertIn(None, choice["properties"]["status"]["enum"])
+                nested = choice["properties"]["child"]["anyOf"][0]
+                self.assertIs(nested.get("additionalProperties"), False)
+                self.assertEqual(nested["required"], ["value"])
+                self.assertEqual(strict["$ref"], schema["$ref"])
+                self.assertEqual(schema, before)
