@@ -1,0 +1,696 @@
+"""Bootstrap conductor: runs a queue of tasks through the D-025 team with no human relay.
+
+Spec: docs/specs/bootstrap-conductor.md. Plain code only; AI is reached solely through
+the Team's agents (core.agents interface). Ben is reached only by email.
+
+    python -m core.bootstrap init --layer layer-1 --tasks tasks.json
+    python -m core.bootstrap run
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+from core.ledger import Ledger, Rejected
+from core.usage import Meter
+
+ROLES = {"ci": "ci", "forge-manager": "manager", "forge-executor": "executor",
+         "forge-auditor": "auditor", "forge-core": "core", "benjamin": "human"}
+NOWIN = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+TASK_FIELDS = ("id", "title", "section", "files_in_scope", "test_files", "test_cmd")
+
+S_TESTS = {"required": ["files"]}
+S_BUILD = {"required": ["status"]}
+S_REVIEW = {"required": ["verdict", "reasons"]}
+S_TROUBLE = {"required": ["kind", "notes"]}
+S_DRIFT = {"required": ["status"]}
+S_PLAN = {"required": ["tasks"]}
+
+
+@dataclass
+class Team:
+    test_writer: object
+    builder: object
+    reviewer: object
+    troubleshooter: object
+    drift_keeper: object
+    planner: object
+
+
+def _git(cwd: Path, *args: str, check: bool = True) -> str:
+    p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", stdin=subprocess.DEVNULL, **NOWIN)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {p.stderr.strip()}")
+    return p.stdout.strip()
+
+
+def _norm(p: str) -> str:
+    p = p.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+class Conductor:
+    def __init__(self, repo: Path, work: Path, state: Path, team: Team, limits: dict, *,
+                 owner_email: str, mailer: Callable[[str, str], None], inbox: Callable[[], list[dict]],
+                 gh: Callable[[list[str]], tuple[int, str]], clock: Callable[[], datetime] | None = None,
+                 judge_cmds: list[str] | None = None, push: bool = True):
+        self.repo, self.work, self.state = Path(repo), Path(work), Path(state)
+        self.team, self.limits = team, limits
+        self.owner = owner_email.strip().lower()
+        self.mailer, self.inbox, self.gh = mailer, inbox, gh
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.judge_cmds = list(judge_cmds or [])
+        self.push = push
+        self.meter = Meter(self.state, clock=self.clock)
+        self.state.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------ files
+    def _read(self, name: str, default):
+        p = self.state / name
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return default
+
+    def _write(self, name: str, data) -> None:
+        p = self.state / name
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_bytes(json.dumps(data, indent=2, sort_keys=True).encode("utf-8"))
+        os.replace(tmp, p)
+
+    def _queue(self) -> dict:
+        return self._read("queue.json", {"layer": "", "tasks": []})
+
+    def _save_queue(self, q: dict) -> None:
+        self._write("queue.json", q)
+
+    @property
+    def wt(self) -> Path:
+        return self.work / self._queue()["layer"]
+
+    # ------------------------------------------------------------------ setup
+    def init_queue(self, layer: str, tasks: list[dict]) -> None:
+        (self.state / "roles.json").write_bytes(json.dumps(ROLES, indent=2).encode("utf-8"))
+        norm = [self._new_task(t) for t in tasks]
+        self._save_queue({"layer": layer, "tasks": norm})
+        self._ensure_worktree(layer)
+
+    @staticmethod
+    def _new_task(t: dict) -> dict:
+        t = dict(t)
+        t.setdefault("kind", "build")
+        t.setdefault("status", "todo")
+        t.setdefault("notes", [])
+        t.setdefault("fail_signatures", [])
+        t.setdefault("troubleshot", False)
+        t.setdefault("fails_since", 0)
+        t.setdefault("review_feedback", [])
+        t.setdefault("trouble_notes", [])
+        return t
+
+    def _ensure_worktree(self, layer: str) -> None:
+        wt = self.work / layer
+        if (wt / ".git").exists():
+            return
+        self.work.mkdir(parents=True, exist_ok=True)
+        branches = _git(self.repo, "branch", "--list", layer)
+        if branches:
+            _git(self.repo, "worktree", "add", str(wt), layer)
+        else:
+            _git(self.repo, "worktree", "add", "-b", layer, str(wt), "main")
+        _git(wt, "config", "user.name", "Forge")
+        _git(wt, "config", "user.email", "forge@localhost")
+
+    def _reset_wt(self) -> None:
+        _git(self.wt, "reset", "-q", "--hard")
+        _git(self.wt, "clean", "-q", "-fd")
+
+    def _changed(self) -> list[str]:
+        out = _git(self.wt, "status", "--porcelain", "-uall")
+        files = []
+        for line in out.splitlines():
+            path = line[3:]
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            files.append(_norm(path.strip('"')))
+        return sorted(set(files))
+
+    def _commit(self, paths: list[str], msg: str) -> str:
+        if paths:
+            _git(self.wt, "add", "-A", "--", *paths)
+        if not _git(self.wt, "diff", "--cached", "--name-only"):
+            return ""
+        _git(self.wt, "commit", "-q", "-m", msg)
+        return _git(self.wt, "rev-parse", "HEAD")
+
+    def _push(self) -> None:
+        if self.push:
+            _git(self.wt, "push", "-q", "-u", "origin", self._queue()["layer"], check=False)
+
+    # ------------------------------------------------------------------ agents
+    def _call(self, role: str, prompt: str, schema: dict | None):
+        agent = getattr(self.team, role)
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + role + "-" + uuid.uuid4().hex[:6]
+        d = self.state / "runs" / run_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "prompt.md").write_bytes(prompt.encode("utf-8"))
+        try:
+            r = agent.run(prompt, self.wt, schema)
+        except Exception as e:  # noqa: BLE001 - an agent crash is a failed result
+            from core.agents import AgentResult
+            r = AgentResult("", 0, False, repr(e), None, getattr(agent, "provider", "unknown"))
+        if r.tokens:
+            self.meter.add(r.provider or "unknown", r.tokens)
+        (d / "output.json").write_bytes(json.dumps({"ok": r.ok, "error": r.error, "text": r.text, "data": r.data,
+                                                    "tokens": r.tokens, "provider": r.provider},
+                                                   indent=2).encode("utf-8"))
+        return r
+
+    def _capped(self) -> bool:
+        providers = {getattr(getattr(self.team, f), "provider", None) for f in Team.__dataclass_fields__}
+        return any(p and self.meter.over(p, self.limits) for p in providers)
+
+    # ------------------------------------------------------------------ email
+    def _ask(self, kind: str, subject: str, body: str, **extra) -> str:
+        qs = self._read("questions.json", {})
+        qid = f"{kind}-{len(qs) + 1}"
+        qs[qid] = {"kind": kind, "status": "open", **extra}
+        self._write("questions.json", qs)
+        self.mailer(f"[Forge Q-{qid}] {subject}", body)
+        return qid
+
+    def _handle_inbox(self) -> None:
+        try:
+            messages = self.inbox() or []
+        except Exception:  # noqa: BLE001 - email trouble never stops the conductor
+            return
+        for m in messages:
+            sender = re.findall(r"[\w.+-]+@[\w.-]+", str(m.get("from", "")).lower())
+            if self.owner not in sender:
+                continue
+            subject, body = str(m.get("subject", "")), str(m.get("body", ""))
+            if re.search(r"\bstop\b", subject + " " + body, re.I):
+                (self.state / "KILL").write_text("stopped by owner email\n")
+            mq = re.search(r"\[Forge Q-([\w-]+)\]", subject)
+            if mq:
+                self._answer(mq.group(1), body)
+
+    def _answer(self, qid: str, body: str) -> None:
+        qs = self._read("questions.json", {})
+        q = qs.get(qid)
+        if not q or q.get("status") != "open":
+            return
+        reply = body.strip().splitlines()[0].strip() if body.strip() else ""
+        if q["kind"] == "gate":
+            first = reply.split()[0].lower().strip(".!,") if reply.split() else ""
+            if first not in {"y", "yes"}:
+                return
+            pr = str(q["pr"])
+            self.gh(["pr", "edit", pr, "--add-label", "human-approved"])
+            self.gh(["pr", "merge", pr, "--merge", "--delete-branch"])
+        elif q["kind"] == "blocked":
+            qd = self._queue()
+            for t in qd["tasks"]:
+                if t["id"] == q.get("task"):
+                    t["trouble_notes"].append(f"Ben: {body.strip()}")
+                    t["status"] = "tests_ok" if t.get("tests_commit") else "todo"
+                    t["fail_signatures"], t["fails_since"], t["troubleshot"] = [], 0, False
+                    t["test_rejects"] = 0
+                    t["plan_rejects"] = 0
+            self._save_queue(qd)
+        elif q["kind"] == "replan":
+            qd = self._queue()
+            qd.setdefault("notes", []).append(f"Ben: {body.strip()}")
+            self._save_queue(qd)
+            (self.state / "PAUSED").unlink(missing_ok=True)
+        q["status"] = "answered"
+        q["answer"] = body.strip()[:2000]
+        self._write("questions.json", qs)
+
+    # ------------------------------------------------------------------ main step
+    def step(self) -> str:
+        self._handle_inbox()
+        if (self.state / "KILL").exists():
+            return "killed"
+        if (self.state / "PAUSED").exists():
+            return "paused"
+        if self._capped():
+            return "capped"
+        q = self._queue()
+        if q.get("drift_due"):
+            q["drift_due"] = False
+            self._save_queue(q)
+            self._drift_check()
+            return "worked"
+        for t in q["tasks"]:
+            if t["status"] in ("todo", "tests_ok"):
+                self._ensure_worktree(q["layer"])
+                if t["kind"] == "plan":
+                    self._plan_stage(t["id"])
+                elif t["status"] == "todo":
+                    self._tests_stage(t["id"])
+                else:
+                    self._build_stage(t["id"])
+                return "worked"
+        tasks = q["tasks"]
+        qs = self._read("questions.json", {})
+        if tasks and all(t["status"] == "done" for t in tasks) and not any(v["kind"] == "gate" for v in qs.values()):
+            self._gate()
+            return "gate"
+        return "idle"
+
+    def run(self, max_steps: int | None = None, idle_sleep_s: int = 60) -> str:
+        n, status = 0, "idle"
+        while max_steps is None or n < max_steps:
+            status = self.step()
+            n += 1
+            if status == "killed":
+                return status
+            if status in ("idle", "paused", "capped", "gate"):
+                time.sleep(idle_sleep_s)
+        return status
+
+    # ------------------------------------------------------------------ helpers
+    def _update(self, tid: str, **changes) -> dict:
+        q = self._queue()
+        for t in q["tasks"]:
+            if t["id"] == tid:
+                t.update(changes)
+                self._save_queue(q)
+                return t
+        raise KeyError(tid)
+
+    def _task(self, tid: str) -> dict:
+        return next(t for t in self._queue()["tasks"] if t["id"] == tid)
+
+    def _block(self, tid: str, why: str) -> None:
+        t = self._update(tid, status="blocked")
+        self._ask("blocked", f"Task {tid} is blocked: {t['title']}",
+                  f"Task {tid} ({t['title']}) is blocked.\n\nWhy: {why}\n\nNotes:\n" +
+                  "\n".join(t.get("notes", [])[-10:] + t.get("trouble_notes", [])[-5:]) +
+                  "\n\nReply to this email with guidance and the task will be retried with it. "
+                  "Otherwise Forge continues with other work.", task=tid)
+
+    def _run_cmd(self, cmd: str) -> tuple[int, str]:
+        try:
+            p = subprocess.run(cmd, shell=True, cwd=str(self.wt), capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", stdin=subprocess.DEVNULL,
+                               timeout=int(self.limits.get("test_timeout_s", 600)), **NOWIN)
+            return p.returncode, (p.stdout or "") + (p.stderr or "")
+        except subprocess.TimeoutExpired:
+            return 124, f"command timed out: {cmd}"
+
+    def _task_prompt(self, t: dict) -> str:
+        return (f"TASK {t['id']}: {t['title']}\n\n{t.get('section', '')}\n\n"
+                f"Files you may change: {', '.join(t.get('files_in_scope', []))}\n"
+                f"Test files (read-only for builders): {', '.join(t.get('test_files', []))}\n"
+                f"Done means this passes: {t.get('test_cmd', '')}\n")
+
+    # ------------------------------------------------------------------ stage A: tests
+    def _tests_stage(self, tid: str) -> None:
+        t = self._task(tid)
+        self._reset_wt()
+        prompt = ("You are the TEST WRITER. Write only these files: " + ", ".join(t["test_files"]) +
+                  ". The tests must fail until the feature exists. Do not write any other file.\n\n" +
+                  self._task_prompt(t) + "\nAnswer with JSON: {\"files\": [...], \"summary\": \"...\"}")
+        r = self._call("test_writer", prompt, S_TESTS)
+        changed = self._changed()
+        reason = None
+        if not r.ok:
+            reason = f"tests rejected: test writer failed ({r.error})"
+        elif not changed:
+            reason = "tests rejected: no test files written"
+        elif any(f not in [_norm(x) for x in t["test_files"]] for f in changed):
+            reason = "tests rejected: wrote outside test_files: " + ", ".join(
+                f for f in changed if f not in [_norm(x) for x in t["test_files"]])
+        else:
+            code, _ = self._run_cmd(t["test_cmd"])
+            if code == 0:
+                reason = "tests rejected: weak (they pass before the feature exists)"
+        if reason:
+            self._reset_wt()
+            rejects = t.get("test_rejects", 0) + 1
+            self._update(tid, notes=t["notes"] + [reason], test_rejects=rejects)
+            if rejects >= 2:
+                self._block(tid, reason)
+            return
+        sha = self._commit(changed, f"{tid}: acceptance tests")
+        self._update(tid, status="tests_ok", tests_commit=sha, fails_since=0, fail_signatures=[])
+
+    # ------------------------------------------------------------------ stage B: build
+    def _ledger(self) -> Ledger:
+        return Ledger(self.state)
+
+    def _apply(self, pid: str, action: str, cid: str, ident: str, payload: dict | None = None) -> bool:
+        try:
+            self._ledger().apply({"proposal_id": pid, "action": action, "contract_id": cid,
+                                  "payload": payload or {}}, ident)
+            return True
+        except Rejected:
+            return False
+
+    def _dead_ends(self) -> list[str]:
+        p = self.state / "dead_ends.jsonl"
+        if not p.exists():
+            return []
+        return [ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+    def _build_stage(self, tid: str) -> None:
+        t = self._task(tid)
+        cid = t["id"]
+        led = self._ledger()
+        if cid not in led.contracts():
+            self._apply(f"create-{cid}", "create", cid, "forge-manager", {
+                "title": t["title"], "spec_ref": cid, "acceptance": t["test_cmd"],
+                "files_in_scope": list(t["files_in_scope"]), "max_attempts": 6, "token_budget": 10 ** 9})
+        c = self._ledger().contracts().get(cid, {})
+        if c.get("status") == "parked":
+            self._block(tid, "ledger parked the contract (attempt or budget limit)")
+            return
+        tag = f"{cid}-{uuid.uuid4().hex[:8]}"
+        self._apply(f"{tag}-claim", "claim", cid, "forge-executor")
+
+        self._reset_wt()
+        tests_commit = t["tests_commit"]
+
+        prompt = "You are the BUILDER. Make the tests pass by changing only the files you may change.\n\n" + \
+                 self._task_prompt(t)
+        if t.get("review_feedback"):
+            prompt += "\nREVIEW FEEDBACK:\n" + "\n".join(f"- {x}" for x in t["review_feedback"]) + "\n"
+        if t.get("trouble_notes"):
+            prompt += "\nTROUBLESHOOTER NOTES:\n" + "\n".join(t["trouble_notes"]) + "\n"
+        dead = self._dead_ends()
+        if dead:
+            prompt += "\nKNOWN DEAD ENDS:\n" + "\n".join(dead) + "\n"
+        prompt += "\nAnswer with JSON: {\"status\": \"done\" | \"blocked\", \"summary\": \"...\"}"
+        r = self._call("builder", prompt, S_BUILD)
+
+        tests = [_norm(x) for x in t["test_files"]]
+        changed = self._changed()
+        violations = [f for f in changed if f in tests]
+        if violations:
+            _git(self.wt, "checkout", "-q", "HEAD", "--", *violations)
+            _git(self.wt, "clean", "-q", "-f", "--", *violations)
+        changed = [f for f in changed if f not in tests]
+        out_of_scope = [f for f in changed if not any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])]
+
+        def fail(reason: str, sig: str, output: str = "", submitted: bool = False) -> None:
+            _git(self.wt, "reset", "-q", "--hard", tests_commit)
+            _git(self.wt, "clean", "-q", "-fd")
+            if submitted:
+                self._apply(f"{tag}-fail", "fail", cid, "forge-auditor")
+            else:
+                self._apply(f"{tag}-release", "release", cid, "forge-core")
+            if self._ledger().contracts().get(cid, {}).get("status") == "failed":
+                self._apply(f"{tag}-reopen", "reopen", cid, "forge-manager")
+            self._after_failure(tid, reason, sig, output)
+
+        if not r.ok:
+            return fail(f"builder output unusable: {r.error}", f"builder-error:{r.error}")
+        if (r.data or {}).get("status") == "blocked":
+            summary = (r.data or {}).get("summary") or (r.data or {}).get("blocker") or "no detail"
+            return fail(f"blocker: {summary}", f"blocker:{summary}")
+        if out_of_scope:
+            return fail("out of scope: " + ", ".join(out_of_scope), "out of scope: " + ",".join(out_of_scope))
+
+        sha = self._commit(changed, f"{cid}: {t['title']}") or _git(self.wt, "rev-parse", "HEAD")
+        self._apply(f"{tag}-report", "run_report", cid, "forge-core", {
+            "run_id": tag, "claim": (r.data or {}).get("status"), "commit": sha, "changed": changed,
+            "violations": violations, "out_of_scope": []})
+        self._apply(f"{tag}-submit", "submit", cid, "forge-executor", {"commit": sha})
+
+        for cmd in [t["test_cmd"], *self.judge_cmds]:
+            code, output = self._run_cmd(cmd)
+            if code != 0:
+                self._apply(f"{tag}-ci", "test_run", cid, "ci", {"run_id": f"{tag}-ci", "commit": sha, "passed": False})
+                tail = "\n".join(output.splitlines()[-20:])
+                # numbers (timings, line numbers, addresses) vary between identical failures; ignore them
+                sig = hashlib.sha256(re.sub(r"\d+", "N", tail).encode()).hexdigest()
+                return fail(f"judge failed: {cmd}", sig, tail, submitted=True)
+        self._apply(f"{tag}-ci", "test_run", cid, "ci", {"run_id": f"{tag}-ci", "commit": sha, "passed": True})
+
+        diff = _git(self.wt, "diff", f"{tests_commit}..{sha}")
+        rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this change against the task. "
+                                    "Reject shortcuts, bare-minimum work, drift from the task, and anything that "
+                                    "weakens tests.\n\n" + self._task_prompt(t) + "\nDIFF:\n" + diff[:60000] +
+                        "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW)
+        if not rv.ok:
+            return fail(f"reviewer output unusable: {rv.error}", f"reviewer-error:{rv.error}", submitted=True)
+        if (rv.data or {}).get("verdict") != "pass":
+            reasons = [str(x) for x in (rv.data or {}).get("reasons") or ["no reasons given"]]
+            self._update(tid, review_feedback=reasons)
+            return fail("review failed: " + "; ".join(reasons), "review:" + "|".join(reasons), submitted=True)
+
+        self._apply(f"{tag}-pass", "pass", cid, "forge-auditor", {"run_id": f"{tag}-ci"})
+        self._update(tid, status="done", done_commit=sha)
+        self._push()
+        q = self._queue()
+        q["drift_due"] = True  # the drift keeper runs as the next step, so it can be stopped like any agent
+        self._save_queue(q)
+
+    def _is_ancestor(self, sha: str) -> bool:
+        return subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], cwd=str(self.wt),
+                              capture_output=True, **NOWIN).returncode == 0
+
+    def _after_failure(self, tid: str, reason: str, sig: str, output: str) -> None:
+        t = self._task(tid)
+        sigs = t["fail_signatures"] + [sig]
+        fails = t.get("fails_since", 0) + 1
+        t = self._update(tid, fail_signatures=sigs, fails_since=fails, notes=t["notes"] + [reason])
+        zero_progress = len(sigs) >= 2 and sigs[-1] == sigs[-2]
+        if t.get("troubleshot"):
+            if fails >= 2:
+                self._block(tid, reason)
+            return
+        if zero_progress or fails >= 2:
+            self._troubleshoot(tid, reason, output)
+
+    def _troubleshoot(self, tid: str, reason: str, output: str) -> None:
+        t = self._task(tid)
+        self._reset_wt()
+        prompt = ("You are the TROUBLESHOOTER. The builder is stuck on this task. Diagnose the cause and give "
+                  "concrete notes the next builder attempt can follow. If this route is a dead end, say so and "
+                  "name the alternative.\n\n" + self._task_prompt(t) +
+                  "\nRECENT FAILURES:\n" + "\n".join(t["notes"][-6:]) +
+                  "\n\nLAST JUDGE OUTPUT:\n" + output[-4000:] +
+                  "\nAnswer with JSON: {\"kind\": \"fix\" | \"dead_end\", \"notes\": \"...\", \"alternative\": \"...\"}")
+        r = self._call("troubleshooter", prompt, S_TROUBLE)
+        self._reset_wt()
+        notes = t.get("trouble_notes", [])
+        if r.ok:
+            d = r.data or {}
+            notes = notes + [str(d.get("notes", ""))]
+            if d.get("kind") == "dead_end":
+                with (self.state / "dead_ends.jsonl").open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"task": tid, "notes": d.get("notes", ""),
+                                        "alternative": d.get("alternative", "")}) + "\n")
+        else:
+            notes = notes + [f"(troubleshooter failed: {r.error})"]
+        self._update(tid, trouble_notes=notes, troubleshot=True, fails_since=0)
+
+    # ------------------------------------------------------------------ drift
+    def _drift_check(self) -> None:
+        q = self._queue()
+        design = self.wt / "docs" / "specs" / "layer-1-design.md"
+        text = design.read_text(encoding="utf-8") if design.exists() else "(no design file)"
+        listing = "\n".join(f"- {t['id']} [{t['status']}] {t['title']}" for t in q["tasks"])
+        r = self._call("drift_keeper", "You are the DRIFT KEEPER (read-only). Is this work still on course for "
+                                       "the design? Say replan only if it is drifting.\n\nTASKS:\n" + listing +
+                       "\n\nDESIGN:\n" + text[:40000] +
+                       "\nAnswer with JSON: {\"status\": \"ok\" | \"replan\", \"reasons\": [...]}", S_DRIFT)
+        if r.ok and (r.data or {}).get("status") == "replan":
+            reasons = (r.data or {}).get("reasons") or []
+            if isinstance(reasons, str):
+                reasons = [reasons]
+            (self.state / "PAUSED").write_text("drift keeper asked for a re-plan\n")
+            self._ask("replan", "Forge paused: the drift keeper wants a re-plan",
+                      "Reasons:\n" + "\n".join(f"- {x}" for x in reasons) +
+                      "\n\nReply with guidance to resume.")
+
+    # ------------------------------------------------------------------ plan tasks
+    def _plan_stage(self, tid: str) -> None:
+        t = self._task(tid)
+        self._reset_wt()
+        plan_file = _norm(t["plan_file"])
+        r = self._call("planner", "You are the PLANNER. Write the implementation plan to " + plan_file +
+                       " (and no other file), then return its tasks.\n\n" + self._task_prompt(t) +
+                       "\nEach task needs: id, title, section, files_in_scope, test_files, test_cmd.\n"
+                       "Answer with JSON: {\"tasks\": [...]}", S_PLAN)
+        changed = self._changed()
+        tasks = (r.data or {}).get("tasks") if r.ok else None
+        reason = None
+        if not r.ok:
+            reason = f"plan rejected: planner failed ({r.error})"
+        elif any(f != plan_file for f in changed) or plan_file not in changed:
+            reason = "plan rejected: wrote outside plan_file" if any(f != plan_file for f in changed) \
+                else "plan rejected: plan file not written"
+        elif not isinstance(tasks, list) or not tasks or not all(
+                isinstance(x, dict) and all(k in x for k in TASK_FIELDS) for x in tasks):
+            reason = "plan rejected: tasks missing required fields"
+        else:
+            existing = {x["id"] for x in self._queue()["tasks"]}
+            if any(x["id"] in existing for x in tasks):
+                reason = "plan rejected: task ids clash with existing tasks"
+        if not reason:
+            plan_text = (self.wt / plan_file).read_text(encoding="utf-8")
+            rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this plan against the task and "
+                                        "design: complete, testable, no placeholders, no drift.\n\n" +
+                            self._task_prompt(t) + "\nPLAN:\n" + plan_text[:60000] + "\nTASKS JSON:\n" +
+                            json.dumps(tasks)[:20000] +
+                            "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW)
+            if not rv.ok or (rv.data or {}).get("verdict") != "pass":
+                reason = "plan review failed: " + "; ".join(str(x) for x in ((rv.data or {}).get("reasons") or [rv.error]))
+        if reason:
+            self._reset_wt()
+            rejects = t.get("plan_rejects", 0) + 1
+            self._update(tid, notes=t["notes"] + [reason], plan_rejects=rejects)
+            if rejects >= 2:
+                self._block(tid, reason)
+            return
+        self._commit([plan_file], f"{tid}: plan")
+        q = self._queue()
+        for x in q["tasks"]:
+            if x["id"] == tid:
+                x["status"] = "done"
+        for x in tasks:
+            nt = self._new_task({k: x[k] for k in TASK_FIELDS})
+            nt["kind"], nt["status"] = "build", "todo"
+            q["tasks"].append(nt)
+        self._save_queue(q)
+        self._push()
+
+    # ------------------------------------------------------------------ gate
+    def _gate(self) -> None:
+        q = self._queue()
+        self._push()
+        report = f"{q['layer']} finished its queue. Every task passed tests at its exact commit, the judges, and " \
+                 "an independent Codex review.\n\n" + \
+                 "\n".join(f"- {t['id']} [{t['status']}] {t['title']}" for t in q["tasks"])
+        code, out = self.gh(["pr", "create", "--base", "main", "--head", q["layer"],
+                             "--title", f"{q['layer']}: ready for approval", "--body", report])
+        m = re.search(r"/pull/(\d+)", out or "")
+        pr = m.group(1) if m else ""
+        self._ask("gate", f"{q['layer']} is ready: reply y to approve",
+                  report + f"\n\nPull request: {out.strip()}\n\nReply y to approve and merge into main.", pr=pr)
+
+
+# ---------------------------------------------------------------------- real I/O
+def gmail_mailer(owner: str) -> Callable[[str, str], None]:
+    def send(subject: str, body: str) -> None:
+        import keyring
+        import smtplib
+        from email.message import EmailMessage
+        pw = keyring.get_password("forge-gmail", owner)
+        msg = EmailMessage()
+        msg["From"], msg["To"], msg["Subject"] = owner, owner, subject
+        msg.set_content(body)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
+            s.login(owner, pw)
+            s.send_message(msg)
+    return send
+
+
+def gmail_inbox(owner: str, state: Path) -> Callable[[], list[dict]]:
+    def read() -> list[dict]:
+        import email
+        import imaplib
+        import keyring
+        from email.header import decode_header, make_header
+        pw = keyring.get_password("forge-gmail", owner)
+        out = []
+        m = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        try:
+            m.login(owner, pw)
+            m.select("INBOX")
+            _, data = m.search(None, '(UNSEEN SUBJECT "[Forge Q-")')
+            ids = data[0].split() if data and data[0] else []
+            _, data2 = m.search(None, '(UNSEEN FROM "%s" SUBJECT "STOP")' % owner)
+            ids += [i for i in (data2[0].split() if data2 and data2[0] else []) if i not in ids]
+            for i in ids:
+                _, raw = m.fetch(i, "(RFC822)")
+                msg = email.message_from_bytes(raw[0][1])
+                body = ""
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        body = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
+                        break
+                # keep only the new reply text, not the quoted original
+                body = re.split(r"\n\s*On .+wrote:\s*\n", body, maxsplit=1)[0]
+                out.append({"from": str(msg.get("From", "")), "subject": str(make_header(decode_header(msg.get("Subject", "")))),
+                            "body": body})
+                m.store(i, "+FLAGS", "\\Seen")
+        finally:
+            try:
+                m.logout()
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+    return read
+
+
+def gh_cli(repo: Path) -> Callable[[list[str]], tuple[int, str]]:
+    def run(args: list[str]) -> tuple[int, str]:
+        p = subprocess.run(["gh", *args], cwd=str(repo), capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", stdin=subprocess.DEVNULL, **NOWIN)
+        return p.returncode, p.stdout + p.stderr
+    return run
+
+
+def real_team(limits: dict) -> Team:
+    from core.agents import ClaudeAgent, CodexAgent
+    t = limits.get("agent_timeout_s", 1800)
+    return Team(test_writer=CodexAgent(t, sandbox="workspace-write"),
+                builder=ClaudeAgent(t, permission_mode="acceptEdits",
+                                    allowed_tools=["Read", "Edit", "Write", "Glob", "Grep", "Bash(python:*)"]),
+                reviewer=CodexAgent(t, sandbox="read-only"),
+                troubleshooter=ClaudeAgent(t, permission_mode="acceptEdits",
+                                           allowed_tools=["Read", "Edit", "Write", "Glob", "Grep", "Bash(python:*)",
+                                                          "WebSearch", "WebFetch"]),
+                drift_keeper=ClaudeAgent(t, permission_mode="plan", allowed_tools=["Read", "Glob", "Grep"]),
+                planner=ClaudeAgent(t, permission_mode="acceptEdits",
+                                    allowed_tools=["Read", "Edit", "Write", "Glob", "Grep"]))
+
+
+def main(argv: list[str]) -> int:
+    from core.agents import load_limits
+    forge = Path(__file__).resolve().parent.parent
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["init", "run", "step"])
+    ap.add_argument("--layer")
+    ap.add_argument("--tasks")
+    ap.add_argument("--owner", default="benjaminanderson0802@gmail.com")
+    ap.add_argument("--work", default=str(Path.home() / "Forge-work"))
+    a = ap.parse_args(argv)
+    limits = load_limits(forge)
+    state = forge / "state" / "bootstrap"
+    c = Conductor(forge, Path(a.work), state, real_team(limits), limits, owner_email=a.owner,
+                  mailer=gmail_mailer(a.owner), inbox=gmail_inbox(a.owner, state), gh=gh_cli(forge),
+                  judge_cmds=["python drills/run_drills.py", "python -m unittest discover -s tests/core"])
+    if a.cmd == "init":
+        c.init_queue(a.layer, json.loads(Path(a.tasks).read_text(encoding="utf-8")))
+        print("queue ready")
+        return 0
+    if a.cmd == "step":
+        print(c.step())
+        return 0
+    print(c.run())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
