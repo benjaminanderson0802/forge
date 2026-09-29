@@ -114,6 +114,41 @@ class BootstrapTests(Harness):
         runs = list((self.state / "runs").iterdir())
         self.assertTrue(runs)
         self.assertTrue(any((r / "prompt.md").exists() and (r / "output.json").exists() for r in runs))
+        self.assertFalse((self.state / "KILL").exists())
+        self.assertFalse(any("tamper" in s.lower() or "tamper" in b.lower() for s, b in self.mails))
+
+    def test_r14_builder_edit_to_earlier_run_artifact_kills_and_emails(self):
+        """R14: fingerprinting covers prior run artifacts under state/runs."""
+        earlier_run = []
+        def tamper(p, cwd):
+            self.assertTrue(earlier_run, "test-writer run must exist before builder starts")
+            (earlier_run[0] / "output.json").write_text("forged\n", encoding="utf-8")
+            (cwd / "feat.py").write_text("VALUE = 42\n")
+            return '{"status":"done"}', 1
+
+        c = self.init(agents={"test_writer": self.write_tests, "builder": tamper})
+        self.assertEqual(c.step(), "worked")
+        earlier_run.extend((self.state / "runs").iterdir())
+        self.assertTrue(earlier_run)
+        c.step()
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertTrue(any("tamper" in s.lower() or "tamper" in b.lower() for s, b in self.mails))
+        self.assertNotEqual(task["status"], "done")
+
+    def test_r14_builder_rewrite_of_meter_kills_and_emails(self):
+        """R14: fingerprinting covers state/meter.json."""
+        def tamper(p, cwd):
+            (self.state / "meter.json").write_text('{"claude":0,"codex":0}\n', encoding="utf-8")
+            (cwd / "feat.py").write_text("VALUE = 42\n")
+            return '{"status":"done"}', 1
+
+        c = self.advance_to_build(agents={"test_writer": self.write_tests, "builder": tamper})
+        c.step()
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertTrue(any("tamper" in s.lower() or "tamper" in b.lower() for s, b in self.mails))
+        self.assertNotEqual(task["status"], "done")
 
     def test_weak_tests_rejected_twice_then_blocked_and_emailed(self):
         """Spec: tests that already pass are weak; two rejected test attempts block and email."""
