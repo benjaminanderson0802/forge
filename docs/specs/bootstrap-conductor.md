@@ -153,3 +153,39 @@ A `kind == "plan"` task with status `todo`:
 - No agent is called when `KILL` or `PAUSED` exists, or when its provider is capped.
 - Every agent run writes `runs/<run-id>/prompt.md` and `output.json`.
 - Emails from anyone except `owner_email` never act.
+
+## Review round 1 amendments (Codex review, 2026-09-29; these override anything above)
+
+- **R1 Safe test commands.** A task's `test_cmd` must match `python -m unittest <path> [<path> ...]`, where every path is one of the task's `test_files` (unittest may be given as a module path with dots, or as a file path). It runs **without a shell** as `[sys.executable, "-m", "unittest", *paths]`. Plans or tasks with any other command are rejected at `init_queue` (raise `ValueError`) or at plan review (note `plan rejected: unsafe test_cmd`). Task fields are also validated:
+  - `id` matches `^[A-Za-z0-9_-]{1,40}$`
+  - `test_files` must be under `tests/`, end in `.py`, and contain no `..`
+  - `files_in_scope` must not contain `..` or absolute paths
+- **R2 Reply codes.** Every question gets a random `code` (8 URL-safe characters), stored in `questions.json`.
+  - **Subject format:** `[Forge Q-<qid> <code>] ...`
+  - **A reply counts only when** its subject contains both the qid and the code, and it comes from `owner_email`. A reply with the right qid but the wrong or missing code is ignored.
+  - **`STOP` keeps working without a code** (owner address only): a forged STOP can only halt Forge, which is safe.
+- **R3 Gate actions checked.**
+  - If `gh pr edit` or `gh pr merge` fails (non-zero exit), the gate question stays `open` and a new email reports the error.
+  - It becomes `answered` only after the merge succeeds.
+  - A failed `gh pr create` does not create a gate question; it emails the error and returns `"gate"` again on the next step.
+- **R4 Weak-test check needs a real failing run.** Tests are accepted only if the command:
+  - does not time out, and
+  - prints unittest's `Ran N test` line with N ≥ 1, and
+  - exits non-zero.
+
+  Otherwise they're rejected with a note starting `tests rejected: no real failing run`.
+- **R5 Focus rule, full.**
+  - **Troubleshooter rounds:** up to 3 per task. Round 1 runs as specified above (zero progress, or 2 failed attempts). After a round, 2 more failed attempts (or zero progress again) trigger the next round. The task is blocked only after round 3 is followed by 2 more failed attempts.
+  - **Builder blocker evidence:** a builder `blocked` answer must include `tried` (a list of at least 2 routes) and `error` (non-empty). Otherwise the attempt fails with the reason `blocker rejected: no evidence (easy out)`, and a line `{"task", "kind": "easy_out", ...}` is appended to `state/easy_outs.jsonl`.
+- **R6 Drift check must succeed.** If the drift keeper's result is unusable (`ok=False` or missing `status`), `drift_due` stays set and it is retried on the next step. After 3 unusable results a question (kind `replan`) is emailed and `PAUSED` is created. The gate never opens while `drift_due` is set.
+- **R7 Email failures.**
+  - If `mailer` raises, the question is saved with `"delivered": false`. Every step retries undelivered questions before anything else, and a question is `delivered: true` once sent.
+  - If `inbox()` raises, the error is appended to `state/errors.log` and the step continues.
+- **R8 Git errors.** If `git status` fails, the current stage fails as an attempt with the reason `git error`. It never counts as "no changes".
+- **R9 State tamper alarm.** Before every agent run, the conductor fingerprints (sha256) every file in `state/` except `runs/` and `meter.json`. If anything differs after the run, it:
+  - creates `KILL`
+  - appends to `errors.log`
+  - emails a question of kind `tamper` naming the changed files
+  - returns without recording the run's result
+
+  The conductor's own writes happen outside agent runs, so they never trigger it.
