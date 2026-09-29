@@ -1,4 +1,5 @@
 """Contract tests for the bootstrap conductor, driven entirely by local fakes."""
+import io
 import json
 import os
 import subprocess
@@ -580,6 +581,70 @@ if __name__ == "__main__":
 
 
 class R15BootstrapTests(Harness):
+    def test_R15_nonempty_lock_baseline_prevents_agent_launch(self):
+        """R15: a non-empty lock baseline fails the stage before launching the agent."""
+        calls = []
+
+        def writer(prompt, cwd):
+            calls.append((prompt, cwd))
+            return self.write_tests(prompt, cwd)
+
+        c = self.init(agents={"test_writer": writer})
+        status_before = json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"]
+        (self.state / "conductor.lock").write_bytes(b"x")
+        result = c.step()
+        self.assertFalse(calls, "a non-empty lock baseline must prevent agent launch")
+        self.assertEqual(result, "error")
+        self.assertIn("conductor.lock", (self.state / "errors.log").read_text(encoding="utf-8"))
+        self.assertFalse((self.state / "KILL").exists())
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertEqual(task["status"], status_before)
+
+    def test_R15_cli_step_respects_lock_and_closes_acquired_handle(self):
+        """R15: CLI step reports busy or holds an acquired lock and closes it afterwards."""
+        from core.bootstrap import acquire_lock, main
+
+        self.make_conductor()
+        real_init = Conductor.__init__
+
+        def redirected_init(conductor, repo, work, state, *args, **kwargs):
+            real_init(conductor, self.repo, self.work, self.state, *args, **kwargs)
+
+        for acquired in (False, True):
+            with self.subTest(acquired=acquired):
+                handle = acquire_lock(self.state)
+                self.assertIsNotNone(handle)
+                lock_states = []
+                stdout = io.StringIO()
+
+                def lock(state):
+                    lock_states.append(state)
+                    return handle if acquired else None
+
+                try:
+                    with (
+                        patch("core.agents.load_limits", return_value=self.c.limits),
+                        patch("core.bootstrap.real_team", return_value=self.team),
+                        patch("core.bootstrap.gmail_mailer", return_value=self.c.mailer),
+                        patch("core.bootstrap.gmail_inbox", return_value=self.c.inbox),
+                        patch("core.bootstrap.gh_cli", return_value=self.gh),
+                        patch.object(Conductor, "__init__", new=redirected_init),
+                        patch("core.bootstrap.acquire_lock", new=lock),
+                        patch.object(Conductor, "step", return_value="worked") as step,
+                        patch("sys.stdout", stdout),
+                    ):
+                        result = main(["step"])
+                    self.assertEqual(result, 0)
+                    if acquired:
+                        step.assert_called_once_with()
+                        self.assertTrue(handle.closed, "CLI step must close its acquired lock")
+                    else:
+                        step.assert_not_called()
+                        self.assertIn("busy", stdout.getvalue())
+                    self.assertEqual(len(lock_states), 1, "CLI step must acquire the conductor lock")
+                finally:
+                    handle.close()
+
     def test_R15_held_conductor_lock_allows_full_test_writer_step(self):
         """R15: the conductor's own OS lock must not break a test-writer step."""
         from core.bootstrap import acquire_lock
@@ -754,7 +819,8 @@ class R15BootstrapTests(Harness):
         self.assertEqual(replacement.st_size, original.st_size)
         self.assertEqual(replacement.st_atime_ns, original.st_atime_ns)
         self.assertEqual(replacement.st_mtime_ns, original.st_mtime_ns)
-        self.assertNotEqual(replacement.st_ino, original.st_ino)
+        if replacement.st_ino == original.st_ino:
+            self.skipTest("filesystem reused the inode; the empty replacement has an identical fingerprint")
         self.assertTrue((self.state / "KILL").exists())
         self.assertEqual(result, "killed")
         self.assertTrue(any("tamper" in subject.lower() and "conductor.lock" in body
