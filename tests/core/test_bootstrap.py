@@ -405,7 +405,7 @@ class BootstrapTests(Harness):
         self.assertTrue(any("unsafe test_cmd" in n for n in json.loads((self.state/"queue.json").read_text())["tasks"][0]["notes"]))
 
     def test_r2_reply_requires_qid_and_code_but_stop_does_not(self):
-        """R2: qid and code authenticate replies; owner STOP remains code-free."""
+        """R2: replies need qid/code, owner STOP does not; R21: KILL defers inbox processing."""
         c=self.init(agents={"test_writer":self.write_tests,"builder":self.build_feature})
         c.step(); c.step(); c.step(); c.step()
         qs=json.loads((self.state/"questions.json").read_text()); qid,q=next(iter(qs.items()))
@@ -421,7 +421,18 @@ class BootstrapTests(Harness):
             self.assertEqual(len(self.gh_calls),before)
         self.messages[:]=[{"from":"ben@example.com","subject":"STOP","body":""}]; c.step()
         self.assertTrue((self.state/"KILL").exists())
-        self.messages[:]=[{"from":"ben@example.com","subject":subject,"body":"yes"}]; c.step()
+        reply={"from":"ben@example.com","subject":subject,"body":"y"}
+        self.messages[:]=[reply]
+        before=len(self.mails)
+        with patch.object(c,"inbox",wraps=c.inbox) as inbox:
+            self.assertEqual(c.step(),"killed")
+            inbox.assert_not_called()
+            self.assertEqual(self.messages,[reply])
+            self.assertEqual(len(self.mails),before)
+            self.assertFalse(any(a[:2]==["pr","merge"] for a in self.gh_calls))
+            (self.state/"KILL").unlink()
+            c.step()
+            inbox.assert_called_once_with()
         self.assertTrue(any(a[:2]==["pr","merge"] for a in self.gh_calls))
 
     def test_r3_failed_merge_keeps_gate_open_and_emails_error(self):
