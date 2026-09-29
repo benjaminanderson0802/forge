@@ -232,6 +232,9 @@ class Conductor:
         d.mkdir(parents=True, exist_ok=True)
         (d / "prompt.md").write_bytes(prompt.encode("utf-8"))
         before = self._fingerprint()
+        unreadable = sorted(k for k, v in before.items() if v.startswith("unreadable:"))
+        if unreadable:  # R15: fail closed; a file we can't read can't be checked for tampering
+            raise RuntimeError("state file unreadable before agent run: " + ", ".join(unreadable))
         try:
             r = agent.run(prompt, self.wt, schema)
         except Exception as e:  # noqa: BLE001 - an agent crash is a failed result
@@ -263,13 +266,15 @@ class Conductor:
                 continue
             rel = f.relative_to(self.state).as_posix()
             st = f.stat()
-            if rel.startswith("runs/") or rel == LOCK_NAME:  # R15: the lock is unreadable to us on Windows
+            if rel == LOCK_NAME:  # R15: unreadable to us on Windows; kept empty, so identity is enough
+                fp[rel] = f"lock:{st.st_size}:{st.st_ino}:{st.st_mtime_ns}"
+            elif rel.startswith("runs/"):
                 fp[rel] = f"{st.st_size}:{st.st_mtime_ns}"
-                continue
-            try:
-                fp[rel] = hashlib.sha256(f.read_bytes()).hexdigest()
-            except OSError:  # R15: never skip; an unreadable file can't match its readable hash
-                fp[rel] = f"unreadable:{st.st_size}:{st.st_mtime_ns}"
+            else:
+                try:
+                    fp[rel] = hashlib.sha256(f.read_bytes()).hexdigest()
+                except OSError:  # R15: never skip; an unreadable file can't match any readable hash
+                    fp[rel] = f"unreadable:{st.st_size}:{st.st_mtime_ns}"
         return fp
 
     def _log(self, msg: str) -> None:
@@ -904,6 +909,8 @@ def acquire_lock(state: Path):
     except OSError:
         f.close()
         return None
+    f.truncate(0)  # R15: the lock file always holds zero bytes, so there is no content to hide
+    f.flush()
     return f
 
 
