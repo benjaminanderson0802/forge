@@ -140,3 +140,109 @@ class R16CodexSandboxTests(unittest.TestCase):
                 index = args.index(override)
                 self.assertGreater(index, 0)
                 self.assertEqual(args[index - 1], "-c")
+
+
+class R17SchemaTests(unittest.TestCase):
+    def assert_strict(self, original, strict):
+        if original.get("type") == "object":
+            self.assertIs(strict.get("additionalProperties"), False)
+            properties = original.get("properties", {})
+            self.assertEqual(set(strict["required"]), set(properties))
+            self.assertEqual(set(strict["properties"]), set(properties))
+            for key, child in properties.items():
+                converted = strict["properties"][key]
+                if key not in original.get("required", []):
+                    self.assertIsInstance(converted["type"], list)
+                    self.assertIn("null", converted["type"])
+                    types = child["type"] if isinstance(child["type"], list) else [child["type"]]
+                    self.assertTrue(set(types) <= set(converted["type"]))
+                self.assert_strict(child, converted)
+        if "items" in original:
+            self.assert_strict(original["items"], strict["items"])
+
+    def test_R17_all_conductor_schemas_are_objects(self):
+        """R17: all six role schemas define typed properties for their required keys."""
+        from core import bootstrap
+        for name in ("S_TESTS", "S_BUILD", "S_REVIEW", "S_TROUBLE", "S_DRIFT", "S_PLAN"):
+            with self.subTest(schema=name):
+                schema = getattr(bootstrap, name)
+                self.assertEqual(schema.get("type"), "object")
+                self.assertIsInstance(schema.get("properties"), dict)
+                self.assertTrue(set(schema["required"]) <= set(schema["properties"]))
+                for prop in schema["properties"].values():
+                    self.assertIn("type", prop)
+
+    def test_R17_strict_schema_recursive_and_nonmutating(self):
+        """R17: strict conversion covers optional objects and array items without mutation."""
+        import copy
+        from core import agents
+        schema = {"type": "object", "required": ["name"], "properties": {
+            "name": {"type": "string"},
+            "count": {"type": ["integer", "null"]},
+            "options": {"type": "object", "properties": {"enabled": {"type": "boolean"}}},
+            "rows": {"type": "array", "items": {"type": "object", "required": ["id"],
+                "properties": {"id": {"type": "integer"}, "label": {"type": "string"}}}}}}
+        before = copy.deepcopy(schema)
+        strict = agents.strict_schema(schema)
+        self.assertIsNot(strict, schema)
+        self.assertEqual(schema, before)
+        self.assert_strict(before, strict)
+        self.assertEqual(strict["properties"]["name"]["type"], "string")
+        strict["properties"]["rows"]["items"]["properties"]["id"]["type"] = "string"
+        self.assertEqual(schema, before)
+
+    def test_R17_strict_plan_schema(self):
+        """R17: S_PLAN has nested task objects and is recursively strict only in its copy."""
+        import copy
+        from core import agents, bootstrap
+        original = copy.deepcopy(bootstrap.S_PLAN)
+        strict = agents.strict_schema(bootstrap.S_PLAN)
+        self.assertIsNot(strict, bootstrap.S_PLAN)
+        self.assertEqual(bootstrap.S_PLAN, original)
+        self.assertEqual(original["properties"]["tasks"]["type"], "array")
+        self.assertEqual(original["properties"]["tasks"]["items"]["type"], "object")
+        self.assert_strict(original, strict)
+
+    def test_R17_codex_output_schema_file_is_strict(self):
+        """R17: the schema file consumed during Codex launch contains the strict form."""
+        import copy
+        from unittest.mock import patch
+        schema = {"type": "object", "required": ["files"], "properties": {
+            "files": {"type": "array", "items": {"type": "string"}},
+            "summary": {"type": "string"}}}
+        before = copy.deepcopy(schema)
+        captured = []
+
+        def fake_launch(args, cwd, stdin_text, timeout_s):
+            captured.append(json.loads(Path(args[args.index("--output-schema") + 1]).read_text(encoding="utf-8")))
+            Path(args[args.index("-o") + 1]).write_text('{"files":[],"summary":null}', encoding="utf-8")
+            return 0, json.dumps({"type": "turn.completed", "usage": {}}), ""
+
+        with patch("core.agents._resolve", return_value=["fake-codex"]), patch("core.agents.launch", side_effect=fake_launch):
+            result = CodexAgent().run("write tests", Path("."), schema)
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(schema, before)
+        self.assertEqual(len(captured), 1)
+        self.assert_strict(before, captured[0])
+
+    def test_R17_codex_nonzero_exit_preserves_event_message(self):
+        """R17: nonzero Codex exits expose turn.failed and error event messages."""
+        from unittest.mock import patch
+        message = "invalid_json_schema: schema must have type object"
+        for event in ({"type": "turn.failed", "error": {"message": message}},
+                      {"type": "error", "message": message}):
+            with self.subTest(event=event["type"]):
+                with patch("core.agents._resolve", return_value=["fake-codex"]), patch(
+                        "core.agents.launch", return_value=(1, json.dumps(event), "")):
+                    result = CodexAgent().run("write tests", Path("."))
+                self.assertFalse(result.ok)
+                self.assertIn(message, result.error)
+
+    def test_R17_shape_check_keeps_original_required_keys(self):
+        """R17: local shape checks accept omitted optional fields after strict conversion."""
+        from core.agents import _shape_ok
+        schema = {"type": "object", "required": ["files"], "properties": {
+            "files": {"type": "array", "items": {"type": "string"}}, "summary": {"type": "string"}}}
+        self.assertTrue(_shape_ok({"files": []}, schema))
+        self.assertFalse(_shape_ok({"summary": "missing files"}, schema))
+        self.assertTrue(FakeAgent(lambda p, c: ('{"files":[]}', 1)).run("tests", Path("."), schema).ok)
