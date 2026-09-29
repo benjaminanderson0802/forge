@@ -32,6 +32,29 @@ ROLES = {"ci": "ci", "forge-manager": "manager", "forge-executor": "executor",
 NOWIN = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 TASK_FIELDS = ("id", "title", "section", "files_in_scope", "test_files", "test_cmd")
 NOTE_CAP, NOTES_KEEP, BODY_CAP = 2000, 30, 20000  # R19
+SUBJECT_CAP, CLOSED_KEEP, SENT_IDS_KEEP = 300, 50, 500  # R26, R28
+
+
+def _prune_questions(qs: dict) -> dict:
+    """R28: keep every open question and the CLOSED_KEEP most recently closed ones."""
+    closed = [k for k, v in qs.items() if v.get("status") != "open"]
+    closed.sort(key=lambda k: (qs[k].get("closed_at", ""), list(qs).index(k)))
+    for k in closed[:-CLOSED_KEEP] if len(closed) > CLOSED_KEEP else []:
+        del qs[k]
+    return qs
+
+
+def is_stop(subject: str, cleaned_body: str) -> bool:
+    """R27: Ben wrote "stop": the whole subject (Re:/Fwd: removed), or the word "stop" in his new text unless it
+    is negated ("don't stop"). Quoted text is already gone. Over-stopping is the safe failure."""
+    subj = re.sub(r"^\s*((re|fwd?|aw)\s*:\s*)+", "", subject or "", flags=re.I).strip().strip(".!").lower()
+    if subj == "stop":
+        return True
+    for m in re.finditer(r"\bstop\b", cleaned_body or "", re.I):
+        before = [w.replace("\u2019", "'").strip(".,!") for w in cleaned_body[:m.start()].lower().split()[-2:]]
+        if not any(w in {"don't", "dont", "not", "never", "no"} for w in before):
+            return True
+    return False
 
 
 def clean_reply(body: str) -> str:
@@ -167,6 +190,8 @@ class Conductor:
         return self._read("queue.json", {"layer": "", "tasks": []})
 
     def _save_queue(self, q: dict) -> None:
+        if isinstance(q.get("notes"), list):  # R28
+            q["notes"] = [str(x)[:NOTE_CAP] for x in q["notes"]][-NOTES_KEEP:]
         for t in q.get("tasks", []):  # R19: nothing grows without bound
             for key in ("notes", "trouble_notes"):
                 if isinstance(t.get(key), list):
@@ -249,7 +274,7 @@ class Conductor:
             _git(self.wt, "push", "-q", "-u", "origin", self._queue()["layer"], check=False)
 
     # ------------------------------------------------------------------ agents
-    def _call(self, role: str, prompt: str, schema: dict | None):
+    def _call(self, role: str, prompt: str, schema: dict | None, cwd: Path | None = None):
         agent = getattr(self.team, role)
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + role + "-" + uuid.uuid4().hex[:6]
         d = self.state / "runs" / run_id
@@ -265,7 +290,7 @@ class Conductor:
         if not before.get(LOCK_NAME, "lock:0:").startswith("lock:0:"):  # R15: only an empty lock is trusted
             raise RuntimeError(f"state file {LOCK_NAME} is not empty before agent run")
         try:
-            r = agent.run(prompt, self.wt, schema)
+            r = agent.run(prompt, Path(cwd) if cwd else self.wt, schema)
         except Exception as e:  # noqa: BLE001 - an agent crash is a failed result
             from core.agents import AgentResult
             r = AgentResult("", 0, False, repr(e), None, getattr(agent, "provider", "unknown"))
@@ -280,7 +305,7 @@ class Conductor:
                 self._log(f"TAMPER during {role} run {run_id}: {changed}")
                 self._ask("tamper", f"Forge stopped: a {role} agent changed Forge's own state files",
                           "Files changed during the agent run:\n" + "\n".join(changed) +
-                          "\n\nForge is halted (KILL). Nothing from that run was recorded.")
+                          "\n\nForge is halted (KILL). Nothing from that run was recorded.", halt=True)
             except Exception:  # noqa: BLE001 - the halt stands even if the report can't be written
                 pass
             raise Tampered(", ".join(changed))
@@ -328,20 +353,33 @@ class Conductor:
         return any(p and self.meter.over(p, self.limits) for p in providers)
 
     # ------------------------------------------------------------------ email
-    def _ask(self, kind: str, subject: str, body: str, **extra) -> str:
+    def _ask(self, kind: str, subject: str, body: str, halt: bool = False, **extra) -> str:
         qs = self._read("questions.json", {})
-        qid = f"{kind}-{len(qs) + 1}"
+        seq = self._read("q_seq.json", {"n": len(qs)})
+        seq["n"] = int(seq.get("n", 0)) + 1
+        self._write("q_seq.json", seq)
+        qid = f"{kind}-{seq['n']}"
         code = secrets.token_urlsafe(6)[:8]
-        qs[qid] = {"kind": kind, "status": "open", "code": code, "subject": subject, "body": body,
-                   "delivered": False, **extra}
-        self._write("questions.json", qs)
-        self._deliver(qid)
+        qs[qid] = {"kind": kind, "status": "open", "code": code, "subject": str(subject)[:SUBJECT_CAP],
+                   "body": str(body)[:BODY_CAP], "delivered": False, **extra}  # R28
+        self._write("questions.json", _prune_questions(qs))
+        self._deliver(qid, halt=halt)
         return qid
 
-    def _send(self, subject: str, body: str) -> bool:
-        """R20: every email goes through here. Capped body; at most mail_per_hour / mail_per_day."""
+    def _send(self, subject: str, body: str, halt: bool = False) -> bool:
+        """R20/R24/R25: every email goes through here. Nothing but a halt alert while KILL is set; at most
+        mail_per_hour / mail_per_day attempts (counted before sending); each email gets a recorded Message-ID."""
+        if (self.state / "KILL").exists() and not halt:
+            return False
         now = self.clock()
-        log = self._read("mail_log.json", {"sent": [], "budget_logged": ""})
+        if halt:  # R24: at most one halt alert every 12 hours, throttled from the attempt
+            notes = self._read("notices.json", {})
+            last = notes.get("halt")
+            if last and (now - datetime.fromisoformat(last)).total_seconds() < 12 * 3600:
+                return False
+            notes["halt"] = now.isoformat()
+            self._write("notices.json", notes)
+        log = self._read("mail_log.json", {"sent": [], "budget_logged": "", "ids": []})
         sent = [x for x in log.get("sent", []) if (now - datetime.fromisoformat(x)).total_seconds() < 86400]
         hour = [x for x in sent if (now - datetime.fromisoformat(x)).total_seconds() < 3600]
         if len(hour) >= int(self.limits.get("mail_per_hour", 6)) or len(sent) >= int(self.limits.get("mail_per_day", 30)):
@@ -352,14 +390,29 @@ class Conductor:
             log["sent"] = sent
             self._write("mail_log.json", log)
             return False
+        from email.utils import make_msgid
+        mid = make_msgid(domain="forge.local")
+        log["sent"] = sent + [now.isoformat()]  # R25: the attempt counts even if SMTP fails part-way
+        log["ids"] = (list(log.get("ids", [])) + [mid])[-SENT_IDS_KEEP:]
+        self._write("mail_log.json", log)
         try:
-            self.mailer(subject, body[:BODY_CAP])
-        except Exception as e:  # noqa: BLE001 - retried later (R7)
+            if self._mailer_takes_id:
+                self.mailer(str(subject)[:SUBJECT_CAP], body[:BODY_CAP], message_id=mid)
+            else:
+                self.mailer(str(subject)[:SUBJECT_CAP], body[:BODY_CAP])
+        except Exception as e:  # noqa: BLE001 - retried later, within budget (R7, R25)
             self._log(f"mail failed: {subject[:120]}: {e!r}")
             return False
-        log["sent"] = sent + [now.isoformat()]
-        self._write("mail_log.json", log)
         return True
+
+    @property
+    def _mailer_takes_id(self) -> bool:
+        import inspect
+        try:
+            ps = inspect.signature(self.mailer).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(p.name == "message_id" or p.kind is inspect.Parameter.VAR_KEYWORD for p in ps)
 
     def _notice_once(self, key: str, subject: str, body: str, every_h: float = 12) -> bool:
         """R22: a notice goes out at most once per every_h hours, and never while KILL is set."""
@@ -370,16 +423,15 @@ class Conductor:
         last = notes.get(key)
         if last and (now - datetime.fromisoformat(last)).total_seconds() < every_h * 3600:
             return False
-        if not self._send(subject, body):
-            return False
-        notes[key] = now.isoformat()
+        notes[key] = now.isoformat()  # R25: throttled from the attempt, whatever SMTP does
         self._write("notices.json", notes)
-        return True
+        return self._send(subject, body)
 
-    def _deliver(self, qid: str) -> None:
+    def _deliver(self, qid: str, halt: bool = False) -> None:
         qs = self._read("questions.json", {})
         q = qs[qid]
-        if not self._send(f"[Forge Q-{qid} {q['code']}] {q['subject']}", q["body"]):
+        subject = f"[Forge Q-{qid} {q['code']}] {q['subject']}"
+        if not self._send(subject, q["body"], halt=halt):
             return
         qs = self._read("questions.json", {})
         qs[qid]["delivered"] = True
@@ -399,18 +451,20 @@ class Conductor:
         except Exception as e:  # noqa: BLE001 - email trouble never stops the conductor (R7)
             self._log(f"inbox read failed: {e!r}")
             return
+        own_ids = set(self._read("mail_log.json", {}).get("ids", []))
         for m in messages:
-            if m.get("outgoing"):  # R18: Forge's own mail is never an answer
-                continue
+            if m.get("outgoing") or (m.get("message_id") and str(m["message_id"]).strip() in own_ids):
+                continue  # R18/R26: Forge's own mail is never an answer
             sender = re.findall(r"[\w.+-]+@[\w.-]+", str(m.get("from", "")).lower())
             if self.owner not in sender:
                 continue
-            subject, body = str(m.get("subject", "")), str(m.get("body", ""))
-            if re.search(r"\bstop\b", subject + " " + body, re.I):
+            subject, body = str(m.get("subject", "")), clean_reply(str(m.get("body", "")))
+            if is_stop(subject, body):
                 (self.state / "KILL").write_text("stopped by owner email\n")
+                return  # R24: nothing after a STOP is processed
             mq = re.search(r"\[Forge Q-([\w-]+) ([\w-]{8})\]", subject)
             if mq:
-                self._answer(mq.group(1), clean_reply(body), mq.group(2))
+                self._answer(mq.group(1), body, mq.group(2))
 
     def _answer(self, qid: str, body: str, code: str) -> None:
         qs = self._read("questions.json", {})
@@ -442,12 +496,14 @@ class Conductor:
             self._save_queue(qd)
         elif q["kind"] == "replan":
             qd = self._queue()
-            qd.setdefault("notes", []).append(f"Ben: {body.strip()}")
+            qd["notes"] = ([str(x)[:NOTE_CAP] for x in qd.get("notes", [])] + [f"Ben: {body.strip()}"[:NOTE_CAP]])[-NOTES_KEEP:]
             self._save_queue(qd)
             (self.state / "PAUSED").unlink(missing_ok=True)
         q["status"] = "answered"
         q["answer"] = body.strip()[:2000]
-        self._write("questions.json", qs)
+        q["closed_seq"] = self._read("q_seq.json", {}).get("n", 0)
+        q["closed_at"] = self.clock().isoformat()
+        self._write("questions.json", _prune_questions(qs))
 
     # ------------------------------------------------------------------ main step
     def step(self) -> str:
@@ -890,8 +946,8 @@ class Conductor:
 
 
 # ---------------------------------------------------------------------- real I/O
-def gmail_mailer(owner: str) -> Callable[[str, str], None]:
-    def send(subject: str, body: str) -> None:
+def gmail_mailer(owner: str) -> Callable[..., None]:
+    def send(subject: str, body: str, message_id: str | None = None) -> None:
         import keyring
         import smtplib
         from email.message import EmailMessage
@@ -899,6 +955,8 @@ def gmail_mailer(owner: str) -> Callable[[str, str], None]:
         msg = EmailMessage()
         msg["From"], msg["To"], msg["Subject"] = owner, owner, subject
         msg["X-Forge-Outgoing"] = "1"  # R18: lets the inbox reader skip Forge's own mail
+        if message_id:
+            msg["Message-ID"] = message_id  # R26: recorded, so Forge also knows its own mail by id
         msg.set_content(body)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
             s.login(owner, pw)
@@ -906,42 +964,81 @@ def gmail_mailer(owner: str) -> Callable[[str, str], None]:
     return send
 
 
-def gmail_inbox(owner: str, state: Path) -> Callable[[], list[dict]]:
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def gmail_inbox(owner: str, state: Path, imap_factory: Callable | None = None,
+                clock: Callable[[], datetime] | None = None) -> Callable[[], list[dict]]:
+    """R26: peek-only reader. Never changes Ben's read flags; remembers handled Message-IDs in inbox_seen.json;
+    the first read only records what is already there."""
     def read() -> list[dict]:
         import email
         import imaplib
-        import keyring
         from email.header import decode_header, make_header
-        pw = keyring.get_password("forge-gmail", owner)
-        out = []
-        m = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        seen_path = Path(state) / "inbox_seen.json"
+        first = not seen_path.exists()
+        try:
+            seen = list(json.loads(seen_path.read_text(encoding="utf-8"))) if not first else []
+        except (OSError, ValueError):
+            seen = []
+        seen_set = set(seen)
+        if imap_factory is None:
+            import keyring
+            pw = keyring.get_password("forge-gmail", owner)
+            m = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        else:
+            pw = ""
+            m = imap_factory()
+        now = (clock or (lambda: datetime.now(timezone.utc)))()
+        since = now.fromordinal(now.toordinal() - 3)
+        day = f"{since.day:02d}-{_MONTHS[since.month - 1]}-{since.year}"
+        out: list[dict] = []
         try:
             m.login(owner, pw)
             m.select("INBOX")
-            _, data = m.search(None, '(UNSEEN SUBJECT "[Forge Q-")')
-            ids = data[0].split() if data and data[0] else []
-            _, data2 = m.search(None, '(UNSEEN FROM "%s" SUBJECT "STOP")' % owner)
-            ids += [i for i in (data2[0].split() if data2 and data2[0] else []) if i not in ids]
-            for i in ids:
-                _, raw = m.fetch(i, "(RFC822)")
-                msg = email.message_from_bytes(raw[0][1])
+            nums: list[bytes] = []
+            for crit in (f'(SINCE {day} SUBJECT "[Forge")', f'(SINCE {day} SUBJECT "STOP")'):
+                _, data = m.search(None, crit)
+                for n in (data[0].split() if data and data[0] else []):
+                    if n not in nums:
+                        nums.append(n)
+            for n in nums:
+                _, raw = m.fetch(n, "(BODY.PEEK[HEADER])")
+                head = email.message_from_bytes(_raw_bytes(raw))
+                mid = str(head.get("Message-ID", "")).strip() or "nomid:" + hashlib.sha256(
+                    _raw_bytes(raw)).hexdigest()[:24]
+                if mid in seen_set:
+                    continue
+                seen.append(mid)
+                seen_set.add(mid)
+                if first or str(head.get("X-Forge-Outgoing", "")).strip() == "1":
+                    continue
+                _, raw = m.fetch(n, "(BODY.PEEK[])")
+                msg = email.message_from_bytes(_raw_bytes(raw))
                 body = ""
                 for part in msg.walk():
                     if part.get_content_type() == "text/plain":
-                        body = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
+                        payload = part.get_payload(decode=True) or b""
+                        body = payload.decode(part.get_content_charset() or "utf-8", "replace")
                         break
-                # keep only the new reply text, not the quoted original
-                body = re.split(r"\n\s*On .+wrote:\s*\n", body, maxsplit=1)[0]
-                out.append({"from": str(msg.get("From", "")), "subject": str(make_header(decode_header(msg.get("Subject", "")))),
-                            "body": body, "outgoing": str(msg.get("X-Forge-Outgoing", "")).strip() == "1"})
-                m.store(i, "+FLAGS", "\\Seen")
+                out.append({"from": str(msg.get("From", "")),
+                            "subject": str(make_header(decode_header(msg.get("Subject", "")))),
+                            "body": body, "message_id": mid, "outgoing": False})
         finally:
             try:
                 m.logout()
             except Exception:  # noqa: BLE001
                 pass
+        seen_path.write_text(json.dumps(seen[-2000:]), encoding="utf-8")
         return out
     return read
+
+
+def _raw_bytes(fetched) -> bytes:
+    for part in fetched or []:
+        if isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray)):
+            return bytes(part[1])
+    return b""
 
 
 def gh_cli(repo: Path) -> Callable[[list[str]], tuple[int, str]]:
@@ -1000,22 +1097,46 @@ SMOKE_ROLES = {  # role: (schema, writes a file?, example answer)
 }
 
 
-def smoke(team: Team, workdir: Path) -> list[str]:
-    """R23: run every role once for real on a throwaway repo. Returns problems; empty means all passed."""
+def smoke(team: Team, workdir: Path, call: Callable | None = None) -> list[str]:
+    """R23/R29: run every role once for real, each in a fresh throwaway repo. Returns problems; empty = passed.
+    call(role, prompt, schema, cwd) runs the agent; main passes the conductor's guarded _call."""
     import shutil
-    import tempfile
-    from core.agents import _shape_ok
+    import stat
+    from core.agents import schema_ok
+    call = call or (lambda role, prompt, schema, cwd: getattr(team, role).run(prompt, cwd, schema))
     Path(workdir).mkdir(parents=True, exist_ok=True)
-    root = Path(tempfile.mkdtemp(prefix="forge-smoke-", dir=str(workdir)))
     problems: list[str] = []
-    try:
-        _git(root, "init", "-q")
-        _git(root, "config", "user.name", "Forge smoke")
-        _git(root, "config", "user.email", "forge@localhost")
-        (root / "README.md").write_bytes(b"Forge smoke test repo\n")
-        _git(root, "add", "-A")
-        _git(root, "commit", "-q", "-m", "smoke")
-        for role, (schema, writes, example) in SMOKE_ROLES.items():
+
+    def files(root: Path) -> dict[str, str]:
+        found = {}
+        for dirpath, dirnames, names in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            for d in dirnames:
+                found[(Path(dirpath) / d).relative_to(root).as_posix() + "/"] = "dir"
+            for nm in names:
+                f = Path(dirpath) / nm
+                found[f.relative_to(root).as_posix()] = hashlib.sha256(f.read_bytes()).hexdigest()
+        return found
+
+    def rm(root: Path) -> None:
+        def unlock(fn, path, _exc):
+            os.chmod(path, stat.S_IWRITE)
+            fn(path)
+        shutil.rmtree(root, onerror=unlock)
+
+    for role, (schema, writes, example) in SMOKE_ROLES.items():
+        # Plain mkdir, not mkdtemp: on Windows mkdtemp locks the folder to this user, and Codex's sandbox runs as
+        # a separate user, so files it wrote there could not be read back.
+        root = Path(workdir) / f"forge-smoke-{role}-{uuid.uuid4().hex[:8]}"
+        root.mkdir()
+        try:
+            _git(root, "init", "-q")
+            _git(root, "config", "user.name", "Forge smoke")
+            _git(root, "config", "user.email", "forge@localhost")
+            (root / "README.md").write_bytes(b"Forge smoke test repo\n")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-q", "-m", "smoke")
+            head, snap = _git(root, "rev-parse", "HEAD"), files(root)
             if writes:
                 ask = "Create a file named smoke.txt containing the word ok in the current folder. Change nothing else."
             elif writes is False:
@@ -1023,25 +1144,31 @@ def smoke(team: Team, workdir: Path) -> list[str]:
             else:
                 ask = "You may read files but do not need to change any."
             prompt = f"SMOKE TEST for Forge (role: {role}). {ask} Then answer with ONLY this JSON: {example}"
-            try:
-                r = getattr(team, role).run(prompt, root, schema)
-            except Exception as e:  # noqa: BLE001
-                problems.append(f"{role}: crashed: {e!r}"[:500])
-                continue
-            status = subprocess.run(["git", "status", "--porcelain", "-uall"], cwd=str(root), capture_output=True,
-                                    text=True, stdin=subprocess.DEVNULL, **NOWIN).stdout.strip()
+            r = call(role, prompt, schema, root)
             if not r.ok:
                 problems.append(f"{role}: failed: {r.error}"[:500])
-            elif not _shape_ok(r.data, schema):
-                problems.append(f"{role}: answer missing required keys {schema.get('required')}")
-            if writes and not (root / "smoke.txt").exists():
-                problems.append(f"{role}: could not write smoke.txt (no write access?)")
-            if writes is False and status:
-                problems.append(f"{role}: changed files but must be read-only: {status[:200]}")
-            _git(root, "reset", "-q", "--hard")
-            _git(root, "clean", "-q", "-fd")
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
+            elif not schema_ok(r.data, schema):
+                problems.append(f"{role}: answer does not match its schema: {json.dumps(r.data)[:200]}")
+            if _git(root, "rev-parse", "HEAD") != head:
+                problems.append(f"{role}: made a git commit (not allowed)")
+            now = files(root)
+            if writes:
+                f = root / "smoke.txt"
+                if not f.is_file() or "ok" not in f.read_text(encoding="utf-8", errors="replace").lower():
+                    problems.append(f"{role}: could not write smoke.txt containing ok (no write access?)")
+                extra = sorted(set(now) - set(snap) - {"smoke.txt"}) + sorted(
+                    k for k in snap if now.get(k) != snap[k])
+                if extra:
+                    problems.append(f"{role}: changed more than smoke.txt: {extra[:5]}")
+            elif writes is False and now != snap:
+                problems.append(f"{role}: changed files but must be read-only")
+        except (RuntimeError, OSError) as e:  # git and file errors are problems, never a pass or a crash
+            problems.append(f"{role}: {type(e).__name__}: {e}"[:500])
+        finally:
+            try:
+                rm(root)
+            except OSError as e:
+                problems.append(f"{role}: could not clean up {root}: {e}"[:500])
     return problems
 
 
@@ -1086,7 +1213,7 @@ def main(argv: list[str]) -> int:
         return 0  # another conductor holds the lock; the watchdog calls us harmlessly
     try:
         if a.cmd == "smoke" or (not (state / "KILL").exists() and _smoke_stale(state, c.clock())):
-            problems = _guarded_smoke(c, Path(a.work))
+            problems = _guarded_smoke(c, Path(a.work), force=a.cmd == "smoke")
             if a.cmd == "smoke":
                 print("\n".join(problems) or "smoke test passed")
                 return 1 if problems else 0
@@ -1114,19 +1241,26 @@ def _smoke_stale(state: Path, now: datetime) -> bool:
         return True
 
 
-def _guarded_smoke(c: Conductor, workdir: Path) -> list[str]:
-    """R23 with the R9 tamper check around it: smoke agents run for real, so state is fingerprinted too."""
-    before = c._fingerprint()
-    problems = smoke(c.team, workdir)
-    try:
-        changed = before != c._fingerprint()
-    except OSError:
-        changed = True
-    if changed:
-        (c.state / "KILL").write_text("state tampered during the smoke test\n")
-        c._log("TAMPER during smoke test")
-        return ["state files changed during the smoke test (Forge halted)"]
-    if not problems:
+def _guarded_smoke(c: Conductor, workdir: Path, force: bool = False) -> list[str]:
+    """R29: the smoke test through the conductor's guarded _call (fail-closed checks, tamper guard, metering),
+    with a 30-minute wait after a failure and a success stamp only after a full pass."""
+    fail = c._read("smoke_fail.json", {})
+    if not force and fail.get("at") and (c.clock() - datetime.fromisoformat(fail["at"])).total_seconds() < 1800:
+        return ["the last smoke test failed; waiting 30 minutes before retrying"]
+    (c.state / "smoke_ok.json").unlink(missing_ok=True)
+    if c._capped():
+        problems = ["token cap reached; smoke test not run"]
+    else:
+        try:
+            problems = smoke(c.team, workdir, lambda role, prompt, schema, cwd: c._call(role, prompt, schema, cwd=cwd))
+        except Tampered as e:
+            problems = [f"state files changed during the smoke test (Forge halted): {e}"[:500]]
+        except RuntimeError as e:  # fail-closed preconditions (R15)
+            problems = [str(e)[:500]]
+    if problems:
+        c._write("smoke_fail.json", {"at": c.clock().isoformat(), "problems": problems})
+    else:
+        (c.state / "smoke_fail.json").unlink(missing_ok=True)
         c._write("smoke_ok.json", {"at": c.clock().isoformat()})
     return problems
 

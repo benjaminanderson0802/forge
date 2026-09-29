@@ -59,12 +59,13 @@ def _resolve(cmd: list[str]) -> list[str] | None:
 
 
 def strict_schema(schema: dict) -> dict:
-    """R17: the strict form Codex's structured output requires. Every object lists all its properties as
-    required and forbids extras; properties that weren't required become nullable. Never mutates the input."""
+    """R17/R30: the strict form Codex's structured output requires. Every object lists all its properties as
+    required and forbids extras; properties that weren't required become nullable (enums gain null too).
+    anyOf, $defs and definitions are converted recursively. Never mutates the input."""
     def conv(node, optional: bool = False):
         if not isinstance(node, dict):
             return node
-        n = {k: v for k, v in node.items()}
+        n = dict(node)
         if n.get("type") == "object" or "properties" in n:
             props = n.get("properties", {})
             req = set(n.get("required", []))
@@ -74,14 +75,58 @@ def strict_schema(schema: dict) -> dict:
             n.setdefault("type", "object")
         if "items" in n:
             n["items"] = conv(n["items"])
+        if isinstance(n.get("anyOf"), list):
+            n["anyOf"] = [conv(x) for x in n["anyOf"]]
+        for key in ("$defs", "definitions"):
+            if isinstance(n.get(key), dict):
+                n[key] = {k: conv(v) for k, v in n[key].items()}
         if optional:
             t = n.get("type")
             if isinstance(t, str) and t != "null":
                 n["type"] = [t, "null"]
             elif isinstance(t, list) and "null" not in t:
                 n["type"] = [*t, "null"]
+            if isinstance(n.get("enum"), list) and None not in n["enum"]:
+                n["enum"] = [*n["enum"], None]
+            if isinstance(n.get("anyOf"), list) and not any(x.get("type") == "null" for x in n["anyOf"]
+                                                           if isinstance(x, dict)):
+                n["anyOf"] = [*n["anyOf"], {"type": "null"}]
         return n
     return conv(schema)
+
+
+_TYPES = {"object": dict, "array": list, "string": str, "boolean": bool, "null": type(None)}
+
+
+def schema_ok(data, schema: dict | None) -> bool:
+    """R29: full validation for the schema forms Forge uses: type, enum, required, properties, items, anyOf."""
+    if schema is None:
+        return True
+    if isinstance(schema.get("anyOf"), list):
+        return any(schema_ok(data, s) for s in schema["anyOf"])
+    t = schema.get("type")
+    if t is not None:
+        types = t if isinstance(t, list) else [t]
+        def is_type(name):
+            if name == "integer":
+                return isinstance(data, int) and not isinstance(data, bool)
+            if name == "number":
+                return isinstance(data, (int, float)) and not isinstance(data, bool)
+            return name in _TYPES and isinstance(data, _TYPES[name])
+        if not any(is_type(x) for x in types):
+            return False
+    if "enum" in schema and data not in schema["enum"]:
+        return False
+    if isinstance(data, dict):
+        if any(k not in data for k in schema.get("required", [])):
+            return False
+        props = schema.get("properties", {})
+        if schema.get("additionalProperties") is False and any(k not in props for k in data):
+            return False
+        return all(schema_ok(data[k], sub) for k, sub in props.items() if k in data)
+    if isinstance(data, list) and isinstance(schema.get("items"), dict):
+        return all(schema_ok(x, schema["items"]) for x in data)
+    return True
 
 
 def _codex_error(events_out: str) -> str:

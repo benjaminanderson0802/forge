@@ -247,7 +247,7 @@ The first run with real agents and real email hit four faults no fake-based test
   3. The inbox reader keeps the IDs of the messages it has already handled in `state/inbox_seen.json`. On its first read, when that file is missing, it records every current Forge message as handled and returns nothing. So no email from before the first start (the incident's included) can ever count as an answer.
 
   The inbox reader searches the last 3 days for subjects containing `[Forge` (and for a subject of just `STOP`). It uses peek-only fetches, so it never changes Ben's read or unread flags. It fetches headers first, and then bodies only for new messages that aren't Forge's own.
-- **R27 STOP means Ben wrote "stop".** KILL is set when the subject, with any `Re:` or `Fwd:` prefixes removed, is exactly `stop`, or when the first word of the cleaned reply (quoted text removed) is `stop`. Case and trailing punctuation are ignored. STOP works as a reply to any Forge email, including the notices.
+- **R27 STOP means Ben wrote "stop".** KILL is set when the subject, with any `Re:` or `Fwd:` prefixes removed, is exactly `stop`, or when the cleaned reply (quoted text removed) contains the word `stop`, unless it is negated ("don't stop", "do not stop", "never stop"). Stopping when Ben didn't mean it is the safe way to fail: pressing Start Forge undoes it. STOP works as a reply to any Forge email, including the notices.
 - **R28 Every stored thing is bounded.**
   - Question subjects are capped at 300 characters and bodies at 20000 before they are stored.
   - `questions.json` keeps every open question and the 50 most recent closed ones.
