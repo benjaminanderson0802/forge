@@ -142,3 +142,7 @@ Restarting requires Ben to deliberately clear the stop.
 - **Anything that costs money:** Ben approves.
 
 **D-033 (2026-09-29) Founding principle: a missing connection is never a reason to stop.** AI agents aren't malicious, but when stumped they commonly take the easy way out. Forge is designed on that assumption. Connections are set up and verified in advance; blocker claims must show work; problems route to whoever can fix them; agents are equipped for the task at hand.
+
+## Build order
+
+**D-034 (2026-09-29) Build the conductor first, and let it build the rest.** A small bootstrap conductor (`core/bootstrap.py`) runs the D-025 team by itself on Ben's PC. It's a hidden, self-restarting scheduled task, and it builds the rest of Layer 1 from `docs/specs/layer-1-queue.json`. Ben is reached only by email: questions carry a secret reply code, and "STOP" halts everything. Chat sessions become optional. This replaces "Cowork plays the conductor for 1A and 1B" in `docs/specs/layer-1-design.md` §7.
