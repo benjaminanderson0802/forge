@@ -235,6 +235,8 @@ class Conductor:
         unreadable = sorted(k for k, v in before.items() if v.startswith("unreadable:"))
         if unreadable:  # R15: fail closed; a file we can't read can't be checked for tampering
             raise RuntimeError("state file unreadable before agent run: " + ", ".join(unreadable))
+        if not before.get(LOCK_NAME, "lock:0:").startswith("lock:0:"):  # R15: only an empty lock is trusted
+            raise RuntimeError(f"state file {LOCK_NAME} is not empty before agent run")
         try:
             r = agent.run(prompt, self.wt, schema)
         except Exception as e:  # noqa: BLE001 - an agent crash is a failed result
@@ -941,10 +943,16 @@ def main(argv: list[str]) -> int:
         c.init_queue(a.layer, json.loads(Path(a.tasks).read_text(encoding="utf-8")))
         print("queue ready")
         return 0
+    lock = acquire_lock(state)  # R15: every command that can launch agents holds the lock
     if a.cmd == "step":
-        print(c.step())
+        if lock is None:
+            print("busy")
+            return 0
+        try:
+            print(c.step())
+        finally:
+            lock.close()
         return 0
-    lock = acquire_lock(state)
     if lock is None:
         return 0  # another conductor holds the lock; the watchdog calls us harmlessly
     try:
