@@ -200,3 +200,13 @@ A `kind == "plan"` task with status `todo`:
 ## Review round 3 amendment
 
 - **R14 Nothing is exempt.** The tamper fingerprint covers every file in `state/`, including `runs/` and `meter.json`. The conductor never writes to `state/` while an agent run is in progress: the run's `prompt.md` is written before the "before" fingerprint, and `output.json` and meter updates only after the "after" comparison. Files under `runs/` use a size+mtime signature, for speed; all other files use sha256.
+
+## Live-run amendments (first start on Ben's PC, 2026-09-29)
+
+- **R15 The lock file is fingerprinted by signature, and nothing unreadable is trusted.** On Windows the R11 lock makes `state/conductor.lock` unreadable to its own process, so hashing it crashed every agent run with `PermissionError`. Now:
+  - `acquire_lock` empties the lock file right after taking the lock, so it always holds zero bytes and has no content to hide. It is fingerprinted as `lock:<size>:<inode>:<mtime>`, which catches any write (the size becomes non-zero), a replaced file (a new inode), or a touch.
+  - **Fail closed before a run.** If any other file in `state/` can't be read when the "before" fingerprint is taken, the agent is not launched. The stage raises an error (R13 backoff, and Ben is emailed after 3).
+  - **Only an empty lock is trusted.** If `conductor.lock` exists but isn't empty when the "before" fingerprint is taken, the agent is not launched, and the stage raises an error in the same way. Every command that can launch agents holds the lock: `run`, and also `step`, which prints `busy` and exits if another conductor holds it.
+  - **Tamper after a run.** A file that becomes unreadable during a run gets an `unreadable:<size>:<mtime>` signature. That never equals a sha256, so the tamper alarm fires.
+  - **The check itself must complete.** The fingerprint walks `state/` strictly: any error listing a folder or reading a file's details raises, and nothing inaccessible is silently left out. Before a run, a fingerprint that fails means the agent is not launched (stage error). After a run, a fingerprint that fails counts as tampering: KILL is written, Ben is emailed, and nothing from the run is recorded.
+- **R16 Codex keeps the Windows sandbox.** `--ignore-user-config` also drops Ben's `windows.sandbox` setting, and without it Codex silently downgrades `workspace-write` to read-only, so the test writer could never write. On Windows, `CodexAgent` passes `-c windows.sandbox="elevated"` for every sandbox mode. The setting only chooses Windows' sandbox implementation, so the reviewer stays `read-only`. Prerequisite for unattended runs: the Codex Windows sandbox has been set up once on the PC (done 2026-09-28).

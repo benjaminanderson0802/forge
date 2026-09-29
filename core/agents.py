@@ -153,6 +153,8 @@ class CodexAgent:
         last = tmp / "last.txt"
         args = base + ["exec", "--ignore-user-config", "--ephemeral", "--json", "--skip-git-repo-check",
                        "-s", self.sandbox, "-C", str(cwd), "-o", str(last)]
+        if IS_WIN:  # R16: --ignore-user-config drops the Windows sandbox; without it writes silently fail
+            args += ["-c", 'windows.sandbox="elevated"']
         if schema:
             (tmp / "schema.json").write_text(json.dumps(schema), encoding="utf-8")
             args += ["--output-schema", str(tmp / "schema.json")]

@@ -1,4 +1,5 @@
 """Contract tests for the bootstrap conductor, driven entirely by local fakes."""
+import io
 import json
 import os
 import subprocess
@@ -577,3 +578,379 @@ class BootstrapTests(Harness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class R15BootstrapTests(Harness):
+    def test_R15_nonempty_lock_baseline_prevents_agent_launch(self):
+        """R15: a non-empty lock baseline fails the stage before launching the agent."""
+        calls = []
+
+        def writer(prompt, cwd):
+            calls.append((prompt, cwd))
+            return self.write_tests(prompt, cwd)
+
+        c = self.init(agents={"test_writer": writer})
+        status_before = json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"]
+        (self.state / "conductor.lock").write_bytes(b"x")
+        result = c.step()
+        self.assertFalse(calls, "a non-empty lock baseline must prevent agent launch")
+        self.assertEqual(result, "error")
+        self.assertIn("conductor.lock", (self.state / "errors.log").read_text(encoding="utf-8"))
+        self.assertFalse((self.state / "KILL").exists())
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertEqual(task["status"], status_before)
+
+    def test_R15_cli_step_respects_lock_and_closes_acquired_handle(self):
+        """R15: CLI step reports busy or holds an acquired lock and closes it afterwards."""
+        from core.bootstrap import acquire_lock, main
+
+        self.make_conductor()
+        real_init = Conductor.__init__
+
+        def redirected_init(conductor, repo, work, state, *args, **kwargs):
+            real_init(conductor, self.repo, self.work, self.state, *args, **kwargs)
+
+        for acquired in (False, True):
+            with self.subTest(acquired=acquired):
+                handle = acquire_lock(self.state)
+                self.assertIsNotNone(handle)
+                lock_states = []
+                stdout = io.StringIO()
+
+                def lock(state):
+                    lock_states.append(state)
+                    return handle if acquired else None
+
+                try:
+                    with (
+                        patch("core.agents.load_limits", return_value=self.c.limits),
+                        patch("core.bootstrap.real_team", return_value=self.team),
+                        patch("core.bootstrap.gmail_mailer", return_value=self.c.mailer),
+                        patch("core.bootstrap.gmail_inbox", return_value=self.c.inbox),
+                        patch("core.bootstrap.gh_cli", return_value=self.gh),
+                        patch.object(Conductor, "__init__", new=redirected_init),
+                        patch("core.bootstrap.acquire_lock", new=lock),
+                        patch.object(Conductor, "step", return_value="worked") as step,
+                        patch("sys.stdout", stdout),
+                    ):
+                        result = main(["step"])
+                    self.assertEqual(result, 0)
+                    if acquired:
+                        step.assert_called_once_with()
+                        self.assertTrue(handle.closed, "CLI step must close its acquired lock")
+                    else:
+                        step.assert_not_called()
+                        self.assertIn("busy", stdout.getvalue())
+                    self.assertEqual(len(lock_states), 1, "CLI step must acquire the conductor lock")
+                finally:
+                    handle.close()
+
+    def test_R15_held_conductor_lock_allows_full_test_writer_step(self):
+        """R15: the conductor's own OS lock must not break a test-writer step."""
+        from core.bootstrap import acquire_lock
+
+        c = self.init(agents={"test_writer": self.write_tests, "builder": self.build_feature})
+        # Lock a real byte so Windows must enforce the read restriction.
+        (self.state / "conductor.lock").write_bytes(b"0")
+        handle = acquire_lock(self.state)
+        self.assertIsNotNone(handle)
+        try:
+            result = c.step()
+            errors = self.state / "errors.log"
+            log = errors.read_text(encoding="utf-8") if errors.exists() else ""
+            self.assertNotIn("stage error", log.lower())
+            self.assertNotIn("PermissionError", log)
+            self.assertEqual(result, "worked")
+            task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+            self.assertEqual(task["status"], "tests_ok")
+            self.assertIn("tests/core/test_feat.py", self.branch_files())
+            self.assertFalse((self.state / "KILL").exists())
+        finally:
+            handle.close()
+
+    def test_R15_agent_append_to_existing_conductor_lock_is_tamper(self):
+        """R15: the lock file remains fingerprinted and agent appends trigger tamper."""
+        from core.bootstrap import acquire_lock
+
+        lock_path = self.state / "conductor.lock"
+
+        def tamper(prompt, cwd):
+            with lock_path.open("ab") as stream:
+                stream.write(b"agent changed the lock\n")
+            return self.write_tests(prompt, cwd)
+
+        c = self.init(agents={"test_writer": tamper})
+        handle = acquire_lock(self.state)
+        self.assertIsNotNone(handle)
+        handle.close()  # Permit the fake agent to append on Windows as well.
+        self.assertTrue(lock_path.exists())
+        status_before = json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"]
+        result = c.step()
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertEqual(result, "killed")
+        self.assertTrue(any("tamper" in subject.lower() and "conductor.lock" in body
+                            for subject, body in self.mails))
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertEqual(task["status"], status_before)
+        self.assertNotIn("tests/core/test_feat.py", self.branch_files())
+        self.assertNotIn("stage error", (self.state / "errors.log").read_text().lower())
+
+    def test_R15_non_lock_file_becoming_unreadable_is_tamper(self):
+        """R15: an unreadable non-lock file triggers tamper rather than a stage error."""
+        meter_path = self.state / "meter.json"
+        real_read_bytes = Path.read_bytes
+        agent_started = False
+        denied_reads = []
+
+        def read_bytes(path):
+            if agent_started and path == meter_path:
+                denied_reads.append(path)
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_read_bytes(path)
+
+        def writer(prompt, cwd):
+            nonlocal agent_started
+            agent_started = True
+            return self.write_tests(prompt, cwd)
+
+        c = self.init(agents={"test_writer": writer})
+        Meter(self.state).add("codex", 1)
+        self.assertTrue(meter_path.read_bytes())
+        status_before = json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"]
+        # Keep the denial active for the fingerprint taken after the agent returns.
+        with patch.object(Path, "read_bytes", new=read_bytes):
+            result = c.step()
+        self.assertTrue(agent_started)
+        self.assertTrue(denied_reads)
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertEqual(result, "killed")
+        self.assertTrue(any("tamper" in subject.lower() and "meter.json" in body
+                            for subject, body in self.mails))
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertEqual(task["status"], status_before)
+        self.assertNotIn("stage error", (self.state / "errors.log").read_text().lower())
+
+    def test_R15_lock_mtime_change_alone_changes_fingerprint(self):
+        """R15: the lock signature covers mtime even when its size and bytes are unchanged."""
+        from core.bootstrap import acquire_lock
+
+        c = self.make_conductor()
+        handle = acquire_lock(self.state)
+        self.assertIsNotNone(handle)
+        handle.close()
+        lock_path = self.state / "conductor.lock"
+        before = c._fingerprint()
+        self.assertIn("conductor.lock", before)
+        stat = lock_path.stat()
+        os.utime(lock_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+        self.assertEqual(lock_path.stat().st_size, stat.st_size)
+        self.assertNotEqual(lock_path.stat().st_mtime_ns, stat.st_mtime_ns)
+        after = c._fingerprint()
+        self.assertIn("conductor.lock", after)
+        self.assertNotEqual(before["conductor.lock"], after["conductor.lock"])
+
+    def test_R15_acquire_lock_truncates_existing_bytes_while_held(self):
+        """R15: acquiring the lock empties existing bytes while the handle is held."""
+        from core.bootstrap import acquire_lock
+
+        lock_path = self.state / "conductor.lock"
+        lock_path.write_bytes(b"junk")
+        handle = acquire_lock(self.state)
+        self.assertIsNotNone(handle)
+        try:
+            self.assertEqual(lock_path.stat().st_size, 0)
+        finally:
+            handle.close()
+
+    def test_R15_unreadable_baseline_prevents_agent_launch(self):
+        """R15: an unreadable baseline fails the stage before launching the agent."""
+        meter_path = self.state / "meter.json"
+        real_read_bytes = Path.read_bytes
+        calls = []
+        denied_reads = []
+
+        def read_bytes(path):
+            if path == meter_path:
+                denied_reads.append(path)
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_read_bytes(path)
+
+        def writer(prompt, cwd):
+            calls.append((prompt, cwd))
+            return self.write_tests(prompt, cwd)
+
+        c = self.init(agents={"test_writer": writer})
+        Meter(self.state).add("codex", 1)
+        status_before = json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"]
+        # Deny reads throughout the step, including both fingerprints if launched.
+        with patch.object(Path, "read_bytes", new=read_bytes):
+            result = c.step()
+        self.assertTrue(denied_reads)
+        self.assertFalse(calls, "an unreadable baseline must prevent agent launch")
+        self.assertEqual(result, "error")
+        self.assertFalse((self.state / "KILL").exists())
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertEqual(task["status"], status_before)
+        self.assertIn("meter.json", (self.state / "errors.log").read_text(encoding="utf-8"))
+
+    def test_R15_lock_replacement_with_restored_size_and_mtime_is_tamper(self):
+        """R15: replacing an empty lock is tamper even when its timestamps are restored."""
+        from core.bootstrap import acquire_lock
+
+        lock_path = self.state / "conductor.lock"
+        replacement_stats = []
+
+        def tamper(prompt, cwd):
+            lock_path.unlink()
+            lock_path.write_bytes(b"")
+            os.utime(lock_path, ns=(original.st_atime_ns, original.st_mtime_ns))
+            replacement_stats.append(lock_path.stat())
+            return self.write_tests(prompt, cwd)
+
+        c = self.init(agents={"test_writer": tamper})
+        handle = acquire_lock(self.state)
+        self.assertIsNotNone(handle)
+        handle.close()  # Allow deletion and recreation on Windows.
+        original = lock_path.stat()
+        self.assertEqual(original.st_size, 0)
+        result = c.step()
+        self.assertEqual(len(replacement_stats), 1)
+        replacement = replacement_stats[0]
+        self.assertEqual(replacement.st_size, original.st_size)
+        self.assertEqual(replacement.st_atime_ns, original.st_atime_ns)
+        self.assertEqual(replacement.st_mtime_ns, original.st_mtime_ns)
+        if replacement.st_ino == original.st_ino:
+            self.skipTest("filesystem reused the inode; the empty replacement has an identical fingerprint")
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertEqual(result, "killed")
+        self.assertTrue(any("tamper" in subject.lower() and "conductor.lock" in body
+                            for subject, body in self.mails))
+
+    def test_R15_after_run_stat_failure_is_tamper(self):
+        """R15: a failed post-run stat kills even when the agent also rewrites the queue."""
+        meter_path = self.state / "meter.json"
+        real_path_stat, real_os_stat = Path.stat, os.stat
+        agent_started = False
+        denied_stats = []
+
+        def deny_stat(path):
+            if agent_started and not isinstance(path, int) and Path(path) == meter_path:
+                denied_stats.append(path)
+                raise PermissionError(13, "Permission denied", str(path))
+
+        def path_stat(path, *args, **kwargs):
+            deny_stat(path)
+            return real_path_stat(path, *args, **kwargs)
+
+        def os_stat(path, *args, **kwargs):
+            deny_stat(path)
+            return real_os_stat(path, *args, **kwargs)
+
+        def writer(prompt, cwd):
+            nonlocal agent_started
+            queue_path = self.state / "queue.json"
+            queue = json.loads(queue_path.read_text(encoding="utf-8"))
+            queue["tasks"][0]["title"] = "Agent rewrote the task"
+            queue_path.write_text(json.dumps(queue), encoding="utf-8")
+            result = self.write_tests(prompt, cwd)
+            agent_started = True
+            return result
+
+        c = self.init(agents={"test_writer": writer})
+        Meter(self.state).add("codex", 1)
+        meter_before = meter_path.read_bytes()
+        status_before = json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"]
+        with patch.object(Path, "stat", new=path_stat), patch.object(os, "stat", new=os_stat):
+            result = c.step()
+        self.assertTrue(agent_started)
+        self.assertTrue(denied_stats, "the post-run fingerprint must encounter the stat failure")
+        self.assertEqual(result, "killed")
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertTrue(any("tamper" in subject.lower() and "meter.json" in body
+                            and any(word in body.lower() for word in ("permission", "denied", "fail", "unreadable"))
+                            for subject, body in self.mails))
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertEqual(task["status"], status_before)
+        self.assertEqual(meter_path.read_bytes(), meter_before)
+        self.assertFalse(list((self.state / "runs").glob("*/output.json")))
+        self.assertNotIn("tests/core/test_feat.py", self.branch_files())
+        # Restoring access must not let the next step accept the rewritten queue.
+        self.assertEqual(c.step(), "killed")
+        self.assertEqual(len(self.team.test_writer.prompts), 1)
+        self.assertEqual(json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"],
+                         status_before)
+
+    def test_R15_after_run_directory_listing_failure_is_tamper(self):
+        """R15: a denied directory listing must not silently hide an agent's state changes."""
+        denied_dir = self.state / "extra"
+        real_scandir, real_iterdir = os.scandir, Path.iterdir
+        agent_started = False
+        denied_listings = []
+
+        def deny_listing(path):
+            if agent_started and not isinstance(path, int) and Path(path) == denied_dir:
+                denied_listings.append(path)
+                raise PermissionError(13, "Permission denied", str(path))
+
+        def scandir(path="."):
+            deny_listing(path)
+            return real_scandir(path)
+
+        def iterdir(path):
+            deny_listing(path)
+            return real_iterdir(path)
+
+        def writer(prompt, cwd):
+            nonlocal agent_started
+            (denied_dir / "hidden.txt").write_text("agent state change\n", encoding="utf-8")
+            result = self.write_tests(prompt, cwd)
+            agent_started = True
+            return result
+
+        c = self.init(agents={"test_writer": writer})
+        # An empty baseline avoids detecting a missing old file by accident when
+        # traversal silently skips the directory containing the new hidden file.
+        denied_dir.mkdir()
+        with patch.object(os, "scandir", new=scandir), patch.object(Path, "iterdir", new=iterdir):
+            result = c.step()
+        self.assertTrue(agent_started)
+        self.assertTrue(denied_listings, "the post-run fingerprint must try listing the directory")
+        self.assertEqual(result, "killed")
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertTrue(any("tamper" in subject.lower() and "extra" in body
+                            and any(word in body.lower() for word in ("permission", "denied", "fail", "unreadable"))
+                            for subject, body in self.mails))
+        self.assertFalse(list((self.state / "runs").glob("*/output.json")))
+        self.assertNotIn("tests/core/test_feat.py", self.branch_files())
+
+    def test_R15_before_run_stat_failure_prevents_agent_launch(self):
+        """R15: a failed baseline stat prevents agent launch and returns error without KILL."""
+        meter_path = self.state / "meter.json"
+        real_path_stat, real_os_stat = Path.stat, os.stat
+        calls, denied_stats = [], []
+
+        def deny_stat(path):
+            if not isinstance(path, int) and Path(path) == meter_path:
+                denied_stats.append(path)
+                raise PermissionError(13, "Permission denied", str(path))
+
+        def path_stat(path, *args, **kwargs):
+            deny_stat(path)
+            return real_path_stat(path, *args, **kwargs)
+
+        def os_stat(path, *args, **kwargs):
+            deny_stat(path)
+            return real_os_stat(path, *args, **kwargs)
+
+        def writer(prompt, cwd):
+            calls.append((prompt, cwd))
+            return self.write_tests(prompt, cwd)
+
+        c = self.init(agents={"test_writer": writer})
+        Meter(self.state).add("codex", 1)
+        with patch.object(Path, "stat", new=path_stat), patch.object(os, "stat", new=os_stat):
+            result = c.step()
+        self.assertTrue(denied_stats, "the baseline fingerprint must encounter the stat failure")
+        self.assertFalse(calls, "a failed baseline stat must prevent agent launch")
+        self.assertEqual(result, "error")
+        self.assertFalse((self.state / "KILL").exists())
