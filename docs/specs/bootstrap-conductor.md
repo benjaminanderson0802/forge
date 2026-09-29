@@ -189,3 +189,10 @@ A `kind == "plan"` task with status `todo`:
   - returns without recording the run's result
 
   The conductor's own writes happen outside agent runs, so they never trigger it.
+
+## Review round 2 amendments (Codex review, 2026-09-29)
+
+- **R10 Fingerprint everything.** The R9 fingerprint covers every file in `state/` except `runs/` and `meter.json`. Temporary files are included.
+- **R11 One conductor, guaranteed.** `main run` takes an operating-system exclusive lock on `state/conductor.lock`: `msvcrt.locking` on Windows, `fcntl.flock` elsewhere. The lock is held for the life of the process. A second process that can't get the lock exits at once with code 0. The lock is exposed as `acquire_lock(state) -> handle | None` so tests can check that a second acquisition returns `None` while the first is held.
+- **R12 The loop survives everything.** Heartbeat writes happen inside the loop's error handling, so a failed heartbeat is logged and the loop continues.
+- **R13 Stage errors back off.** A stage `RuntimeError` or `OSError` makes `step()` return `"error"`, not `"worked"`. `run()` backs off on `"error"` just as it does on an exception. After 3 consecutive `"error"` steps, Ben is emailed once.

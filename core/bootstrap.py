@@ -259,7 +259,7 @@ class Conductor:
             if not f.is_file():
                 continue
             rel = f.relative_to(self.state).as_posix()
-            if rel.startswith("runs/") or rel == "meter.json" or rel.startswith(".tmp") or rel.endswith(".tmp"):
+            if rel.startswith("runs/") or rel == "meter.json":  # R10: everything else, temp files included
                 continue
             fp[rel] = hashlib.sha256(f.read_bytes()).hexdigest()
         return fp
@@ -397,6 +397,7 @@ class Conductor:
                             self._after_failure(t["id"], f"git error: {e}"[:300], "git-error", "")
                     except Exception as e2:  # noqa: BLE001
                         self._log(f"could not record stage error: {e2!r}")
+                    return "error"  # R13: run() backs off on this
                 return "worked"
         tasks = q["tasks"]
         qs = self._read("questions.json", {})
@@ -406,32 +407,36 @@ class Conductor:
             return "gate"
         return "idle"
 
-    def run(self, max_steps: int | None = None, idle_sleep_s: int = 60, heartbeat: Path | None = None) -> str:
-        """Loop forever (or max_steps). An unexpected error never ends the loop: it is logged, Ben is told once,
-        and the conductor backs off and tries again."""
-        n, status, crashes = 0, "idle", 0
+    def run(self, max_steps: int | None = None, idle_sleep_s: int = 60, heartbeat: Path | None = None,
+            sleep: Callable[[float], None] = time.sleep) -> str:
+        """Loop forever (or max_steps). Nothing ends the loop except the kill switch: errors are logged,
+        Ben is told once after 3 in a row, and the loop backs off (R12, R13)."""
+        n, status, errors, told = 0, "idle", 0, False
         while max_steps is None or n < max_steps:
-            if heartbeat:
-                heartbeat.write_text(f"{os.getpid()} {time.time()}")
             try:
+                if heartbeat:
+                    heartbeat.write_text(f"{os.getpid()} {time.time()}")
                 status = self.step()
-                crashes = 0
             except Exception as e:  # noqa: BLE001
-                crashes += 1
                 status = "error"
-                self._log(f"step crashed ({crashes} in a row): {e!r}")
-                if crashes == 3:
-                    try:
-                        self.mailer("[Forge] the conductor keeps hitting an error",
-                                    f"Last error:\n{e!r}\n\nIt keeps retrying with a pause. Details: state/bootstrap/errors.log")
-                    except Exception:  # noqa: BLE001
-                        pass
-                time.sleep(min(idle_sleep_s * crashes, 1800))
+                self._log(f"step crashed: {e!r}")
             n += 1
             if status == "killed":
                 return status
+            if status == "error":
+                errors += 1
+                if errors >= 3 and not told:
+                    told = True
+                    try:
+                        self.mailer("[Forge] the conductor keeps hitting an error",
+                                    "It keeps retrying with a growing pause. Details: state/bootstrap/errors.log")
+                    except Exception:  # noqa: BLE001
+                        pass
+                sleep(min(idle_sleep_s * errors, 1800))
+                continue
+            errors, told = 0, False
             if status in ("idle", "paused", "capped", "gate"):
-                time.sleep(idle_sleep_s)
+                sleep(idle_sleep_s)
         return status
 
     # ------------------------------------------------------------------ helpers
@@ -873,19 +878,22 @@ def real_team(limits: dict) -> Team:
                                     allowed_tools=["Read", "Edit", "Write", "Glob", "Grep"]))
 
 
-def _single_instance(state: Path, stale_s: int) -> bool:
-    """Only one conductor at a time. A heartbeat older than stale_s means the old one died."""
-    hb = state / "conductor.heartbeat"
-    if hb.exists():
-        try:
-            age = time.time() - float(hb.read_text().split()[1])
-        except (ValueError, IndexError, OSError):
-            age = stale_s + 1
-        if age < stale_s:
-            return False
+def acquire_lock(state: Path):
+    """R11: OS-level exclusive lock held for the life of the process. Returns a handle, or None if taken."""
     state.mkdir(parents=True, exist_ok=True)
-    hb.write_text(f"{os.getpid()} {time.time()}")
-    return True
+    f = open(state / "conductor.lock", "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
 
 
 def main(argv: list[str]) -> int:
@@ -918,9 +926,9 @@ def main(argv: list[str]) -> int:
     if a.cmd == "step":
         print(c.step())
         return 0
-    stale = int(limits.get("agent_timeout_s", 1800)) * 2 + 600
-    if not _single_instance(state, stale):
-        return 0  # another conductor is alive; the watchdog calls us harmlessly
+    lock = acquire_lock(state)
+    if lock is None:
+        return 0  # another conductor holds the lock; the watchdog calls us harmlessly
     try:
         c.mailer("[Forge] conductor started", "The conductor is running in the background. You'll hear from it only "
                  "when something needs you, when a layer is ready for approval, or if it hits trouble.\n\n"
