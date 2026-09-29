@@ -1,0 +1,38 @@
+name: core-checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Protected paths untouched (unless the owner applied human-approved)
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ vars.FORGE_OWNER }}
+        run: |
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          # The label only counts if the repo owner applied it (an agent token could add labels too).
+          APPROVED=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/events" \
+            --jq "[.[] | select(.event==\"labeled\" and .label.name==\"human-approved\" and .actor.login==\"$OWNER\")] | length")
+          if [ "${APPROVED:-0}" -gt 0 ]; then LABELS=human-approved; else LABELS=none; fi
+          python -m core.cli protect $FILES --labels "$LABELS"
+      - name: Ledger valid and hash chain intact
+        run: python -m core.cli verify
+      - name: Sabotage drills
+        run: python drills/run_drills.py
+      - name: Acceptance tests
+        run: |
+          if ls tests/acceptance/test_*.py >/dev/null 2>&1; then python -m unittest discover -s tests/acceptance -v; else echo "no acceptance tests yet"; fi

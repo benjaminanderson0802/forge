@@ -1,0 +1,8 @@
+{
+  "ci": "ci",
+  "forge-manager": "manager",
+  "forge-executor": "executor",
+  "forge-auditor": "auditor",
+  "benjamin": "human",
+  "forge-core": "core"
+}
