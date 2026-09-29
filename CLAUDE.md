@@ -18,6 +18,12 @@ Forge is Ben's autonomous build-and-venture system. This repo is its memory. **N
 - **Evidence before claims.** Never say done, fixed or passing without running the check and showing its output.
 - **Stay on purpose.** If the work in front of you doesn't serve the current phase's plan, stop. Don't wander into it. Note it in `docs/STATUS.md` under "Open items", or ask Ben.
 - **Rabbit-hole limit.** Stop after 3 failed approaches to the same problem, or about 45 minutes. Write down what you tried and hand it back. Don't keep digging.
+- **Nothing goes live on fake tests alone.** Before anything that sends email, spends money or tokens, posts, or runs unattended is switched on:
+  1. It passes a live test against the real services (for the conductor, `python -m core.bootstrap smoke`).
+  2. Its possible damage is capped by hard limits in `charter/limits.json`.
+  3. Its first real cycle is watched, with the evidence shown to Ben. (D-035)
+- **Loops are time-boxed for you too.** A fix-and-review loop gets at most 3 rounds, or about 45 minutes. Then report to Ben: what is fixed, what is left, and a recommendation, and let him choose. (D-036)
+- **Never run dependent steps in parallel.** Sync to the branch before building a patch.
 - **Protected files:** `core/`, `drills/`, `tests/acceptance/`, `charter/`, `spec/`, `.github/`, `roles.json`, `CODEOWNERS`, `docs/PURPOSE.md`, `docs/DECISIONS.md`. Changes go through a pull request with Ben's `human-approved` label. Never apply that label yourself unless Ben has approved in this conversation.
 - **Secrets:** never print, commit, log or ask for tokens or passwords. Credentials live in Bitwarden, the Windows keyring and user environment variables.
 - **Money:** follow `charter/authority.md`. Uncovered spend and new subscriptions go to Ben.
