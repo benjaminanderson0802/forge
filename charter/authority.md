@@ -13,7 +13,7 @@ Every agent loads this file on every run.
 - Spending over budget, or any new paid subscription or contract
 - Irreversible deletes
 - Anything a platform's terms forbid
-- Changes to core/, drills/, tests/acceptance/, charter/, spec/, .github/, roles.json
+- Changes to core/, drills/, tests/acceptance/, charter/, spec/, .github/, roles.json, docs/PURPOSE.md, docs/DECISIONS.md
 
 ## Budgets
 - Daily Claude usage cap: 50% of the Max plan's limits. When Forge reaches it, it pauses until the next day; the rest is kept for the owner's own use.

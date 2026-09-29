@@ -1,5 +1,7 @@
 # Forge — trusted core (Phase 0)
 
+**Agents and new sessions: read `CLAUDE.md` first.** It points to the purpose, decisions, status and roadmap in `docs/`.
+
 This is the part of Forge that contains **no AI**. Everything the agents do later
 has to pass through it, and nothing Forge does can change it without you.
 
