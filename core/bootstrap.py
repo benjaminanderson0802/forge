@@ -115,6 +115,10 @@ class Tampered(Exception):
     """An agent run changed the conductor's own state files (R9)."""
 
 
+class Capped(Exception):
+    """R37: the agent's provider is at its daily token cap; nothing was launched."""
+
+
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
 
@@ -286,6 +290,9 @@ class Conductor:
     # ------------------------------------------------------------------ agents
     def _call(self, role: str, prompt: str, schema: dict | None, cwd: Path | None = None):
         agent = getattr(self.team, role)
+        provider = getattr(agent, "provider", None)
+        if provider and self.meter.over(provider, self.limits):  # R37: checked before every launch
+            raise Capped(provider)
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + role + "-" + uuid.uuid4().hex[:6]
         d = self.state / "runs" / run_id
         d.mkdir(parents=True, exist_ok=True)
@@ -552,6 +559,8 @@ class Conductor:
         if q.get("drift_due"):
             try:
                 self._drift_check()
+            except Capped:
+                return "capped"
             except Tampered:
                 return "killed"
             return "worked"
@@ -567,6 +576,8 @@ class Conductor:
                         self._build_stage(t["id"])
                 except Tampered:
                     return "killed"
+                except Capped:  # R37: the attempt was undone by its stage; retried when the cap resets
+                    return "capped"
                 except (RuntimeError, OSError) as e:  # R8: git or filesystem trouble is a failed attempt
                     self._log(f"stage error on {t['id']}: {e!r}")
                     try:
@@ -674,7 +685,11 @@ class Conductor:
         prompt = ("You are the TEST WRITER. Write only these files: " + ", ".join(t["test_files"]) +
                   ". The tests must fail until the feature exists. Do not write any other file.\n\n" +
                   self._task_prompt(t) + "\nAnswer with JSON: {\"files\": [...], \"summary\": \"...\"}")
-        r = self._call("test_writer", prompt, S_TESTS)
+        try:
+            r = self._call("test_writer", prompt, S_TESTS)
+        except Capped:
+            self._reset_wt()
+            raise
         changed = self._changed()
         reason = None
         if not r.ok:
@@ -749,7 +764,13 @@ class Conductor:
         prompt += ("\nAnswer with JSON: {\"status\": \"done\" | \"blocked\", \"summary\": \"...\"}. "
                    "A blocked answer must also include \"tried\" (at least 2 different routes you actually tried) "
                    "and \"error\" (the real error output); without them it is rejected as an easy way out.")
-        r = self._call("builder", prompt, S_BUILD)
+        try:
+            r = self._call("builder", prompt, S_BUILD)
+        except Capped:  # R37: release the claim and undo, no failure recorded
+            self._apply(f"{tag}-release", "release", cid, "forge-core")
+            _git(self.wt, "reset", "-q", "--hard", tests_commit)
+            _git(self.wt, "clean", "-q", "-fd")
+            raise
 
         tests = [_norm(x) for x in t["test_files"]]
         changed = self._changed()
@@ -805,10 +826,18 @@ class Conductor:
         self._apply(f"{tag}-ci", "test_run", cid, "ci", {"run_id": f"{tag}-ci", "commit": sha, "passed": True})
 
         diff = _git(self.wt, "diff", f"{tests_commit}..{sha}")
-        rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this change against the task. "
-                                    "Reject shortcuts, bare-minimum work, drift from the task, and anything that "
-                                    "weakens tests.\n\n" + self._task_prompt(t) + "\nDIFF:\n" + diff[:60000] +
-                        "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW)
+        try:
+            rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this change against the task. "
+                                        "Reject shortcuts, bare-minimum work, drift from the task, and anything that "
+                                        "weakens tests.\n\n" + self._task_prompt(t) + "\nDIFF:\n" + diff[:60000] +
+                            "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW)
+        except Capped:  # R37: undo the submitted run like a failed judge, but record no failure
+            self._apply(f"{tag}-capped", "fail", cid, "forge-auditor")
+            if self._ledger().contracts().get(cid, {}).get("status") == "failed":
+                self._apply(f"{tag}-reopen", "reopen", cid, "forge-manager")
+            _git(self.wt, "reset", "-q", "--hard", tests_commit)
+            _git(self.wt, "clean", "-q", "-fd")
+            raise
         if not rv.ok:
             return fail(f"reviewer output unusable: {rv.error}", f"reviewer-error:{rv.error}", submitted=True)
         if (rv.data or {}).get("verdict") != "pass":
@@ -903,10 +932,14 @@ class Conductor:
         t = self._task(tid)
         self._reset_wt()
         plan_file = _norm(t["plan_file"])
-        r = self._call("planner", "You are the PLANNER. Write the implementation plan to " + plan_file +
-                       " (and no other file), then return its tasks.\n\n" + self._task_prompt(t) +
-                       "\nEach task needs: id, title, section, files_in_scope, test_files, test_cmd.\n"
-                       "Answer with JSON: {\"tasks\": [...]}", S_PLAN)
+        try:
+            r = self._call("planner", "You are the PLANNER. Write the implementation plan to " + plan_file +
+                           " (and no other file), then return its tasks.\n\n" + self._task_prompt(t) +
+                           "\nEach task needs: id, title, section, files_in_scope, test_files, test_cmd.\n"
+                           "Answer with JSON: {\"tasks\": [...]}", S_PLAN)
+        except Capped:
+            self._reset_wt()
+            raise
         changed = self._changed()
         tasks = (r.data or {}).get("tasks") if r.ok else None
         reason = None
@@ -927,11 +960,16 @@ class Conductor:
                 reason = "plan rejected: task ids clash with existing tasks"
         if not reason:
             plan_text = (self.wt / plan_file).read_text(encoding="utf-8")
-            rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this plan against the task and "
-                                        "design: complete, testable, no placeholders, no drift.\n\n" +
-                            self._task_prompt(t) + "\nPLAN:\n" + plan_text[:60000] + "\nTASKS JSON:\n" +
-                            json.dumps(tasks)[:20000] +
-                            "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW)
+            try:
+                rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this plan against the task and "
+                                            "design: complete, testable, no placeholders, no drift.\n\n" +
+                                self._task_prompt(t) + "\nPLAN:\n" + plan_text[:60000] + "\nTASKS JSON:\n" +
+                                json.dumps(tasks)[:20000] +
+                                "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}",
+                                S_REVIEW)
+            except Capped:
+                self._reset_wt()
+                raise
             if not rv.ok or (rv.data or {}).get("verdict") != "pass":
                 reason = "plan review failed: " + "; ".join(str(x) for x in ((rv.data or {}).get("reasons") or [rv.error]))
         if reason:
@@ -1315,6 +1353,8 @@ def _guarded_smoke(c: Conductor, workdir: Path, force: bool = False) -> list[str
     else:
         try:
             problems = smoke(c.team, workdir, lambda role, prompt, schema, cwd: c._call(role, prompt, schema, cwd=cwd))
+        except Capped as e:  # R37
+            problems = [f"token cap reached during the smoke test ({e})"]
         except Tampered as e:
             problems = [f"state files changed during the smoke test (Forge halted): {e}"[:500]]
         except RuntimeError as e:  # fail-closed preconditions (R15)
