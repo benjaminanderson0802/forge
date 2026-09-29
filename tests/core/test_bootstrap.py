@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from core.agents import FakeAgent
@@ -17,8 +18,7 @@ def git(repo, *args):
 
 
 def py_test(path):
-    exe = subprocess.list2cmdline([sys.executable])
-    return f'{exe} -m unittest {path}'
+    return f'python -m unittest {path}'
 
 
 class Harness(unittest.TestCase):
@@ -205,9 +205,18 @@ class BootstrapTests(Harness):
             f.write_text("import unittest\nclass T(unittest.TestCase):\n def test_fail(self): self.fail('no')\n")
             return json.dumps({"files":[test_file]}),1
         def builder(p,cwd): return '{"status":"ok"}',1
-        task2=self.task(id="T2", title="Second", files_in_scope=["other.py"], test_files=["tests/core/test_other.py"], test_cmd="python -c \"raise SystemExit(1)\"")
+        task2=self.task(id="T2", title="Second", files_in_scope=["other.py"], test_files=["tests/core/test_other.py"], test_cmd=py_test("tests/core/test_other.py"))
         c=self.init(self.task(),task2,agents={"test_writer":writer,"builder":builder})
-        for _ in range(6): c.step()
+        for _ in range(40):
+            c.step()
+            tasks=json.loads((self.state/"queue.json").read_text())["tasks"]
+            if tasks[0]["status"] == "blocked":
+                break
+        for _ in range(40):
+            tasks=json.loads((self.state/"queue.json").read_text())["tasks"]
+            if tasks[1]["status"] == "tests_ok":
+                break
+            c.step()
         tasks=json.loads((self.state/"queue.json").read_text())["tasks"]
         self.assertEqual(tasks[0]["status"],"blocked")
         self.assertEqual(tasks[1]["status"],"tests_ok")
@@ -215,7 +224,7 @@ class BootstrapTests(Harness):
 
     def test_builder_blocked_result_is_failed_attempt(self):
         """Spec: builder status blocked becomes a failed attempt and triggers troubleshooting rules."""
-        c=self.advance_to_build(agents={"test_writer":self.write_tests,"builder":lambda p,c: ('{"status":"blocked","summary":"cannot proceed"}',1)})
+        c=self.advance_to_build(agents={"test_writer":self.write_tests,"builder":lambda p,c: (json.dumps({"status":"blocked","summary":"cannot proceed","tried":["route a","route b"],"error":"boom"}),1)})
         c.step()
         task=json.loads((self.state/"queue.json").read_text())["tasks"][0]
         self.assertNotEqual(task["status"],"blocked")
@@ -344,6 +353,128 @@ class BootstrapTests(Harness):
         self.messages[:]=[{"from":"ben@example.com","subject":"hello","body":"please STOP now"}]
         self.assertEqual(c.step(),"killed")
         self.assertTrue((self.state/"KILL").exists())
+
+    def test_r1_unsafe_test_commands_rejected_and_planner_noted(self):
+        """R1: unsafe shell commands and unlisted unittest paths are rejected."""
+        for command in ['python -c "print(1)"', "del x", "python -m unittest tests/core/test_other.py"]:
+            with self.subTest(command=command):
+                c=self.make_conductor()
+                with self.assertRaises(ValueError): c.init_queue(self.layer,[self.task(test_cmd=command)])
+        task={"id":"P1","kind":"plan","title":"Plan","section":"Plan","plan_file":"plan.md","status":"todo"}
+        def planner(p,cwd):
+            (cwd/"plan.md").write_text("plan")
+            child={"id":"T2","title":"Build","section":"Build","files_in_scope":["feat.py"],"test_files":["tests/core/test_feat.py"],"test_cmd":"python -c \"x\""}
+            return json.dumps({"tasks":[child]}),1
+        c=self.init(task,agents={"planner":planner}); c.step()
+        self.assertTrue(any("unsafe test_cmd" in n for n in json.loads((self.state/"queue.json").read_text())["tasks"][0]["notes"]))
+
+    def test_r2_reply_requires_qid_and_code_but_stop_does_not(self):
+        """R2: qid and code authenticate replies; owner STOP remains code-free."""
+        c=self.init(agents={"test_writer":self.write_tests,"builder":self.build_feature})
+        c.step(); c.step(); c.step(); c.step()
+        qs=json.loads((self.state/"questions.json").read_text()); qid,q=next(iter(qs.items()))
+        subject=next(s for s,b in self.mails if "[Forge Q-" in s)
+        code=q.get("code","missing")
+        no_code=f"Re: [Forge Q-{qid}] ..."
+        for bad in [no_code, subject.replace(code,"wrongcode")]:
+            before=len(self.gh_calls); self.messages[:]=[{"from":"ben@example.com","subject":bad,"body":"yes"}]; c.step()
+            self.assertEqual(len(self.gh_calls),before)
+        self.messages[:]=[{"from":"ben@example.com","subject":"STOP","body":""}]; c.step()
+        self.assertTrue((self.state/"KILL").exists())
+        self.messages[:]=[{"from":"ben@example.com","subject":subject,"body":"yes"}]; c.step()
+        self.assertTrue(any(a[:2]==["pr","merge"] for a in self.gh_calls))
+
+    def test_r3_failed_merge_keeps_gate_open_and_emails_error(self):
+        """R3: failed gh merge leaves approval open and reports the error."""
+        c=self.init(agents={"test_writer":self.write_tests,"builder":self.build_feature})
+        c.step(); c.step(); c.step(); c.step()
+        qid,q=next(iter(json.loads((self.state/"questions.json").read_text()).items()))
+        c.gh=lambda args: (1,"merge failed") if args[:2]==["pr","merge"] else (0,"")
+        subj=next(s for s,b in self.mails if "[Forge Q-" in s)
+        self.messages[:]=[{"from":"ben@example.com","subject":subj,"body":"yes"}]; c.step()
+        self.assertEqual(json.loads((self.state/"questions.json").read_text())[qid]["status"],"open")
+        self.assertTrue(any("error" in (s+b).lower() for s,b in self.mails))
+
+    def test_r4_empty_and_timed_out_test_runs_are_rejected(self):
+        """R4: acceptance needs a real failing unittest run that completes."""
+        rejected=[]
+        for source in ["import unittest\n", "import time; time.sleep(5)\n"]:
+            def writer(p,cwd,source=source):
+                f=cwd/"tests/core/test_feat.py"; f.parent.mkdir(parents=True,exist_ok=True); f.write_text(source)
+                return '{"files":["tests/core/test_feat.py"]}',1
+            c=self.init(agents={"test_writer":writer}, limits={"test_timeout_s":1,"claude_daily_token_cap":10**9,"codex_daily_token_cap":10**9}); c.step()
+            t=json.loads((self.state/"queue.json").read_text())["tasks"][0]
+            rejected.append(any(n.startswith("tests rejected: no real failing run") for n in t["notes"]))
+        self.assertEqual(rejected,[True,True])
+
+    def test_r5_troubleshooter_three_rounds(self):
+        """R5: repeated failures allow three troubleshoot rounds."""
+        c=self.advance_to_build(agents={"test_writer":self.write_tests,"builder":lambda p,c: ('{"status":"ok"}',1)})
+        for _ in range(8): c.step()
+        self.assertEqual(len(c.team.troubleshooter.prompts),3)
+
+    def test_r5_blocker_easy_out(self):
+        """R5: unsupported blocker is an easy out."""
+        c=self.advance_to_build(agents={"test_writer":self.write_tests,"builder":lambda p,c: ('{"status":"blocked","summary":"x"}',1)})
+        c.step(); t=json.loads((self.state/"queue.json").read_text())["tasks"][0]
+        self.assertIn("blocker rejected: no evidence (easy out)"," ".join(t["notes"]))
+        self.assertTrue((self.state/"easy_outs.jsonl").exists())
+
+    def test_r6_malformed_drift_retries_then_pauses(self):
+        """R6: unusable drift results keep the gate closed and pause after three tries."""
+        c=self.init(agents={"test_writer":self.write_tests,"builder":self.build_feature,"drift_keeper":lambda p,c: ("not json",1)})
+        c.step(); c.step()
+        for _ in range(3): c.step()
+        self.assertTrue((self.state/"PAUSED").exists())
+        self.assertTrue(any("[Forge Q-" in s for s,b in self.mails))
+
+    def test_r7_mail_and_inbox_failures_are_recovered(self):
+        """R7: failed sends are retried and inbox exceptions are logged without escaping."""
+        c=self.init(); calls=[0]
+        def flaky(s,b):
+            calls[0]+=1
+            if calls[0]==1: raise RuntimeError("mail down")
+            self.mails.append((s,b))
+        c.mailer=flaky
+        try: c._ask("blocked","subject","body",task="T1")
+        except RuntimeError: pass
+        initial=json.loads((self.state/"questions.json").read_text())
+        initially_undelivered=next(iter(initial.values())).get("delivered") is False
+        c.step()
+        delivered_on_retry=next(iter(json.loads((self.state/"questions.json").read_text()).values())).get("delivered",False)
+        c.inbox=lambda: (_ for _ in ()).throw(RuntimeError("inbox down"))
+        self.assertIsInstance(c.step(),str)
+        self.assertTrue(initially_undelivered)
+        self.assertTrue(delivered_on_retry)
+        self.assertTrue((self.state/"errors.log").exists())
+
+    def test_r8_git_status_error_fails_attempt_without_escaping_step(self):
+        """R8: git status failure is an attempt failure and never escapes step."""
+        def writer(p,cwd):
+            f=cwd/"tests/core/test_feat.py"; f.parent.mkdir(parents=True,exist_ok=True)
+            f.write_text("import unittest\nclass T(unittest.TestCase):\n def test_x(self): self.fail()\n")
+            return '{"files":["tests/core/test_feat.py"]}',1
+        c=self.init(agents={"test_writer":writer})
+        real_run=subprocess.run
+        def broken_status(args,*a,**kw):
+            if args[:2]==["git","status"]: return subprocess.CompletedProcess(args,1,b"",b"broken git")
+            return real_run(args,*a,**kw)
+        try:
+            with patch("core.bootstrap.subprocess.run",side_effect=broken_status): result=c.step()
+        except Exception as exc: self.fail(f"step leaked git error: {exc}")
+        self.assertEqual(result,"worked")
+        self.assertIn("git error"," ".join(json.loads((self.state/"queue.json").read_text())["tasks"][0]["notes"]))
+
+    def test_r9_state_write_by_builder_kills_and_emails_tamper_question(self):
+        """R9: builder state tampering triggers KILL and a tamper question before completion."""
+        def tamper(p,cwd):
+            (self.state/"forged.json").write_text("bad")
+            (cwd/"feat.py").write_text("VALUE = 42\n")
+            return '{"status":"done"}',1
+        c=self.advance_to_build(agents={"test_writer":self.write_tests,"builder":tamper}); c.step()
+        self.assertTrue((self.state/"KILL").exists())
+        self.assertTrue(any("tamper" in s.lower() for s,b in self.mails))
+        self.assertNotEqual(json.loads((self.state/"queue.json").read_text())["tasks"][0]["status"],"done")
 
 
 if __name__ == "__main__":
