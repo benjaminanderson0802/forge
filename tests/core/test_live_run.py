@@ -1137,3 +1137,76 @@ class ReviewRoundFourReaderTests(Harness):
         self.assertEqual(read(), [])
         self.assertEqual(self.reader(server)(), [])
         self.assertEqual(server.stores, [])
+
+
+class RealTeamTokenCapTests(Harness):
+    def setUp(self):
+        super().setUp()
+        launch_patch = patch("core.agents.launch", side_effect=AssertionError("unexpected agent launch"))
+        self.launch = launch_patch.start()
+        self.addCleanup(launch_patch.stop)
+        self.cap = 10
+        self.clock = lambda: datetime(2026, 9, 29, 8, tzinfo=timezone.utc)
+        limits = {"claude_daily_token_cap": 100, "codex_daily_token_cap": self.cap}
+        self.c = Conductor(
+            self.repo, self.work, self.state, bootstrap.real_team(limits), limits,
+            owner_email="ben@example.com", mailer=lambda s, b: self.mails.append((s, b)),
+            inbox=lambda: [], gh=self.gh, clock=self.clock, judge_cmds=[], push=False,
+        )
+        self.agent_runs = []
+        for role in Team.__dataclass_fields__:
+            run_patch = patch.object(
+                getattr(self.c.team, role), "run",
+                side_effect=AssertionError(f"unexpected {role} agent call"),
+            )
+            self.agent_runs.append(run_patch.start())
+            self.addCleanup(run_patch.stop)
+
+    def add_codex_usage(self, tokens):
+        from core.usage import Meter
+
+        Meter(self.state, self.clock).add("codex", tokens)
+        self.assertEqual(self.c.meter.used_today("codex"), tokens)
+
+    def test_R6_claude_provider_identifies_token_caps(self):
+        """R6: Claude's provider id matches the meter id used for token caps."""
+        from core.agents import ClaudeAgent
+
+        self.assertEqual(ClaudeAgent().provider, "claude")
+
+    def test_R6_codex_provider_identifies_token_caps(self):
+        """R6: Codex's provider id matches the meter id used for token caps."""
+        from core.agents import CodexAgent
+
+        self.assertEqual(CodexAgent().provider, "codex")
+
+    def test_R6_real_team_detects_exceeded_token_caps(self):
+        """R6: token caps apply to real_team members with persisted Codex usage."""
+        self.add_codex_usage(self.cap + 1)
+        self.assertIs(self.c._capped(), True)
+        self.launch.assert_not_called()
+
+    def test_R6_real_team_step_stops_at_token_caps(self):
+        """R6: token caps make a real-team conductor step return capped."""
+        self.add_codex_usage(self.cap + 1)
+        self.assertEqual(self.c.step(), "capped")
+        for run in self.agent_runs:
+            run.assert_not_called()
+        self.launch.assert_not_called()
+
+    def test_R29_real_team_guarded_smoke_respects_token_caps(self):
+        """R29: token caps stop guarded smoke before any real-team agent call."""
+        self.add_codex_usage(self.cap + 1)
+        problems = bootstrap._guarded_smoke(self.c, self.work)
+        with self.subTest(check="cap problem"):
+            self.assertTrue(any("cap" in problem.lower() for problem in problems), problems)
+        for role, run in zip(Team.__dataclass_fields__, self.agent_runs):
+            with self.subTest(role=role):
+                run.assert_not_called()
+        self.launch.assert_not_called()
+
+    def test_R6_real_team_under_token_caps_is_not_capped(self):
+        """R6: usage below token caps does not cap a real-team conductor."""
+        self.add_codex_usage(self.cap - 1)
+        self.assertIs(self.c._capped(), False)
+        self.launch.assert_not_called()
