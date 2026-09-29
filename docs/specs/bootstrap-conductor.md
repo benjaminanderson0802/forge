@@ -232,3 +232,35 @@ The first run with real agents and real email hit four faults no fake-based test
   - every role must return JSON that passes its schema.
 
   `main run` runs the smoke test when `state/smoke_ok.json` is missing or more than 24 hours old. If the smoke test fails, the conductor logs the problems, emails Ben (R22 rate), and exits without starting the loop. `python -m core.bootstrap smoke` runs it on demand and prints the result.
+
+## Review round 1 amendments to R17–R23 (Codex review, 2026-09-29)
+
+- **R24 KILL silences everything except one halt alert.**
+  - While KILL is set, `_send` refuses every email except a halt alert: `_send(..., halt=True)`.
+  - A halt alert still counts against the mail budget and goes out at most once every 12 hours (notice key `halt`), so Ben always learns that Forge stopped, and why, but never gets a stream of alerts.
+  - The tamper path records its question and then delivers it as a halt alert.
+  - `_handle_inbox` stops processing the moment a STOP sets KILL.
+- **R25 The budget counts attempts.** `_send` records the attempt in `mail_log.json` before calling SMTP, and an attempt that fails still counts. `_notice_once` records its throttle time before sending, too. A retry can therefore never exceed the budget, even if SMTP failed after the message went out.
+- **R26 Self-mail is rejected three ways, and Ben's read status is never touched.**
+  1. The `X-Forge-Outgoing` header.
+  2. Every email Forge sends gets its own `Message-ID`. The last 500 are kept in `mail_log.json`, and any incoming message with one of those IDs is ignored.
+  3. The inbox reader keeps the IDs of the messages it has already handled in `state/inbox_seen.json`. On its first read, when that file is missing, it records every current Forge message as handled and returns nothing. So no email from before the first start (the incident's included) can ever count as an answer.
+
+  The inbox reader searches the last 3 days for subjects containing `[Forge` (and for a subject of just `STOP`). It uses peek-only fetches, so it never changes Ben's read or unread flags. It fetches headers first, and then bodies only for new messages that aren't Forge's own.
+- **R27 STOP means Ben wrote "stop".** KILL is set when the subject, with any `Re:` or `Fwd:` prefixes removed, is exactly `stop`, or when the first word of the cleaned reply (quoted text removed) is `stop`. Case and trailing punctuation are ignored. STOP works as a reply to any Forge email, including the notices.
+- **R28 Every stored thing is bounded.**
+  - Question subjects are capped at 300 characters and bodies at 20000 before they are stored.
+  - `questions.json` keeps every open question and the 50 most recent closed ones.
+  - Queue-level `notes` follow the R19 caps.
+- **R29 The smoke test is guarded like real work.**
+  - `smoke(team, workdir, call=None)` runs each role through `call(role, prompt, schema, cwd)`. `main` passes the conductor's `_call` (which now takes a `cwd`), so every smoke run gets the fail-closed checks, the tamper guard (KILL plus a halt alert), metering and a run record.
+  - The smoke test doesn't start if the token cap has been reached.
+  - Each role gets a fresh throwaway repo.
+  - A role passes only if:
+    - its answer passes full schema validation (`agents.schema_ok`: types, enums, required keys, nested items);
+    - a writer role produced `smoke.txt` as a regular file containing `ok`, and nothing else changed;
+    - a read-only role changed nothing: git `HEAD` and the file list both match the starting snapshot.
+  - Git errors count as problems, and a folder that can't be cleaned up is reported.
+  - Before each attempt, `smoke_ok.json` is deleted, and it is written again only on full success.
+  - After a failed attempt, `smoke_fail.json` holds the time, and watchdog restarts skip the smoke test (and don't start the loop) for the next 30 minutes.
+- **R30 `strict_schema` is complete for the forms Forge uses.** An optional field that has an `enum` also gets `null` added to the enum. `anyOf`, `$defs` and `definitions` are converted recursively.
