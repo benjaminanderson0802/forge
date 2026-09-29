@@ -231,7 +231,10 @@ class Conductor:
         d = self.state / "runs" / run_id
         d.mkdir(parents=True, exist_ok=True)
         (d / "prompt.md").write_bytes(prompt.encode("utf-8"))
-        before = self._fingerprint()
+        try:
+            before = self._fingerprint()
+        except OSError as e:  # R15: fail closed; state we can't fully check can't be protected
+            raise RuntimeError(f"state could not be fingerprinted before agent run: {type(e).__name__}: {e}") from e
         unreadable = sorted(k for k, v in before.items() if v.startswith("unreadable:"))
         if unreadable:  # R15: fail closed; a file we can't read can't be checked for tampering
             raise RuntimeError("state file unreadable before agent run: " + ", ".join(unreadable))
@@ -242,14 +245,20 @@ class Conductor:
         except Exception as e:  # noqa: BLE001 - an agent crash is a failed result
             from core.agents import AgentResult
             r = AgentResult("", 0, False, repr(e), None, getattr(agent, "provider", "unknown"))
-        after = self._fingerprint()
-        if after != before:
+        try:
+            after = self._fingerprint()
             changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+        except Exception as e:  # noqa: BLE001 - R15: a check that can't complete counts as tampering
+            changed = [f"state could not be fingerprinted after the run: {type(e).__name__}: {e}"]
+        if changed:
             (self.state / "KILL").write_text("state tampered during an agent run\n")
-            self._log(f"TAMPER during {role} run {run_id}: {changed}")
-            self._ask("tamper", f"Forge stopped: a {role} agent changed Forge's own state files",
-                      "Files changed during the agent run:\n" + "\n".join(changed) +
-                      "\n\nForge is halted (KILL). Nothing from that run was recorded.")
+            try:
+                self._log(f"TAMPER during {role} run {run_id}: {changed}")
+                self._ask("tamper", f"Forge stopped: a {role} agent changed Forge's own state files",
+                          "Files changed during the agent run:\n" + "\n".join(changed) +
+                          "\n\nForge is halted (KILL). Nothing from that run was recorded.")
+            except Exception:  # noqa: BLE001 - the halt stands even if the report can't be written
+                pass
             raise Tampered(", ".join(changed))
         if r.tokens:
             self.meter.add(r.provider or "unknown", r.tokens)
@@ -263,21 +272,28 @@ class Conductor:
         is exempt. Run records (which only grow) and the lock file use a size+mtime signature; everything else a
         sha256 (R15)."""
         fp = {}
-        for f in self.state.rglob("*"):
-            if not f.is_file():
-                continue
-            rel = f.relative_to(self.state).as_posix()
-            st = f.stat()
-            if rel == LOCK_NAME:  # R15: unreadable to us on Windows; kept empty, so identity is enough
-                fp[rel] = f"lock:{st.st_size}:{st.st_ino}:{st.st_mtime_ns}"
-            elif rel.startswith("runs/"):
-                fp[rel] = f"{st.st_size}:{st.st_mtime_ns}"
-            else:
-                try:
-                    fp[rel] = hashlib.sha256(f.read_bytes()).hexdigest()
-                except OSError:  # R15: never skip; an unreadable file can't match any readable hash
-                    fp[rel] = f"unreadable:{st.st_size}:{st.st_mtime_ns}"
+
+        def fail(e: OSError) -> None:  # R15: a folder we can't list is an error, never silently skipped
+            raise e
+
+        for root, _dirs, files in os.walk(self.state, onerror=fail):
+            for name in files:
+                f = Path(root) / name
+                rel = f.relative_to(self.state).as_posix()
+                fp[rel] = self._signature(f, rel)
         return fp
+
+    @staticmethod
+    def _signature(f: Path, rel: str) -> str:
+        st = f.stat()
+        if rel == LOCK_NAME:  # R15: unreadable to us on Windows; kept empty, so identity is enough
+            return f"lock:{st.st_size}:{st.st_ino}:{st.st_mtime_ns}"
+        if rel.startswith("runs/"):
+            return f"{st.st_size}:{st.st_mtime_ns}"
+        try:
+            return hashlib.sha256(f.read_bytes()).hexdigest()
+        except OSError:  # R15: never skip; an unreadable file can't match any readable hash
+            return f"unreadable:{st.st_size}:{st.st_mtime_ns}"
 
     def _log(self, msg: str) -> None:
         with (self.state / "errors.log").open("a", encoding="utf-8") as f:
