@@ -860,3 +860,86 @@ class ReviewRoundTwoReplyTests(Harness):
         status = c.step()
         self.assertFalse((self.state / "KILL").exists())
         self.assertEqual(status, "paused")
+
+
+class R33LineEndingTests(unittest.TestCase):
+    def test_R33_on_wrote_normalizes_mail_line_endings(self):
+        """R33: normalize CRLF and lone CR before a wrapped On ... wrote: quote."""
+        for ending in ("\r\n", "\r"):
+            with self.subTest(ending=repr(ending)):
+                body = ending.join([
+                    "Yes, continue", "", "On Tue, Sep 29, 2026 at 1:15 PM Forge <x@gmail.com>",
+                    "wrote:", "To stop everything: reply STOP", "",
+                ])
+                self.assertEqual(bootstrap.clean_reply(body), "Yes, continue")
+
+    def test_R33_original_message_normalizes_mail_line_endings(self):
+        """R33: normalize CRLF and lone CR before an Original Message separator."""
+        for ending in ("\r\n", "\r"):
+            with self.subTest(ending=repr(ending)):
+                body = ending.join([
+                    "Yes, continue", "", "-----Original Message-----",
+                    "To stop everything: reply STOP", "",
+                ])
+                self.assertEqual(bootstrap.clean_reply(body), "Yes, continue")
+
+    def test_R33_underscores_normalizes_mail_line_endings(self):
+        """R33: normalize CRLF and lone CR before an underscores quote separator."""
+        for ending in ("\r\n", "\r"):
+            with self.subTest(ending=repr(ending)):
+                body = ending.join([
+                    "Yes, continue", "________________________________",
+                    "To stop everything: reply STOP", "",
+                ])
+                self.assertEqual(bootstrap.clean_reply(body), "Yes, continue")
+
+    def test_R33_from_headers_normalizes_mail_line_endings(self):
+        """R33: normalize CRLF and lone CR before From plus Sent, Date, or To headers."""
+        for ending in ("\r\n", "\r"):
+            for header in ("Sent: today", "Date: today", "To: Ben"):
+                with self.subTest(ending=repr(ending), header=header):
+                    body = ending.join([
+                        "Yes, continue", "From: Forge <x@gmail.com>", header, "",
+                        "To stop everything: reply STOP", "",
+                    ])
+                    self.assertEqual(bootstrap.clean_reply(body), "Yes, continue")
+
+
+class R33SMTPReplyTests(Harness):
+    reader = ReviewInboxTests.reader
+
+    def test_R33_smtp_outlook_quote_through_gmail_inbox_does_not_kill(self):
+        """R33: an SMTP reply delivered after baseline cannot STOP via its Outlook quote."""
+        from email.message import EmailMessage
+        from email.policy import SMTP
+
+        c = self.make_conductor()
+        server = FakePeekIMAP()
+        read = self.reader(server)
+        self.assertEqual(read(), [])
+
+        msg = EmailMessage()
+        msg["From"] = c.owner
+        msg["To"] = c.owner
+        msg["Subject"] = "Re: [Forge] conductor started"
+        msg["Message-ID"] = "<r33-smtp-reply@example.com>"
+        msg.set_content(
+            "Yes, continue\n________________________________\nFrom: Forge\n"
+            "Sent: today\nTo: Ben\nSubject: [Forge] conductor started\n\n"
+            "To stop everything: reply STOP\n"
+        )
+        raw = msg.as_bytes(policy=SMTP)
+        self.assertIn(b"Yes, continue\r\n________________________________\r\n", raw)
+        server.messages.append(raw)
+
+        messages = read()
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["from"], c.owner)
+        self.assertEqual(messages[0]["subject"], "Re: [Forge] conductor started")
+        self.assertIn("To stop everything: reply STOP", messages[0]["body"])
+        c.inbox = Mock(return_value=messages)
+        (self.state / "PAUSED").touch()  # Process the real decoded reply before task work.
+        status = c.step()
+        c.inbox.assert_called_once_with()
+        self.assertFalse((self.state / "KILL").exists())
+        self.assertEqual(status, "paused")
