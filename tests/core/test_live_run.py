@@ -703,3 +703,160 @@ class ReviewSmokeTests(Harness):
         self.now += timedelta(minutes=2)
         bootstrap._guarded_smoke(c, self.work)
         self.assertTrue(calls)
+
+
+class ReviewRoundTwoRunTests(Harness):
+    read_state = LiveRunTests.read_state
+
+    def setUp(self):
+        super().setUp()
+        # main has no state override and checks its local state before smoke.
+        # Redirect __file__ rather than mocking Path: real Path semantics then
+        # give main and Conductor the same isolated state directory (unlike an
+        # __init__-only redirect). The initializer wrapper only injects a clock.
+        self.state = self.repo / "state" / "bootstrap"
+        self.state.mkdir(parents=True)
+        self.now = datetime(2026, 9, 29, 8, tzinfo=timezone.utc)
+        self.make_conductor()
+        self.c.clock = lambda: self.now
+        self.c._write("smoke_ok.json", {"at": (self.now - timedelta(hours=25)).isoformat()})
+        self.inbox = Mock(side_effect=lambda: list(self.messages))
+        real_init = Conductor.__init__
+
+        def timed_init(conductor, *args, **kwargs):
+            kwargs["clock"] = lambda: self.now
+            real_init(conductor, *args, **kwargs)
+
+        patches = {
+            "module_file": patch("core.bootstrap.__file__", str(self.repo / "core" / "bootstrap.py")),
+            "limits": patch("core.agents.load_limits", return_value=self.c.limits),
+            "team": patch("core.bootstrap.real_team", return_value=self.team),
+            "mailer": patch("core.bootstrap.gmail_mailer", return_value=self.c.mailer),
+            "inbox_factory": patch("core.bootstrap.gmail_inbox", return_value=self.inbox),
+            "gh": patch("core.bootstrap.gh_cli", return_value=self.gh),
+            "init": patch.object(Conductor, "__init__", new=timed_init),
+            "lock": patch("core.bootstrap.acquire_lock", side_effect=lambda state: Mock()),
+            "guarded_smoke": patch("core.bootstrap._guarded_smoke", return_value=[]),
+            "smoke": patch("core.bootstrap.smoke", return_value=[]),
+            "run": patch.object(Conductor, "run", return_value="idle"),
+        }
+        self.cli = {}
+        for name, patcher in patches.items():
+            self.cli[name] = patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def assert_no_work(self):
+        self.cli["guarded_smoke"].assert_not_called()
+        self.cli["smoke"].assert_not_called()
+        self.cli["run"].assert_not_called()
+
+    def pending_halt(self, qid="tamper-1"):
+        questions = self.c._read("questions.json", {})
+        questions[qid] = {"kind": "tamper", "status": "open", "code": "abcdefgh",
+                          "subject": "Forge tamper halt", "body": "tamper: queue.json changed",
+                          "halt": True, "delivered": False}
+        self.c._write("questions.json", questions)
+        (self.state / "KILL").touch()
+        return qid
+
+    def test_R31_cli_owner_stop_prevents_stale_smoke_and_run(self):
+        self.assertFalse((self.state / "KILL").exists())
+        self.assertTrue(bootstrap._smoke_stale(self.state, self.now))
+        self.messages.append({"from": "benjaminanderson0802@gmail.com",
+                              "subject": "Re: [Forge] smoke failed", "body": "STOP"})
+        self.assertEqual(bootstrap.main(["run"]), 0)
+        with self.subTest(check="kill"):
+            self.assertTrue((self.state / "KILL").exists())
+        with self.subTest(check="no work"):
+            self.assert_no_work()
+        with self.subTest(check="inbox"):
+            self.inbox.assert_called_once_with()
+
+    def test_R31_cli_without_stop_reads_inbox_before_stale_smoke(self):
+        events = []
+        self.inbox.side_effect = lambda: events.append("inbox") or []
+        self.cli["guarded_smoke"].side_effect = lambda *a, **kw: events.append("smoke") or []
+        self.assertEqual(bootstrap.main(["run"]), 0)
+        self.cli["guarded_smoke"].assert_called_once()
+        self.assertEqual(events, ["inbox", "smoke"])
+        self.assertFalse((self.state / "KILL").exists())
+
+    def test_R32_cli_killed_retries_halt_and_throttles_across_restarts(self):
+        qid = self.pending_halt()
+        self.assertEqual(bootstrap.main(["run"]), 0)
+        with self.subTest(check="delivery"):
+            self.assertEqual(len(self.mails), 1)
+            self.assertIn("tamper", " ".join(self.mails[0]).lower())
+            self.assertIs(self.read_state("questions.json")[qid]["delivered"], True)
+        with self.subTest(check="no work"):
+            self.assert_no_work()
+        self.inbox.assert_not_called()
+        # Another pending halt makes this exercise the persisted throttle, not
+        # merely the delivered flag on the first question.
+        second = self.pending_halt("tamper-2")
+        self.now += timedelta(hours=11, minutes=59)
+        before = list(self.mails)
+        self.assertEqual(bootstrap.main(["run"]), 0)
+        self.assertEqual(self.mails, before)
+        self.assertIs(self.read_state("questions.json")[second]["delivered"], False)
+        with self.subTest(check="restart no work"):
+            self.assert_no_work()
+        self.inbox.assert_not_called()
+
+    def test_R32_cli_budget_refusal_does_not_reserve_halt_throttle(self):
+        self.c.limits.update(mail_per_hour=1, mail_per_day=30)
+        self.assertTrue(self.c._send("ordinary", "uses this hour's budget"))
+        self.mails.clear()
+        qid = self.pending_halt()
+        self.assertEqual(bootstrap.main(["run"]), 0)
+        self.assertEqual(self.mails, [])
+        self.assertNotIn("halt", self.c._read("notices.json", {}))
+        self.assertIs(self.read_state("questions.json")[qid]["delivered"], False)
+        with self.subTest(check="no work before budget reset"):
+            self.assert_no_work()
+        self.now += timedelta(minutes=61)  # Budget resets well before 12h.
+        self.assertEqual(bootstrap.main(["run"]), 0)
+        with self.subTest(check="delivery after budget reset"):
+            self.assertEqual(len(self.mails), 1)
+            self.assertIn("tamper", " ".join(self.mails[0]).lower())
+            self.assertIs(self.read_state("questions.json")[qid]["delivered"], True)
+        with self.subTest(check="no work after budget reset"):
+            self.assert_no_work()
+        self.inbox.assert_not_called()
+
+
+class ReviewRoundTwoReplyTests(Harness):
+    def test_R32_ask_persists_halt_for_failed_delivery(self):
+        c = self.make_conductor()
+        (self.state / "KILL").touch()
+        c.mailer = Mock(side_effect=OSError("fake SMTP failure"))
+        qid = c._ask("tamper", "tamper halt", "queue changed", halt=True)
+        question = json.loads((self.state / "questions.json").read_text(encoding="utf-8"))[qid]
+        self.assertIs(question.get("halt"), True)
+        self.assertIs(question["delivered"], False)
+
+    def test_R33_clean_reply_removes_wrapped_and_outlook_quotes(self):
+        bodies = [
+            "Yes, continue\n\nOn Tue, Sep 29, 2026 at 1:15 PM Forge <x@gmail.com>\nwrote:\n> reply STOP to stop",
+            "Yes, continue\n\n-----Original Message-----\nFrom: x\nSent: y\nreply STOP",
+            "Yes, continue\n________________________________\nFrom: Forge\nSent: today\nTo: Ben\nSubject: [Forge] conductor started\n\nTo stop everything: reply STOP",
+            "Yes, continue\nFrom: Forge <x@gmail.com>\nDate: today\nTo: Ben\n\nreply STOP",
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertEqual(bootstrap.clean_reply(body), "Yes, continue")
+
+    def test_R33_clean_reply_keeps_from_line_without_header_block(self):
+        self.assertEqual(bootstrap.clean_reply("From: my notes, keep going"),
+                         "From: my notes, keep going")
+
+    def test_R33_outlook_start_notice_quote_does_not_kill(self):
+        c = self.make_conductor()
+        self.messages.append({"from": c.owner, "subject": "Re: [Forge] conductor started",
+                              "body": "Yes, continue\n________________________________\nFrom: Forge\n"
+                                      "Sent: today\nTo: Ben\nSubject: [Forge] conductor started\n\n"
+                                      "To stop everything: reply STOP"})
+        (self.state / "PAUSED").touch()  # Process mail, then stop before task work.
+        status = c.step()
+        self.assertFalse((self.state / "KILL").exists())
+        self.assertEqual(status, "paused")

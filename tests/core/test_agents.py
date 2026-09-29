@@ -306,3 +306,79 @@ class R30StrictSchemaTests(unittest.TestCase):
                 self.assertEqual(nested["required"], ["value"])
                 self.assertEqual(strict["$ref"], schema["$ref"])
                 self.assertEqual(schema, before)
+
+
+class R34NullOptionalTests(unittest.TestCase):
+    def answer(self, path, payload, schema):
+        from unittest.mock import patch
+        text = json.dumps(payload)
+        if path == "fake":
+            return FakeAgent(lambda p, c: (text, 1)).run("answer", Path("."), schema)
+
+        def fake_launch(args, cwd, stdin_text, timeout_s):
+            Path(args[args.index("-o") + 1]).write_text(text, encoding="utf-8")
+            return 0, json.dumps({"type": "turn.completed", "usage": {}}), ""
+
+        with patch("core.agents._resolve", return_value=["fake-codex"]), patch(
+                "core.agents.launch", side_effect=fake_launch):
+            return CodexAgent().run("answer", Path("."), schema)
+
+    def test_R34_null_optional_summary_is_absent_and_valid(self):
+        from core.agents import _shape_ok, schema_ok
+        from core.bootstrap import S_TESTS
+        for path in ("fake", "codex"):
+            with self.subTest(path=path):
+                result = self.answer(path, {"files": ["smoke.txt"], "summary": None}, S_TESTS)
+                self.assertTrue(result.ok, result.error)
+                self.assertTrue(_shape_ok(result.data, S_TESTS))
+                with self.subTest(check="conductor smoke schema"):
+                    self.assertTrue(schema_ok(result.data, S_TESTS))
+                self.assertEqual(result.data["files"], ["smoke.txt"])
+                self.assertNotIn("summary", result.data)
+
+    def test_R34_null_required_files_still_fails_validation(self):
+        from core.agents import schema_ok
+        from core.bootstrap import S_TESTS
+        for path in ("fake", "codex"):
+            with self.subTest(path=path):
+                result = self.answer(path, {"files": None}, S_TESTS)
+                # Either the agent rejects the answer or the conductor's full
+                # schema check does; null must never become a valid files list.
+                self.assertFalse(result.ok and schema_ok(result.data, S_TESTS))
+                if result.data is not None:
+                    self.assertIn("files", result.data)
+                    self.assertIsNone(result.data["files"])
+
+    def test_R34_nested_optional_nulls_are_removed_recursively(self):
+        import copy
+        from core.agents import _shape_ok, schema_ok
+        # S_PLAN's task fields are all required. Use an object inside an array
+        # with a further nested object to exercise optional fields at both levels.
+        schema = {"type": "object", "required": ["tasks"], "properties": {
+            "tasks": {"type": "array", "items": {"type": "object", "required": ["id", "details"],
+                "properties": {"id": {"type": "string"}, "summary": {"type": "string"},
+                    "details": {"type": "object", "required": ["name"], "properties": {
+                        "name": {"type": "string"}, "note": {"type": "string"}}}}}}}}
+        payload = {"tasks": [{"id": "T1", "summary": None, "details": {"name": "one", "note": None}},
+                             {"id": "T2", "summary": "keep", "details": {"name": "two", "note": "keep"}}]}
+        expected = {"tasks": [{"id": "T1", "details": {"name": "one"}}, payload["tasks"][1]]}
+        original_schema = copy.deepcopy(schema)
+        for path in ("fake", "codex"):
+            with self.subTest(path=path):
+                result = self.answer(path, payload, schema)
+                self.assertTrue(result.ok, result.error)
+                self.assertTrue(_shape_ok(result.data, schema))
+                with self.subTest(check="nested schema"):
+                    self.assertTrue(schema_ok(result.data, schema))
+                self.assertEqual(result.data, expected)
+                self.assertEqual(schema, original_schema)
+
+    def test_R34_nested_required_null_still_fails_validation(self):
+        from core.agents import schema_ok
+        schema = {"type": "object", "required": ["tasks"], "properties": {
+            "tasks": {"type": "array", "items": {"type": "object", "required": ["id"],
+                "properties": {"id": {"type": "string"}, "summary": {"type": "string"}}}}}}
+        for path in ("fake", "codex"):
+            with self.subTest(path=path):
+                result = self.answer(path, {"tasks": [{"id": None, "summary": None}]}, schema)
+                self.assertFalse(result.ok and schema_ok(result.data, schema))
