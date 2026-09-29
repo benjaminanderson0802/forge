@@ -210,3 +210,25 @@ A `kind == "plan"` task with status `todo`:
   - **Tamper after a run.** A file that becomes unreadable during a run gets an `unreadable:<size>:<mtime>` signature. That never equals a sha256, so the tamper alarm fires.
   - **The check itself must complete.** The fingerprint walks `state/` strictly: any error listing a folder or reading a file's details raises, and nothing inaccessible is silently left out. Before a run, a fingerprint that fails means the agent is not launched (stage error). After a run, a fingerprint that fails counts as tampering: KILL is written, Ben is emailed, and nothing from the run is recorded.
 - **R16 Codex keeps the Windows sandbox.** `--ignore-user-config` also drops Ben's `windows.sandbox` setting, and without it Codex silently downgrades `workspace-write` to read-only, so the test writer could never write. On Windows, `CodexAgent` passes `-c windows.sandbox="elevated"` for every sandbox mode. The setting only chooses Windows' sandbox implementation, so the reviewer stays `read-only`. Prerequisite for unattended runs: the Codex Windows sandbox has been set up once on the PC (done 2026-09-28).
+
+## Live-run amendments, round 2 (first real agent runs, 2026-09-29)
+
+The first run with real agents and real email hit four faults no fake-based test could see. It sent Ben about 27 emails, each blocked email twice the size of the last. These rules stop each fault and bound the damage from any fault like it.
+
+- **R17 Real answer schemas.** Each role's schema (`S_TESTS`, `S_BUILD`, `S_REVIEW`, `S_TROUBLE`, `S_DRIFT`, `S_PLAN`) is a full JSON Schema: `"type": "object"`, `properties` with types, and `required` listing the keys the conductor needs. Codex receives a strict form built by `agents.strict_schema(schema)`:
+  - every object gets `additionalProperties: false`, and every property is listed in `required`;
+  - properties that weren't required become nullable;
+  - this applies recursively, through nested objects and array items.
+
+  The conductor's own shape check (`_shape_ok`) still checks only the original `required` keys. When Codex fails, `AgentResult.error` includes Codex's own error message (the `turn.failed` or `error` event), not only the exit code.
+- **R18 Forge never reads its own mail.** Every email Forge sends carries the header `X-Forge-Outgoing: 1`. The inbox reader reports it as `"outgoing": True`, and the conductor ignores every message marked outgoing. A reply is also cleaned before use: quoted lines (starting `>`) and everything from `On … wrote:` onward are dropped, and the result is capped at 2000 characters.
+- **R19 Nothing grows without bound.** Every entry stored in a task's `notes` or `trouble_notes` is capped at 2000 characters, and each list keeps only its last 30 entries. The body of every email Forge sends is capped at 20000 characters.
+- **R20 Mail budget.** All outgoing email goes through one method, `_send(subject, body) -> bool`. It sends at most `mail_per_hour` (default 6) and `mail_per_day` (default 30) emails, counted in `state/mail_log.json`. Over budget, nothing is sent: `_send` returns False, a question stays undelivered and is retried later, and the budget hit is logged once per window.
+- **R21 KILL means everything stops.** `step()` checks KILL before anything else, including the inbox, and returns `"killed"`. No email is read or sent while KILL is set.
+- **R22 The start email is rare.** "conductor started" is sent only when KILL is absent, and at most once every 12 hours (the time of the last one is kept in `state/notices.json`). The same once-per-12-hours rule covers the "keeps hitting an error" email and the smoke-test failure email (R23).
+- **R23 Live smoke test before running.** `smoke(team, workdir) -> list[str]` runs each role once for real, on a tiny throwaway git repo, and returns a list of problems (empty means all passed):
+  - the roles that write files (test writer, builder, planner) must create `smoke.txt`;
+  - the read-only roles (reviewer, drift keeper) must not change anything;
+  - every role must return JSON that passes its schema.
+
+  `main run` runs the smoke test when `state/smoke_ok.json` is missing or more than 24 hours old. If the smoke test fails, the conductor logs the problems, emails Ben (R22 rate), and exits without starting the loop. `python -m core.bootstrap smoke` runs it on demand and prints the result.
