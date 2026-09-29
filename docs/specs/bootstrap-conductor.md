@@ -308,3 +308,10 @@ The first run with real agents and real email hit four faults no fake-based test
 
 - **R38 Deferred troubleshooting is never lost.** When the troubleshooter is capped (R37), the task records `troubleshoot_pending` with the failure's reason and the last 4000 characters of its output. Before any further builder attempt on that task, the pending troubleshooting runs first; that step does nothing else. `troubleshoot_pending` is cleared only when the troubleshooter has actually run.
 - **R39 A smoke folder that can't be deleted yet doesn't block the start.** On Windows, an agent's child process can briefly keep its folder busy. Deleting a smoke folder is retried 5 times, 2 seconds apart. If it still fails, the folder is logged and left in place, and it is not counted as a smoke problem. Each smoke test first sweeps away any `forge-smoke-*` folders left over from earlier runs (best effort).
+
+## Review round 9 amendment (Codex review, 2026-09-29)
+
+- **R40 While paused, nothing launches.** On a `main run` start, after the R31 inbox read:
+  - **If PAUSED is set:** the conductor only waits. It reads the inbox every minute (answers can clear the pause), writes its heartbeat, and runs no smoke test and no agents.
+  - **When the pause clears:** it goes on to the smoke test (if stale) and then the loop.
+  - **If KILL appears** while waiting, it exits.
