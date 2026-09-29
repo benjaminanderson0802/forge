@@ -17,6 +17,7 @@ PROTECTED = [
     "spec/*", "spec/**",
     ".github/*", ".github/**",
     "roles.json", "CODEOWNERS",
+    "docs/PURPOSE.md", "docs/DECISIONS.md",
 ]
 
 

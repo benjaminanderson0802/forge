@@ -85,11 +85,12 @@ def drill_1():
 def drill_2():
     """Executor edits the acceptance test (or any protected file) -> rejected unless human-approved."""
     for f in ["tests/acceptance/test_c1.py", "core/ledger.py", "drills/run_drills.py", "spec/spec.md",
-              ".github/workflows/core-checks.yml", "roles.json", "charter/authority.md", "./core/protect.py"]:
+              ".github/workflows/core-checks.yml", "roles.json", "charter/authority.md", "./core/protect.py",
+              "docs/PURPOSE.md", "docs/DECISIONS.md", "docs\\DECISIONS.md"]:
         assert violations(["src/demo.py", f]) == [normalize(f)], f"{f} not protected"
-    assert violations(["src/demo.py", "skills/clip.md"]) == [], "normal files wrongly blocked"
+    assert violations(["src/demo.py", "skills/clip.md", "docs/STATUS.md"]) == [], "normal files wrongly blocked"
     assert violations(["core/ledger.py"], ["human-approved"]) == [], "human approval not honored"
-    return "8 protected paths blocked, normal files allowed, human-approved label honored"
+    return "11 protected paths blocked, normal files allowed, human-approved label honored"
 
 
 def drill_3():
