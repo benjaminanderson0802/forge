@@ -1035,20 +1035,33 @@ def gmail_inbox(owner: str, state: Path, imap_factory: Callable | None = None,
                     if n not in nums:
                         nums.append(n)
             for n in nums:
-                mid = None
                 try:  # R36: each message on its own; one bad email never blocks the rest
                     _, raw = m.fetch(n, "(BODY.PEEK[HEADER])")
-                    head = email.message_from_bytes(_raw_bytes(raw))
+                    head_bytes = _raw_bytes(raw)
+                    if not head_bytes:
+                        continue  # transport trouble: retried on the next read
+                    head = email.message_from_bytes(head_bytes)
                     mid = str(head.get("Message-ID", "")).strip() or "nomid:" + hashlib.sha256(
-                        _raw_bytes(raw)).hexdigest()[:24]
-                    if mid in seen_set:
-                        continue
+                        head_bytes).hexdigest()[:24]
+                except Exception:  # noqa: BLE001 - transport trouble: retried on the next read
+                    continue
+                if mid in seen_set:
+                    continue
+                if first or str(head.get("X-Forge-Outgoing", "")).strip() == "1":
                     seen.append(mid)
                     seen_set.add(mid)
-                    if first or str(head.get("X-Forge-Outgoing", "")).strip() == "1":
-                        continue
+                    continue
+                try:
                     _, raw = m.fetch(n, "(BODY.PEEK[])")
-                    msg = email.message_from_bytes(_raw_bytes(raw))
+                    body_bytes = _raw_bytes(raw)
+                except Exception:  # noqa: BLE001 - transport trouble: not marked seen, retried next read
+                    continue
+                if not body_bytes:
+                    continue
+                seen.append(mid)  # fetched: from here on it is handled, delivered or skipped as malformed
+                seen_set.add(mid)
+                try:
+                    msg = email.message_from_bytes(body_bytes)
                     body = ""
                     for part in msg.walk():
                         if part.get_content_type() == "text/plain":
@@ -1064,10 +1077,7 @@ def gmail_inbox(owner: str, state: Path, imap_factory: Callable | None = None,
                         subj = str(msg.get("Subject", ""))
                     out.append({"from": str(msg.get("From", "")), "subject": subj, "body": body,
                                 "message_id": mid, "outgoing": False})
-                except Exception:  # noqa: BLE001 - skipped; once its id is known it is recorded as seen
-                    if mid is not None and mid not in seen_set:
-                        seen.append(mid)
-                        seen_set.add(mid)
+                except Exception:  # noqa: BLE001 - malformed: skipped for good
                     continue
         finally:
             try:
