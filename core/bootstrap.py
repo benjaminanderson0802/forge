@@ -67,7 +67,7 @@ _QUOTE_STARTS = [
 
 def clean_reply(body: str) -> str:
     """R18/R33: only the new text of a reply: nothing from the first quote header onward, no quoted lines, capped."""
-    body = body or ""
+    body = (body or "").replace("\r\n", "\n").replace("\r", "\n")  # real email bodies use CRLF
     cut = min((m.start() for rx in _QUOTE_STARTS for m in [rx.search(body)] if m), default=len(body))
     lines = [ln for ln in body[:cut].splitlines() if not ln.lstrip().startswith(">")]
     return "\n".join(lines).strip()[:NOTE_CAP]

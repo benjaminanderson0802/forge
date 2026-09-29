@@ -274,7 +274,7 @@ The first run with real agents and real email hit four faults no fake-based test
   - A question asked with `halt=True` is stored with `"halt": true`.
   - Every `main run` start that finds KILL does nothing except retry undelivered halt questions (`_retry_halts`), within the budget and the 12-hour halt throttle, and then exits.
   - The halt throttle is recorded only when an attempt actually goes ahead, after the budget check passes.
-- **R33 More quoting styles are removed.** `clean_reply` cuts everything from the first of these lines onward:
+- **R33 More quoting styles are removed.** `clean_reply` first turns CRLF and lone CR line endings into LF (real email bodies use CRLF), then cuts everything from the first of these lines onward:
   - an `On … wrote:` line, including when it wraps over two lines;
   - `-----Original Message-----`;
   - a line of 10 or more underscores;
