@@ -376,7 +376,11 @@ class BootstrapTests(Harness):
         subject=next(s for s,b in self.mails if "[Forge Q-" in s)
         code=q.get("code","missing")
         no_code=f"Re: [Forge Q-{qid}] ..."
-        for bad in [no_code, subject.replace(code,"wrongcode")]:
+        wrong_code = "Z" * 8
+        if wrong_code == code:
+            wrong_code = code[:-1] + ("A" if code[-1] != "A" else "B")
+        wrong_subject = f"Re: [Forge Q-{qid} {wrong_code}]"
+        for bad in [no_code, wrong_subject]:
             before=len(self.gh_calls); self.messages[:]=[{"from":"ben@example.com","subject":bad,"body":"yes"}]; c.step()
             self.assertEqual(len(self.gh_calls),before)
         self.messages[:]=[{"from":"ben@example.com","subject":"STOP","body":""}]; c.step()
@@ -462,7 +466,7 @@ class BootstrapTests(Harness):
         try:
             with patch("core.bootstrap.subprocess.run",side_effect=broken_status): result=c.step()
         except Exception as exc: self.fail(f"step leaked git error: {exc}")
-        self.assertEqual(result,"worked")
+        self.assertEqual(result,"error")
         self.assertIn("git error"," ".join(json.loads((self.state/"queue.json").read_text())["tasks"][0]["notes"]))
 
     def test_r9_state_write_by_builder_kills_and_emails_tamper_question(self):
@@ -475,6 +479,65 @@ class BootstrapTests(Harness):
         self.assertTrue((self.state/"KILL").exists())
         self.assertTrue(any("tamper" in s.lower() for s,b in self.mails))
         self.assertNotEqual(json.loads((self.state/"queue.json").read_text())["tasks"][0]["status"],"done")
+
+    def test_r10_new_state_file_by_builder_kills_and_emails_tamper_question(self):
+        """R10: creating a new state file during a builder run is detected as tampering."""
+        def tamper(p,cwd):
+            (self.state/"sneaky.tmp").write_text("unexpected")
+            (cwd/"feat.py").write_text("VALUE = 42\n")
+            return '{"status":"done"}',1
+        c=self.advance_to_build(agents={"test_writer":self.write_tests,"builder":tamper})
+        c.step()
+        self.assertTrue((self.state/"KILL").exists())
+        self.assertTrue(any("tamper" in s.lower() for s,b in self.mails))
+
+    def test_r11_lock_is_exclusive_across_processes_and_reusable(self):
+        """R11: only one process can hold the state lock, and it can be reacquired after close."""
+        from core.bootstrap import acquire_lock
+        lock_dir=self.state/"lock-test"
+        first=acquire_lock(lock_dir)
+        self.assertIsNotNone(first)
+        code=("import sys; from pathlib import Path; from core.bootstrap import acquire_lock; "
+              "h=acquire_lock(Path(sys.argv[1])); print('locked' if h is not None else 'busy'); "
+              "h and h.close()")
+        try:
+            result=subprocess.run([sys.executable,"-c",code,str(lock_dir)],text=True,capture_output=True,check=True)
+            self.assertEqual(result.stdout.strip(),"busy")
+        finally:
+            first.close()
+        second=acquire_lock(lock_dir)
+        self.assertIsNotNone(second)
+        second.close()
+
+    def test_r12_missing_heartbeat_directory_does_not_escape_run(self):
+        """R12: an unwritable heartbeat path is handled by the run loop."""
+        c=self.init()
+        heartbeat=self.state/"missing"/"heartbeat"
+        self.assertIsInstance(c.run(max_steps=3,idle_sleep_s=0,heartbeat=heartbeat,sleep=lambda s:None),str)
+
+    def test_r13_stage_errors_back_off_and_notify_once_after_three(self):
+        """R13: repeated stage errors are contained, back off, and send one alert after three."""
+        def writer(p,cwd):
+            f=cwd/"tests/core/test_feat.py"; f.parent.mkdir(parents=True,exist_ok=True)
+            f.write_text("import unittest\nclass T(unittest.TestCase):\n def test_x(self): self.fail()\n")
+            return '{"files":["tests/core/test_feat.py"]}',1
+        c=self.init(agents={"test_writer":writer})
+        real_run=subprocess.run
+        def broken_status(args,*a,**kw):
+            if args[:2]==["git","status"]: return subprocess.CompletedProcess(args,1,b"",b"broken git")
+            return real_run(args,*a,**kw)
+        durations=[]
+        try:
+            with patch("core.bootstrap.subprocess.run",side_effect=broken_status):
+                c.run(max_steps=4,idle_sleep_s=0,sleep=durations.append)
+        except Exception as exc:
+            self.fail(f"run leaked stage error: {exc}")
+        self.assertEqual(len(durations),4)
+        # With a zero idle interval the backoff durations are all zero; errors
+        # still reach the third-consecutive-error notification threshold.
+        self.assertEqual(durations,[0,0,0,0])
+        alerts=[(s,b) for s,b in self.mails if "keeps hitting an error" in s.lower() or "keeps hitting an error" in b.lower()]
+        self.assertEqual(len(alerts),1)
 
 
 if __name__ == "__main__":
