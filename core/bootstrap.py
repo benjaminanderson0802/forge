@@ -470,20 +470,33 @@ class Conductor:
         except Exception as e:  # noqa: BLE001 - email trouble never stops the conductor (R7)
             self._log(f"inbox read failed: {e!r}")
             return
+        pending = self._read("inbox_pending.json", [])
+        batch = (pending if isinstance(pending, list) else []) + list(messages)
+        if pending:
+            self._write("inbox_pending.json", [])
         own_ids = set(self._read("mail_log.json", {}).get("ids", []))
-        for m in messages:
-            if m.get("outgoing") or (m.get("message_id") and str(m["message_id"]).strip() in own_ids):
-                continue  # R18/R26: Forge's own mail is never an answer
-            sender = re.findall(r"[\w.+-]+@[\w.-]+", str(m.get("from", "")).lower())
-            if self.owner not in sender:
-                continue
-            subject, body = str(m.get("subject", "")), clean_reply(str(m.get("body", "")))
-            if is_stop(subject, body):
-                (self.state / "KILL").write_text("stopped by owner email\n")
-                return  # R24: nothing after a STOP is processed
-            mq = re.search(r"\[Forge Q-([\w-]+) ([\w-]{8})\]", subject)
-            if mq:
-                self._answer(mq.group(1), body, mq.group(2))
+        for i, m in enumerate(batch):
+            try:
+                if not isinstance(m, dict):
+                    continue
+                if m.get("outgoing") or (m.get("message_id") and str(m["message_id"]).strip() in own_ids):
+                    continue  # R18/R26: Forge's own mail is never an answer
+                sender = re.findall(r"[\w.+-]+@[\w.-]+", str(m.get("from", "")).lower())
+                if self.owner not in sender:
+                    continue
+                subject, body = str(m.get("subject", "")), clean_reply(str(m.get("body", "")))
+                if is_stop(subject, body):
+                    (self.state / "KILL").write_text("stopped by owner email\n")
+                    rest = [dict(x, body=clean_reply(str(x.get("body", "")))) for x in batch[i + 1:]
+                            if isinstance(x, dict)]
+                    if rest:  # R35: kept for after the restart, never lost
+                        self._write("inbox_pending.json", rest[-50:])
+                    return  # R24: nothing after a STOP is processed now
+                mq = re.search(r"\[Forge Q-([\w-]+) ([\w-]{8})\]", subject)
+                if mq:
+                    self._answer(mq.group(1), body, mq.group(2))
+            except Exception as e:  # noqa: BLE001 - R35: one bad message never blocks the rest
+                self._log(f"inbox message failed: {e!r}"[:500])
 
     def _answer(self, qid: str, body: str, code: str) -> None:
         qs = self._read("questions.json", {})
@@ -1022,27 +1035,40 @@ def gmail_inbox(owner: str, state: Path, imap_factory: Callable | None = None,
                     if n not in nums:
                         nums.append(n)
             for n in nums:
-                _, raw = m.fetch(n, "(BODY.PEEK[HEADER])")
-                head = email.message_from_bytes(_raw_bytes(raw))
-                mid = str(head.get("Message-ID", "")).strip() or "nomid:" + hashlib.sha256(
-                    _raw_bytes(raw)).hexdigest()[:24]
-                if mid in seen_set:
+                mid = None
+                try:  # R36: each message on its own; one bad email never blocks the rest
+                    _, raw = m.fetch(n, "(BODY.PEEK[HEADER])")
+                    head = email.message_from_bytes(_raw_bytes(raw))
+                    mid = str(head.get("Message-ID", "")).strip() or "nomid:" + hashlib.sha256(
+                        _raw_bytes(raw)).hexdigest()[:24]
+                    if mid in seen_set:
+                        continue
+                    seen.append(mid)
+                    seen_set.add(mid)
+                    if first or str(head.get("X-Forge-Outgoing", "")).strip() == "1":
+                        continue
+                    _, raw = m.fetch(n, "(BODY.PEEK[])")
+                    msg = email.message_from_bytes(_raw_bytes(raw))
+                    body = ""
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            payload = part.get_payload(decode=True) or b""
+                            try:
+                                body = payload.decode(part.get_content_charset() or "utf-8", "replace")
+                            except LookupError:  # unknown charset
+                                body = payload.decode("utf-8", "replace")
+                            break
+                    try:
+                        subj = str(make_header(decode_header(msg.get("Subject", ""))))
+                    except (LookupError, UnicodeError, ValueError):
+                        subj = str(msg.get("Subject", ""))
+                    out.append({"from": str(msg.get("From", "")), "subject": subj, "body": body,
+                                "message_id": mid, "outgoing": False})
+                except Exception:  # noqa: BLE001 - skipped; once its id is known it is recorded as seen
+                    if mid is not None and mid not in seen_set:
+                        seen.append(mid)
+                        seen_set.add(mid)
                     continue
-                seen.append(mid)
-                seen_set.add(mid)
-                if first or str(head.get("X-Forge-Outgoing", "")).strip() == "1":
-                    continue
-                _, raw = m.fetch(n, "(BODY.PEEK[])")
-                msg = email.message_from_bytes(_raw_bytes(raw))
-                body = ""
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        payload = part.get_payload(decode=True) or b""
-                        body = payload.decode(part.get_content_charset() or "utf-8", "replace")
-                        break
-                out.append({"from": str(msg.get("From", "")),
-                            "subject": str(make_header(decode_header(msg.get("Subject", "")))),
-                            "body": body, "message_id": mid, "outgoing": False})
         finally:
             try:
                 m.logout()
