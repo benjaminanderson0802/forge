@@ -1,0 +1,350 @@
+"""Contract tests for the bootstrap conductor, driven entirely by local fakes."""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from core.agents import FakeAgent
+from core.bootstrap import Conductor, Team
+from core.usage import Meter
+
+
+def git(repo, *args):
+    return subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+
+
+def py_test(path):
+    exe = subprocess.list2cmdline([sys.executable])
+    return f'{exe} -m unittest {path}'
+
+
+class Harness(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.repo, self.work, self.state = root / "repo", root / "work", root / "state"
+        self.repo.mkdir(); self.work.mkdir(); self.state.mkdir()
+        git(self.repo, "init", "-b", "main")
+        git(self.repo, "config", "user.name", "Forge Test")
+        git(self.repo, "config", "user.email", "ben@example.com")
+        (self.repo / "README.md").write_text("initial\n", encoding="utf-8")
+        git(self.repo, "add", "."); git(self.repo, "commit", "-m", "initial")
+        self.mails, self.gh_calls = [], []
+        self.messages = []
+
+        def gh(args):
+            self.gh_calls.append(list(args))
+            return (0, "https://github.com/o/r/pull/7") if args[:2] == ["pr", "create"] else (0, "")
+
+        self.gh = gh
+        self.layer = "layer-1"
+        self.c = None
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def agent(self, script, provider):
+        return FakeAgent(script, provider=provider)
+
+    def make_conductor(self, agents=None, limits=None):
+        agents = agents or {}
+        noop = lambda prompt, cwd: ('{"status":"ok"}', 1)
+        members = {
+            "test_writer": self.agent(agents.get("test_writer", noop), "codex"),
+            "builder": self.agent(agents.get("builder", noop), "claude"),
+            "reviewer": self.agent(agents.get("reviewer", lambda p, c: ('{"verdict":"pass","reasons":[]}', 1)), "codex"),
+            "troubleshooter": self.agent(agents.get("troubleshooter", lambda p, c: ('{"kind":"suggestion","notes":"try another approach"}', 1)), "claude"),
+            "drift_keeper": self.agent(agents.get("drift_keeper", noop), "claude"),
+            "planner": self.agent(agents.get("planner", lambda p, c: ('{"tasks":[]}', 1)), "claude"),
+        }
+        self.team = Team(**members)
+        self.c = Conductor(self.repo, self.work, self.state, self.team,
+                           limits or {"claude_daily_token_cap": 10**9, "codex_daily_token_cap": 10**9},
+                           owner_email="ben@example.com", mailer=lambda s, b: self.mails.append((s, b)),
+                           inbox=lambda: self.messages, gh=self.gh, judge_cmds=[], push=False)
+        return self.c
+
+    def task(self, **kw):
+        d = {"id": "T1", "kind": "build", "title": "Implement feature", "section": "Feature value is 42.",
+             "files_in_scope": ["feat.py"], "test_files": ["tests/core/test_feat.py"],
+             "test_cmd": py_test("tests/core/test_feat.py")}
+        d.update(kw)
+        return d
+
+    def init(self, *tasks, agents=None, limits=None):
+        c = self.make_conductor(agents, limits)
+        c.init_queue(self.layer, list(tasks or [self.task()]))
+        return c
+
+    def write_tests(self, prompt, cwd):
+        p = cwd / "tests/core/test_feat.py"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("import unittest\nimport feat\nclass T(unittest.TestCase):\n def test_value(self): self.assertEqual(feat.VALUE, 42)\n", encoding="utf-8")
+        return '{"files":["tests/core/test_feat.py"]}', 1
+
+    def build_feature(self, prompt, cwd):
+        (cwd / "feat.py").write_text("VALUE = 42\n", encoding="utf-8")
+        return '{"status":"done"}', 1
+
+    def advance_to_build(self, task=None, agents=None):
+        c = self.init(task or self.task(), agents=agents)
+        self.assertEqual(c.step(), "worked")
+        return c
+
+    def branch_files(self):
+        return set(git(self.repo, "ls-tree", "-r", "--name-only", self.layer).splitlines())
+
+
+class BootstrapTests(Harness):
+    def test_happy_path_commits_test_then_build_and_ledger_evidence(self):
+        """Spec: Stage A acceptance, Stage B judges/review/merge, ledger evidence and run artifacts."""
+        c = self.init(agents={"test_writer": self.write_tests, "builder": self.build_feature})
+        self.assertEqual(c.step(), "worked")
+        q = json.loads((self.state / "queue.json").read_text())
+        self.assertEqual(q["tasks"][0]["status"], "tests_ok")
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(c.step(), "worked")  # drift keeper follows reviewer pass
+        self.assertEqual(json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"], "done")
+        self.assertTrue({"feat.py", "tests/core/test_feat.py"} <= self.branch_files())
+        contracts = json.loads((self.state / "ledger/contracts.json").read_text())
+        self.assertEqual(next(iter(contracts.values()))["status"], "done")
+        runs = list((self.state / "runs").iterdir())
+        self.assertTrue(runs)
+        self.assertTrue(any((r / "prompt.md").exists() and (r / "output.json").exists() for r in runs))
+
+    def test_weak_tests_rejected_twice_then_blocked_and_emailed(self):
+        """Spec: tests that already pass are weak; two rejected test attempts block and email."""
+        def weak(p, cwd):
+            path = cwd / "tests/core/test_feat.py"; path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("import unittest\nclass T(unittest.TestCase):\n def test_ok(self): self.assertTrue(True)\n")
+            return '{"files":["tests/core/test_feat.py"]}', 1
+        c = self.init(agents={"test_writer": weak})
+        c.step(); c.step()
+        t = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertEqual(t["status"], "blocked")
+        self.assertTrue(any(n.startswith("tests rejected: weak") for n in t["notes"]))
+        self.assertTrue(self.mails)
+
+    def test_test_writer_outside_test_files_is_rejected_and_not_committed(self):
+        """Spec: Stage A rejects all changes when the writer touches a file outside test_files."""
+        def bad(p, cwd):
+            (cwd / "stray.txt").write_text("stray")
+            return '{"files":["stray.txt"]}', 1
+        c = self.init(agents={"test_writer": bad})
+        c.step()
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertTrue(any(n.startswith("tests rejected: wrote outside test_files") for n in task["notes"]))
+        self.assertNotIn("stray.txt", self.branch_files())
+
+    def test_builder_test_edit_is_reverted_and_never_merged(self):
+        """Spec: builder changes to protected test_files are restored from the layer tip."""
+        def edit_test(p, cwd):
+            (cwd / "feat.py").write_text("VALUE = 42\n")
+            (cwd / "tests/core/test_feat.py").write_text("# tampered\n")
+            return '{"status":"done"}', 1
+        c = self.advance_to_build(agents={"test_writer": self.write_tests, "builder": edit_test})
+        c.step(); c.step()
+        self.assertNotIn("# tampered", git(self.repo, "show", f"{self.layer}:tests/core/test_feat.py"))
+
+    def test_builder_fake_test_edit_is_reverted_before_judges(self):
+        """Spec: Stage B step 3 reverts builder edits to test_files before judges run."""
+        def replace_test(p, cwd):
+            (cwd / "feat.py").write_text("VALUE = 42\n")
+            (cwd / "tests/core/test_feat.py").write_text(
+                "import unittest\nclass T(unittest.TestCase):\n def test_value(self): self.assertTrue(True)\n"
+            )
+            return '{"status":"done"}', 1
+        c = self.advance_to_build(agents={"test_writer": self.write_tests, "builder": replace_test})
+        c.step()
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        committed_test = git(self.repo, "show", f"{self.layer}:tests/core/test_feat.py")
+        self.assertNotEqual(task["status"], "done")
+        self.assertIn("self.assertEqual(feat.VALUE, 42)", committed_test)
+
+    def test_builder_out_of_scope_attempt_fails(self):
+        """Spec: any builder edit beyond files_in_scope and test_files fails as out of scope."""
+        def bad(p, cwd):
+            (cwd / "oops.py").write_text("x=1\n"); return '{"status":"done"}', 1
+        c = self.advance_to_build(agents={"test_writer": self.write_tests, "builder": bad})
+        c.step()
+        t = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertIn("out of scope", " ".join(t["notes"]))
+        self.assertNotIn("oops.py", self.branch_files())
+
+    def test_review_reasons_are_in_next_builder_prompt(self):
+        """Spec: reviewer rejection reasons appear under REVIEW FEEDBACK on the next attempt."""
+        def reviewer(p, cwd): return '{"verdict":"fail","reasons":["missing edge case"]}', 1
+        c = self.advance_to_build(agents={"test_writer": self.write_tests, "builder": self.build_feature, "reviewer": reviewer})
+        c.step(); c.step(); c.step()
+        self.assertIn("REVIEW FEEDBACK:", c.team.builder.prompts[-1])
+        self.assertIn("missing edge case", c.team.builder.prompts[-1])
+
+    def test_zero_progress_troubleshooter_notes_and_dead_end_are_prompted(self):
+        """Spec: repeated identical judge failures invoke troubleshooting and dead ends are persisted and prompted."""
+        def failing_test(p, cwd):
+            f = cwd / "tests/core/test_feat.py"; f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("import unittest\nclass T(unittest.TestCase):\n def test_fail(self): self.fail('same judge failure')\n")
+            return '{"files":["tests/core/test_feat.py"]}', 1
+        def ts(p, cwd): return '{"kind":"dead_end","notes":"approach blocked","alternative":"use a table"}', 1
+        c = self.init(agents={"test_writer": failing_test, "builder": lambda p,c: ('{"status":"ok"}',1), "troubleshooter": ts})
+        c.step(); c.step(); c.step(); c.step()
+        self.assertIn("TROUBLESHOOTER NOTES:", c.team.builder.prompts[-1])
+        self.assertIn("approach blocked", c.team.builder.prompts[-1])
+        self.assertIn("KNOWN DEAD ENDS:", c.team.builder.prompts[-1])
+        self.assertIn('"alternative": "use a table"', (self.state / "dead_ends.jsonl").read_text())
+
+    def test_block_after_troubleshoot_emails_and_queue_continues(self):
+        """Spec: two failures after troubleshooting block a task, email a question, then next task runs."""
+        # Intentionally deterministic failing accepted test.
+        def writer(p, cwd):
+            test_file = "tests/core/test_other.py" if "tests/core/test_other.py" in p else "tests/core/test_feat.py"
+            f=cwd/test_file; f.parent.mkdir(parents=True,exist_ok=True)
+            f.write_text("import unittest\nclass T(unittest.TestCase):\n def test_fail(self): self.fail('no')\n")
+            return json.dumps({"files":[test_file]}),1
+        def builder(p,cwd): return '{"status":"ok"}',1
+        task2=self.task(id="T2", title="Second", files_in_scope=["other.py"], test_files=["tests/core/test_other.py"], test_cmd="python -c \"raise SystemExit(1)\"")
+        c=self.init(self.task(),task2,agents={"test_writer":writer,"builder":builder})
+        for _ in range(6): c.step()
+        tasks=json.loads((self.state/"queue.json").read_text())["tasks"]
+        self.assertEqual(tasks[0]["status"],"blocked")
+        self.assertEqual(tasks[1]["status"],"tests_ok")
+        self.assertTrue(self.mails)
+
+    def test_builder_blocked_result_is_failed_attempt(self):
+        """Spec: builder status blocked becomes a failed attempt and triggers troubleshooting rules."""
+        c=self.advance_to_build(agents={"test_writer":self.write_tests,"builder":lambda p,c: ('{"status":"blocked","summary":"cannot proceed"}',1)})
+        c.step()
+        task=json.loads((self.state/"queue.json").read_text())["tasks"][0]
+        self.assertNotEqual(task["status"],"blocked")
+        self.assertIn("blocker: cannot proceed"," ".join(task["notes"]))
+
+    def test_malformed_builder_output_is_failed_attempt_not_exception(self):
+        """Spec: malformed required-schema agent output is a failed attempt, not an exception."""
+        c=self.advance_to_build(agents={"test_writer":self.write_tests,"builder":lambda p,c: ('not json',1)})
+        self.assertEqual(c.step(),"worked")
+        self.assertTrue(json.loads((self.state/"queue.json").read_text())["tasks"][0]["fail_signatures"])
+
+    def test_malformed_builder_output_does_not_mark_correct_feature_done(self):
+        """Spec: malformed builder output is a failed attempt even when its file change is correct."""
+        def malformed(p, cwd):
+            (cwd / "feat.py").write_text("VALUE = 42\n")
+            return "not json", 1
+        c = self.advance_to_build(agents={"test_writer": self.write_tests, "builder": malformed})
+        c.step()
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertNotEqual(task["status"], "done")
+        self.assertTrue(task["fail_signatures"])
+
+    def test_kill_and_paused_prevent_all_agent_calls(self):
+        """Spec: KILL and PAUSED short circuit step before any agent runs."""
+        c=self.init(); (self.state/"KILL").write_text("stop")
+        self.assertEqual(c.step(),"killed")
+        self.assertFalse(any(a.prompts for a in vars(self.team).values()))
+        (self.state/"KILL").unlink(); (self.state/"PAUSED").write_text("pause")
+        self.assertEqual(c.step(),"paused")
+        self.assertFalse(any(a.prompts for a in vars(self.team).values()))
+
+    def test_provider_cap_prevents_agent_calls(self):
+        """Spec: any provider at or above its daily token cap halts work before agent calls."""
+        c=self.init(limits={"claude_daily_token_cap":10,"codex_daily_token_cap":10**9})
+        Meter(self.state).add("claude",10)
+        self.assertEqual(c.step(),"capped")
+        self.assertFalse(any(a.prompts for a in vars(self.team).values()))
+
+    def test_drift_keeper_replan_pauses_and_emails(self):
+        """Spec: drift keeper replan result creates PAUSED and emails a replan question."""
+        c=self.init(agents={"test_writer":self.write_tests,"builder":self.build_feature,"drift_keeper":lambda p,c: ('{"status":"replan","reasons":"design drift"}',1)})
+        c.step(); c.step(); c.step()
+        self.assertTrue((self.state/"PAUSED").exists())
+        self.assertTrue(any("replan" in s.lower() for s,b in self.mails))
+
+    def test_plan_task_commits_plan_and_appends_build_tasks(self):
+        """Spec: reviewed plan task commits plan_file and appends normalized build tasks."""
+        planfile="docs/superpowers/plans/plan.md"
+        task={"id":"P1","kind":"plan","title":"Plan feature","section":"Plan it","plan_file":planfile,"status":"todo"}
+        def planner(p,cwd):
+            f=cwd/planfile; f.parent.mkdir(parents=True,exist_ok=True); f.write_text("plan\n")
+            child={"id":"T2","title":"Build it","section":"Build it","files_in_scope":["feat.py"],"test_files":["tests/core/test_feat.py"],"test_cmd":py_test("tests/core/test_feat.py")}
+            return json.dumps({"tasks":[child]}),1
+        c=self.init(task,agents={"planner":planner})
+        c.step()
+        data=json.loads((self.state/"queue.json").read_text())
+        self.assertEqual(data["tasks"][0]["status"],"done")
+        self.assertEqual((data["tasks"][1]["kind"],data["tasks"][1]["status"]),("build","todo"))
+        self.assertEqual(data["tasks"][1]["notes"],[])
+        self.assertIn(planfile,self.branch_files())
+
+    def test_plan_writer_outside_plan_file_is_rejected(self):
+        """Spec: planner changes outside plan_file reject the plan attempt."""
+        task={"id":"P1","kind":"plan","title":"Plan","section":"Plan","plan_file":"plan.md","status":"todo"}
+        def planner(p,cwd):
+            (cwd/"plan.md").write_text("plan"); (cwd/"extra.txt").write_text("extra")
+            return '{"tasks":[]}',1
+        c=self.init(task,agents={"planner":planner})
+        c.step()
+        self.assertNotIn("extra.txt",self.branch_files())
+        self.assertNotEqual(json.loads((self.state/"queue.json").read_text())["tasks"][0]["status"],"done")
+
+    def test_planner_cannot_write_extra_file_with_valid_task(self):
+        """Spec: Plan tasks step 2 permits planner edits only to plan_file."""
+        task={"id":"P1","kind":"plan","title":"Plan","section":"Plan","plan_file":"plan.md","status":"todo"}
+        def planner(p,cwd):
+            (cwd/"plan.md").write_text("plan")
+            (cwd/"extra.txt").write_text("extra")
+            child={"id":"T2","title":"Build it","section":"Build it","files_in_scope":["feat.py"],"test_files":["tests/core/test_feat.py"],"test_cmd":py_test("tests/core/test_feat.py")}
+            return json.dumps({"tasks":[child]}),1
+        c=self.init(task,agents={"planner":planner})
+        c.step()
+        tasks=json.loads((self.state/"queue.json").read_text())["tasks"]
+        self.assertNotEqual(tasks[0]["status"],"done")
+        self.assertEqual(len(tasks),1)
+        self.assertNotIn("extra.txt",self.branch_files())
+
+    def test_gate_opens_pr_and_emails_owner_approval_question(self):
+        """Spec: when all queue tasks are done, gate creates a PR and asks owner to reply y."""
+        c=self.init(agents={"test_writer":self.write_tests,"builder":self.build_feature})
+        c.step(); c.step(); c.step()
+        self.assertEqual(c.step(),"gate")
+        self.assertTrue(any(a[:2]==["pr","create"] for a in self.gh_calls))
+        self.assertTrue(any("[Forge Q-" in s and "reply y" in s.lower() for s,b in self.mails))
+
+    def test_owner_y_reply_approves_and_merges_but_other_sender_does_not(self):
+        """Spec: only owner first-word y/yes replies to gate question label and merge the PR."""
+        c=self.init(agents={"test_writer":self.write_tests,"builder":self.build_feature})
+        c.step(); c.step(); c.step(); c.step()
+        subject=next(s for s,b in self.mails if "[Forge Q-" in s)
+        before=len(self.gh_calls)
+        self.messages[:]=[{"from":"other@example.com","subject":subject,"body":"y"}]
+        c.step(); self.assertEqual(len(self.gh_calls),before)
+        self.messages[:]=[{"from":"ben@example.com","subject":subject,"body":"Y please"}]
+        c.step()
+        self.assertTrue(any(a[:2]==["pr","edit"] and "human-approved" in a for a in self.gh_calls))
+        self.assertTrue(any(a[:2]==["pr","merge"] for a in self.gh_calls))
+
+    def test_gate_rejects_owner_reply_unless_first_word_is_y_or_yes(self):
+        """Spec: Gate approval requires the owner's reply to begin with y or yes."""
+        c=self.init(agents={"test_writer":self.write_tests,"builder":self.build_feature})
+        c.step(); c.step(); c.step(); c.step()
+        subject=next(s for s,b in self.mails if "[Forge Q-" in s)
+        self.messages[:]=[{"from":"ben@example.com","subject":subject,"body":"no, not yet"}]
+        c.step()
+        self.assertFalse(any(a[:2]==["pr","merge"] for a in self.gh_calls))
+        self.messages[:]=[{"from":"ben@example.com","subject":subject,"body":"yes"}]
+        c.step()
+        self.assertTrue(any(a[:2]==["pr","merge"] for a in self.gh_calls))
+
+    def test_stop_email_only_acts_for_owner(self):
+        """Spec: STOP in an owner email creates KILL; messages from other senders never act."""
+        c=self.init()
+        self.messages[:]=[{"from":"other@example.com","subject":"stop","body":"STOP now"}]
+        c.step(); self.assertFalse((self.state/"KILL").exists())
+        self.messages[:]=[{"from":"ben@example.com","subject":"hello","body":"please STOP now"}]
+        self.assertEqual(c.step(),"killed")
+        self.assertTrue((self.state/"KILL").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

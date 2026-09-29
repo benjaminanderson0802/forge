@@ -94,7 +94,7 @@ Before every agent run, the worktree is reset to the layer branch tip (`git rese
    - a line `KNOWN DEAD ENDS:` followed by the entries in `dead_ends.jsonl`
 
    Schema `{"required": ["status"]}`.
-3. **Protected tests:** any change to `test_files` is reverted (restored from the layer tip).
+3. **Protected tests:** any change to `test_files` is reverted (restored from the layer tip), and the attempt **fails** with the reason `touched test files`, even if the rest of the work is correct. This matches the Phase 0 core rule (drill 7): an attempt that touched protected files can never pass.
 4. **Scope:** changed files outside `files_in_scope` and `test_files` mean the attempt fails, with the reason `out of scope: <files>`.
 5. **Commit:** changed in-scope files are committed.
 6. **Judges:** `test_cmd` then each of `judge_cmds` run in the worktree. The first non-zero exit fails the attempt. Its **failure signature** is the sha256 of the last 20 lines of that command's combined output.
@@ -103,7 +103,7 @@ Before every agent run, the worktree is reset to the layer branch tip (`git rese
    - `submit` (`forge-executor`) with the commit
    - `test_run` (`ci`), passed or not
 8. **Review:** if the judges pass, the reviewer is prompted with the task, the `section` and the diff since the tests commit, with schema `{"required": ["verdict", "reasons"]}`.
-   - `verdict == "pass"` → `pass` (`forge-auditor`), status `done`, push the layer branch when `push` is on, then run the drift keeper.
+   - `verdict == "pass"` → `pass` (`forge-auditor`); if the ledger refuses the pass, the attempt fails. Otherwise: status `done`, push the layer branch when `push` is on, then run the drift keeper.
    - Otherwise → the reasons are stored for the next attempt's `REVIEW FEEDBACK:`.
 9. **Any failed attempt** (bad builder output, out of scope, judges or reviewer):
    - the commit is removed (`git reset --hard` to the tests commit)

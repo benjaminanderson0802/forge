@@ -141,13 +141,18 @@ class Conductor:
         _git(self.wt, "clean", "-q", "-fd")
 
     def _changed(self) -> list[str]:
-        out = _git(self.wt, "status", "--porcelain", "-uall")
-        files = []
-        for line in out.splitlines():
-            path = line[3:]
-            if " -> " in path:
-                path = path.split(" -> ", 1)[1]
-            files.append(_norm(path.strip('"')))
+        """Every added, modified, deleted or untracked path in the worktree (NUL-separated: no trimming bugs)."""
+        p = subprocess.run(["git", "status", "--porcelain", "-z", "-uall"], cwd=str(self.wt), capture_output=True,
+                           stdin=subprocess.DEVNULL, **NOWIN)
+        entries = p.stdout.decode("utf-8", "replace").split("\0")
+        files, i = [], 0
+        while i < len(entries):
+            e = entries[i]
+            if len(e) > 3:
+                files.append(_norm(e[3:]))
+                if e[0] in "RC":  # a rename/copy is followed by its source path
+                    i += 1
+            i += 1
         return sorted(set(files))
 
     def _commit(self, paths: list[str], msg: str) -> str:
@@ -425,6 +430,9 @@ class Conductor:
         if (r.data or {}).get("status") == "blocked":
             summary = (r.data or {}).get("summary") or (r.data or {}).get("blocker") or "no detail"
             return fail(f"blocker: {summary}", f"blocker:{summary}")
+        if violations:  # D-025 / drill 7: an attempt that touched its own tests can never pass
+            return fail("touched test files (reverted): " + ", ".join(violations),
+                        "touched tests: " + ",".join(violations))
         if out_of_scope:
             return fail("out of scope: " + ", ".join(out_of_scope), "out of scope: " + ",".join(out_of_scope))
 
@@ -456,7 +464,8 @@ class Conductor:
             self._update(tid, review_feedback=reasons)
             return fail("review failed: " + "; ".join(reasons), "review:" + "|".join(reasons), submitted=True)
 
-        self._apply(f"{tag}-pass", "pass", cid, "forge-auditor", {"run_id": f"{tag}-ci"})
+        if not self._apply(f"{tag}-pass", "pass", cid, "forge-auditor", {"run_id": f"{tag}-ci"}):
+            return fail("ledger refused the pass (evidence incomplete)", "ledger-refused-pass", submitted=True)
         self._update(tid, status="done", done_commit=sha)
         self._push()
         q = self._queue()
