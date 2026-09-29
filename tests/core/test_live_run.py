@@ -943,3 +943,158 @@ class R33SMTPReplyTests(Harness):
         c.inbox.assert_called_once_with()
         self.assertFalse((self.state / "KILL").exists())
         self.assertEqual(status, "paused")
+
+
+class ReviewRoundFourConductorTests(Harness):
+    read_state = LiveRunTests.read_state
+    gate = ReviewMailTests.gate
+
+    def test_R35_stop_persists_gate_reply_and_replays_after_kill_cleared(self):
+        """A consumed inbox batch survives STOP until the owner clears KILL."""
+        c = self.make_conductor()
+        qid, subject = self.gate(c)
+        reply = {"from": c.owner, "subject": subject, "body": "y"}
+        c.inbox = Mock(side_effect=[[
+            {"from": c.owner, "subject": "STOP", "body": ""}, reply,
+        ], []])
+        self.assertEqual(c.step(), "killed")
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertEqual(self.gh_calls, [])
+        self.assertEqual(self.read_state("questions.json")[qid]["status"], "open")
+        pending = self.state / "inbox_pending.json"
+        self.assertTrue(pending.exists(), "STOP must persist the rest of the batch")
+        self.assertEqual(self.read_state("inbox_pending.json"), [reply])
+
+        (self.state / "KILL").unlink()
+        (self.state / "PAUSED").touch()  # Isolate mail processing from agent work.
+        self.assertEqual(c.step(), "paused")
+        self.assertEqual(c.inbox.call_count, 2)
+        self.assertIn(["pr", "merge", "7", "--merge", "--delete-branch"], self.gh_calls)
+        self.assertEqual(self.read_state("questions.json")[qid]["status"], "answered")
+        self.assertFalse(json.loads(pending.read_text(encoding="utf-8")) if pending.exists() else [])
+
+    def test_R35_answer_error_is_logged_and_next_reply_is_processed(self):
+        """An individual answer failure cannot prevent the following gate merge."""
+        c = self.make_conductor()
+        first_id, first_subject = self.gate(c)
+        second_id, second_subject = self.gate(c)
+        c.inbox = Mock(return_value=[
+            {"from": c.owner, "subject": first_subject, "body": "y"},
+            {"from": c.owner, "subject": second_subject, "body": "y"},
+        ])
+        (self.state / "PAUSED").touch()
+        original_answer = c._answer
+        calls = []
+
+        def fail_first(qid, body, code):
+            calls.append(qid)
+            if len(calls) == 1:
+                raise RuntimeError("R35 fake answer failure")
+            return original_answer(qid, body, code)
+
+        with patch.object(c, "_answer", side_effect=fail_first):
+            self.assertEqual(c.step(), "paused")
+        self.assertEqual(calls, [first_id, second_id])
+        self.assertIn("R35 fake answer failure", (self.state / "errors.log").read_text(encoding="utf-8"))
+        questions = self.read_state("questions.json")
+        self.assertEqual(questions[first_id]["status"], "open")
+        self.assertEqual(questions[second_id]["status"], "answered")
+        self.assertIn(["pr", "merge", "7", "--merge", "--delete-branch"], self.gh_calls)
+
+    def test_R35_pending_messages_are_bounded_and_bodies_cleaned(self):
+        """STOP retains a bounded batch with cleaned, capped reply bodies."""
+        c = self.make_conductor()
+        replies = [{"from": c.owner, "subject": f"Re: [Forge] reply {i}",
+                    "body": f"reply {i}\n> quoted-secret\n" + "x" * 5000 +
+                            "\nOn Tuesday Ben wrote:\nold-secret"} for i in range(60)]
+        c.inbox = Mock(return_value=[{"from": c.owner, "subject": "STOP", "body": ""}] + replies)
+        self.assertEqual(c.step(), "killed")
+        pending = self.state / "inbox_pending.json"
+        self.assertTrue(pending.exists(), "STOP must retain pending replies")
+        messages = self.read_state("inbox_pending.json")
+        self.assertGreater(len(messages), 0)
+        self.assertLessEqual(len(messages), 50)
+        self.assertEqual(len({m["subject"] for m in messages}), len(messages))
+        originals = {m["subject"]: m for m in replies}
+        for message in messages:
+            with self.subTest(subject=message["subject"]):
+                self.assertIn(message["subject"], originals)
+                self.assertTrue(message["body"].startswith("reply "))
+                self.assertLessEqual(len(message["body"]), 2000)
+                self.assertNotIn("quoted-secret", message["body"])
+                self.assertNotIn("old-secret", message["body"])
+
+
+class ReviewRoundFourReaderTests(Harness):
+    reader = ReviewInboxTests.reader
+    read_state = LiveRunTests.read_state
+
+    def test_R36_unknown_charset_and_undecodable_reply_do_not_lose_batch(self):
+        """Bad decoding is isolated and all three new Message-IDs are persisted."""
+        import email
+
+        server = FakePeekIMAP()
+        read = self.reader(server)
+        self.assertEqual(read(), [])
+        bad_id, unknown_id, good_id = (
+            "<r36-bad@example.com>", "<r36-unknown@example.com>", "<r36-good@example.com>",
+        )
+        server.add(bad_id, "fake undecodable payload")
+        bad_raw = server.messages[-1]
+        server.messages.append(
+            b"From: ben@example.com\r\nTo: ben@example.com\r\n"
+            b"Subject: Re: [Forge Q-gate-1 abcdefgh] ready\r\n"
+            b"Message-ID: <r36-unknown@example.com>\r\n"
+            b'Content-Type: text/plain; charset="x-unknown-forge"\r\n'
+            b"Content-Transfer-Encoding: 8bit\r\n\r\nProceed caf\xc3\xa9 \xff\r\n"
+        )
+        server.add(good_id, "Good reply after both failures")
+        parse = email.message_from_bytes
+        failures = []
+
+        def decode(raw, *args, **kwargs):
+            # A deterministic fake decoding failure; headers remain readable so
+            # the bad message has a usable ID and must not be retried forever.
+            if raw == bad_raw:
+                failures.append(bad_id)
+                raise ValueError("R36 fake undecodable message")
+            return parse(raw, *args, **kwargs)
+
+        with patch("email.message_from_bytes", side_effect=decode):
+            messages = read()
+            self.assertEqual([m["message_id"] for m in messages], [unknown_id, good_id])
+            self.assertEqual(messages[0]["body"].strip(), "Proceed caf\u00e9 \ufffd")
+            self.assertEqual(messages[1]["body"].strip(), "Good reply after both failures")
+            self.assertTrue(all(m["from"] == "ben@example.com" for m in messages))
+            self.assertTrue({bad_id, unknown_id, good_id} <= set(self.read_state("inbox_seen.json")))
+            self.assertEqual(read(), [])
+            self.assertEqual(self.reader(server)(), [])
+        self.assertEqual(failures, [bad_id])
+        self.assertEqual(server.stores, [])
+
+    def test_R36_fetch_failure_does_not_block_other_replies_or_saved_progress(self):
+        """A failed body fetch cannot discard good replies before or after it."""
+        server = FakePeekIMAP()
+        read = self.reader(server)
+        self.assertEqual(read(), [])
+        ids = [f"<r36-fetch-{i}@example.com>" for i in range(3)]
+        for i, mid in enumerate(ids):
+            server.add(mid, f"reply {i}")
+        fetch = server.fetch
+        failures = []
+
+        def fail_middle(num, message_parts):
+            if int(num) == 2 and message_parts == "(BODY.PEEK[])":
+                failures.append(num)
+                raise OSError("R36 fake fetch failure")
+            return fetch(num, message_parts)
+
+        with patch.object(server, "fetch", side_effect=fail_middle):
+            messages = read()
+            self.assertEqual([m["message_id"] for m in messages], [ids[0], ids[2]])
+            self.assertEqual([m["body"].strip() for m in messages], ["reply 0", "reply 2"])
+            self.assertTrue(set(ids) <= set(self.read_state("inbox_seen.json")))
+            self.assertEqual(self.reader(server)(), [])
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(server.stores, [])
+
