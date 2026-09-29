@@ -1548,3 +1548,129 @@ class R39SmokeCleanupTests(Harness):
         self.assertEqual(len(calls), 6)
         self.assertEqual(stale_at_launch, [False] * 6)
         self.assertFalse(stale.exists())
+
+
+class R40PausedRunTests(Harness):
+    def setUp(self):
+        super().setUp()
+        # Use the R31/R32 main fixture pattern: real temporary state and a
+        # clock-injecting initializer, with every external dependency faked.
+        self.state = self.repo / "state" / "bootstrap"
+        self.state.mkdir(parents=True)
+        self.now = datetime(2026, 9, 29, 8, tzinfo=timezone.utc)
+        self.make_conductor()
+        self.c.clock = lambda: self.now
+        self.c._write("smoke_ok.json", {"at": (self.now - timedelta(hours=25)).isoformat()})
+        self.inbox = Mock(return_value=[])
+        real_init = Conductor.__init__
+
+        def timed_init(conductor, *args, **kwargs):
+            kwargs["clock"] = lambda: self.now
+            real_init(conductor, *args, **kwargs)
+
+        patches = {
+            "module_file": patch("core.bootstrap.__file__", str(self.repo / "core" / "bootstrap.py")),
+            "limits": patch("core.agents.load_limits", return_value=self.c.limits),
+            "team": patch("core.bootstrap.real_team", return_value=self.team),
+            "mailer": patch("core.bootstrap.gmail_mailer", return_value=self.c.mailer),
+            "inbox_factory": patch("core.bootstrap.gmail_inbox", return_value=self.inbox),
+            "gh": patch("core.bootstrap.gh_cli", return_value=self.gh),
+            "init": patch.object(Conductor, "__init__", new=timed_init),
+            "lock": patch("core.bootstrap.acquire_lock", side_effect=lambda state: Mock()),
+            "guarded_smoke": patch("core.bootstrap._guarded_smoke", return_value=[]),
+            "smoke": patch("core.bootstrap.smoke", return_value=[]),
+            "run": patch.object(Conductor, "run", return_value="idle"),
+        }
+        self.cli = {}
+        for name, patcher in patches.items():
+            self.cli[name] = patcher.start()
+            self.addCleanup(patcher.stop)
+        self.paused = self.state / "PAUSED"
+        self.paused.touch()
+        self.assertTrue(bootstrap._smoke_stale(self.state, self.now))
+
+    assert_no_work = ReviewRoundTwoRunTests.assert_no_work
+
+    def test_R40_cli_waits_for_unpause_before_stale_smoke_and_run(self):
+        """R40: poll the inbox each minute while paused, then smoke before running."""
+        events = []
+        inbox_counts = []
+        self.inbox.side_effect = lambda: events.append("inbox") or []
+
+        def resume_after_three_sleeps(seconds):
+            self.assertEqual(seconds, 60)
+            self.assertTrue(self.paused.exists())
+            self.assert_no_work()
+            inbox_counts.append(self.inbox.call_count)
+            self.now += timedelta(seconds=seconds)
+            if len(inbox_counts) == 3:
+                self.paused.unlink()  # Simulate an answer clearing the pause.
+                events.append("unpaused")
+            self.assertLessEqual(len(inbox_counts), 3, "main must leave the pause wait")
+
+        def smoke_after_unpause(*args, **kwargs):
+            self.assertFalse(self.paused.exists(), "smoke launched while PAUSED exists")
+            events.append("smoke")
+            return []
+
+        def run_after_smoke(*args, **kwargs):
+            self.assertFalse(self.paused.exists())
+            self.assertIn("smoke", events)
+            events.append("run")
+            return "idle"
+
+        self.cli["guarded_smoke"].side_effect = smoke_after_unpause
+        self.cli["run"].side_effect = run_after_smoke
+        with patch("core.bootstrap.time.sleep", side_effect=resume_after_three_sleeps) as sleep:
+            self.assertEqual(bootstrap.main(["run"]), 0)
+        self.assertEqual(sleep.call_count, 3)
+        self.assertGreaterEqual(inbox_counts[0], 1)
+        self.assertTrue(all(later > earlier for earlier, later in zip(inbox_counts, inbox_counts[1:])),
+                        "the inbox must be read again between waits")
+        self.assertEqual(events[0], "inbox")
+        self.assertLess(events.index("unpaused"), events.index("smoke"))
+        self.assertLess(events.index("smoke"), events.index("run"))
+        self.cli["guarded_smoke"].assert_called_once()
+        self.cli["run"].assert_called_once()
+
+    def test_R40_cli_kill_during_pause_exits_without_smoke_or_run(self):
+        """R40: KILL appearing during the pause wait exits main successfully without work."""
+        def kill_during_wait(seconds):
+            self.assertEqual(seconds, 60)
+            self.assertTrue(self.paused.exists())
+            self.assert_no_work()
+            self.assertFalse((self.state / "KILL").exists(), "main must exit after KILL")
+            (self.state / "KILL").touch()
+
+        with patch("core.bootstrap.time.sleep", side_effect=kill_during_wait) as sleep:
+            self.assertEqual(bootstrap.main(["run"]), 0)
+        self.assert_no_work()
+        sleep.assert_called_once_with(60)
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertTrue(self.paused.exists())
+        self.inbox.assert_called_with()
+
+    def test_R40_cli_writes_heartbeat_while_waiting(self):
+        """R40: a heartbeat is written during each paused wait before any work launches."""
+        heartbeat = self.state / "conductor.heartbeat"
+        observed = []
+        self.assertFalse(heartbeat.exists())
+
+        def observe_wait(seconds):
+            self.assertEqual(seconds, 60)
+            self.assertTrue(self.paused.exists())
+            self.assert_no_work()
+            self.assertTrue(heartbeat.is_file(), "paused main must write its heartbeat")
+            observed.append(heartbeat.read_text(encoding="utf-8"))
+            self.assertTrue(observed[-1].strip())
+            self.assertLessEqual(len(observed), 2, "main must exit after KILL")
+            if len(observed) == 2:
+                (self.state / "KILL").touch()
+            else:
+                heartbeat.unlink()  # The next wait must write it again.
+                self.now += timedelta(seconds=seconds)
+
+        with patch("core.bootstrap.time.sleep", side_effect=observe_wait):
+            self.assertEqual(bootstrap.main(["run"]), 0)
+        self.assertEqual(len(observed), 2, "main must maintain a heartbeat while paused")
+        self.assert_no_work()
