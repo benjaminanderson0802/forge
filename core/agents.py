@@ -163,10 +163,24 @@ def _shape_ok(data: dict | None, schema: dict | None) -> bool:
     return all(k in data for k in schema.get("required", []))
 
 
+def drop_null_optionals(data, schema: dict | None):
+    """R34: a null value for a key the schema doesn't require counts as missing (Codex's strict form makes
+    optional fields nullable). Recursive through nested objects and array items."""
+    if not isinstance(schema, dict):
+        return data
+    if isinstance(data, dict):
+        req = set(schema.get("required", []))
+        props = schema.get("properties", {})
+        return {k: drop_null_optionals(v, props.get(k)) for k, v in data.items() if not (v is None and k not in req)}
+    if isinstance(data, list) and isinstance(schema.get("items"), dict):
+        return [drop_null_optionals(x, schema["items"]) for x in data]
+    return data
+
+
 def _finish(provider: str, text: str, tokens: int, schema: dict | None) -> AgentResult:
     if schema is None:
         return AgentResult(text, tokens, True, None, None, provider)
-    data = _extract_json(text)
+    data = drop_null_optionals(_extract_json(text), schema)
     if not _shape_ok(data, schema):
         return AgentResult(text, tokens, False, "output did not match the required shape", None, provider)
     return AgentResult(text, tokens, True, None, data, provider)

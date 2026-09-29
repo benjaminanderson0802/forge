@@ -57,11 +57,21 @@ def is_stop(subject: str, cleaned_body: str) -> bool:
     return False
 
 
+_QUOTE_STARTS = [
+    re.compile(r"(?m)^[ \t]*On [^\n]*(\n[^\n]*)?wrote:[ \t]*$"),
+    re.compile(r"(?mi)^[ \t]*-{2,}\s*Original Message\s*-{2,}[ \t]*$"),
+    re.compile(r"(?m)^[ \t]*_{10,}[ \t]*$"),
+    re.compile(r"(?mi)^[ \t]*From:[^\n]*(\n[^\n]*){0,3}\n[ \t]*(Sent|Date|To):"),
+]
+
+
 def clean_reply(body: str) -> str:
-    """R18: only the new text of a reply: no quoted lines, nothing from "On ... wrote:" onward, capped."""
-    body = re.split(r"(?m)^\s*On .+wrote:\s*$", body or "", maxsplit=1)[0]
-    lines = [ln for ln in body.splitlines() if not ln.lstrip().startswith(">")]
+    """R18/R33: only the new text of a reply: nothing from the first quote header onward, no quoted lines, capped."""
+    body = body or ""
+    cut = min((m.start() for rx in _QUOTE_STARTS for m in [rx.search(body)] if m), default=len(body))
+    lines = [ln for ln in body[:cut].splitlines() if not ln.lstrip().startswith(">")]
     return "\n".join(lines).strip()[:NOTE_CAP]
+
 
 _STR, _STRS = {"type": "string"}, {"type": "array", "items": {"type": "string"}}
 
@@ -362,6 +372,8 @@ class Conductor:
         code = secrets.token_urlsafe(6)[:8]
         qs[qid] = {"kind": kind, "status": "open", "code": code, "subject": str(subject)[:SUBJECT_CAP],
                    "body": str(body)[:BODY_CAP], "delivered": False, **extra}  # R28
+        if halt:
+            qs[qid]["halt"] = True  # R32: retried on watchdog starts while KILL is set
         self._write("questions.json", _prune_questions(qs))
         self._deliver(qid, halt=halt)
         return qid
@@ -372,13 +384,11 @@ class Conductor:
         if (self.state / "KILL").exists() and not halt:
             return False
         now = self.clock()
-        if halt:  # R24: at most one halt alert every 12 hours, throttled from the attempt
-            notes = self._read("notices.json", {})
+        notes = self._read("notices.json", {})
+        if halt:  # R24: at most one halt alert every 12 hours
             last = notes.get("halt")
             if last and (now - datetime.fromisoformat(last)).total_seconds() < 12 * 3600:
                 return False
-            notes["halt"] = now.isoformat()
-            self._write("notices.json", notes)
         log = self._read("mail_log.json", {"sent": [], "budget_logged": "", "ids": []})
         sent = [x for x in log.get("sent", []) if (now - datetime.fromisoformat(x)).total_seconds() < 86400]
         hour = [x for x in sent if (now - datetime.fromisoformat(x)).total_seconds() < 3600]
@@ -390,6 +400,9 @@ class Conductor:
             log["sent"] = sent
             self._write("mail_log.json", log)
             return False
+        if halt:  # R32: the halt throttle starts only when an attempt actually goes ahead
+            notes["halt"] = now.isoformat()
+            self._write("notices.json", notes)
         from email.utils import make_msgid
         mid = make_msgid(domain="forge.local")
         log["sent"] = sent + [now.isoformat()]  # R25: the attempt counts even if SMTP fails part-way
@@ -436,6 +449,12 @@ class Conductor:
         qs = self._read("questions.json", {})
         qs[qid]["delivered"] = True
         self._write("questions.json", qs)
+
+    def _retry_halts(self) -> None:
+        """R32: while KILL is set, the only thing a watchdog start does is retry an undelivered halt alert."""
+        for qid, q in self._read("questions.json", {}).items():
+            if q.get("halt") and q.get("delivered") is False:
+                self._deliver(qid, halt=True)
 
     def _mail_notice(self, qid: str, subject: str, body: str) -> None:
         """Follow-up email on an existing question (keeps its reply code)."""
@@ -1212,7 +1231,14 @@ def main(argv: list[str]) -> int:
     if lock is None:
         return 0  # another conductor holds the lock; the watchdog calls us harmlessly
     try:
-        if a.cmd == "smoke" or (not (state / "KILL").exists() and _smoke_stale(state, c.clock())):
+        if a.cmd == "run":
+            if (c.state / "KILL").exists():  # R32: while stopped, only retry a pending halt alert
+                c._retry_halts()
+                return 0
+            c._handle_inbox()  # R31: a STOP is honoured before anything is launched
+            if (c.state / "KILL").exists():
+                return 0
+        if a.cmd == "smoke" or _smoke_stale(c.state, c.clock()):
             problems = _guarded_smoke(c, Path(a.work), force=a.cmd == "smoke")
             if a.cmd == "smoke":
                 print("\n".join(problems) or "smoke test passed")
@@ -1227,7 +1253,7 @@ def main(argv: list[str]) -> int:
                        "The conductor is running in the background. You'll hear from it only when something "
                        "needs you, when a layer is ready for approval, or if it hits trouble.\n\n"
                        "To stop everything: reply STOP to any Forge email.")
-        print(c.run(heartbeat=state / "conductor.heartbeat"))
+        print(c.run(heartbeat=c.state / "conductor.heartbeat"))
     finally:
         lock.close()
     return 0
