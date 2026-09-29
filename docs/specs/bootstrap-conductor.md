@@ -303,3 +303,8 @@ The first run with real agents and real email hit four faults no fake-based test
     - **reviewer capped** (after the work was submitted): the auditor fails the run and the manager reopens the contract, exactly as a failed judge would, but no failure note or signature is recorded, `fails_since` is unchanged, and the task stays `tests_ok`;
     - **troubleshooter or drift keeper capped:** nothing changes, and they run when the cap resets.
   - **smoke test:** a `Capped` stops the smoke run with the problem "token cap reached", and `smoke_ok.json` is not written.
+
+## Review round 8 amendments (Codex review and live smoke run, 2026-09-29)
+
+- **R38 Deferred troubleshooting is never lost.** When the troubleshooter is capped (R37), the task records `troubleshoot_pending` with the failure's reason and the last 4000 characters of its output. Before any further builder attempt on that task, the pending troubleshooting runs first; that step does nothing else. `troubleshoot_pending` is cleared only when the troubleshooter has actually run.
+- **R39 A smoke folder that can't be deleted yet doesn't block the start.** On Windows, an agent's child process can briefly keep its folder busy. Deleting a smoke folder is retried 5 times, 2 seconds apart. If it still fails, the folder is logged and left in place, and it is not counted as a smoke problem. Each smoke test first sweeps away any `forge-smoke-*` folders left over from earlier runs (best effort).
