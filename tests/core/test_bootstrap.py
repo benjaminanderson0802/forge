@@ -577,3 +577,109 @@ class BootstrapTests(Harness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class R15BootstrapTests(Harness):
+    def test_R15_held_conductor_lock_allows_full_test_writer_step(self):
+        """R15: the conductor's own OS lock must not break a test-writer step."""
+        from core.bootstrap import acquire_lock
+
+        c = self.init(agents={"test_writer": self.write_tests, "builder": self.build_feature})
+        # Lock a real byte so Windows must enforce the read restriction.
+        (self.state / "conductor.lock").write_bytes(b"0")
+        handle = acquire_lock(self.state)
+        self.assertIsNotNone(handle)
+        try:
+            result = c.step()
+            errors = self.state / "errors.log"
+            log = errors.read_text(encoding="utf-8") if errors.exists() else ""
+            self.assertNotIn("stage error", log.lower())
+            self.assertNotIn("PermissionError", log)
+            self.assertEqual(result, "worked")
+            task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+            self.assertEqual(task["status"], "tests_ok")
+            self.assertIn("tests/core/test_feat.py", self.branch_files())
+            self.assertFalse((self.state / "KILL").exists())
+        finally:
+            handle.close()
+
+    def test_R15_agent_append_to_existing_conductor_lock_is_tamper(self):
+        """R15: the lock file remains fingerprinted and agent appends trigger tamper."""
+        from core.bootstrap import acquire_lock
+
+        lock_path = self.state / "conductor.lock"
+
+        def tamper(prompt, cwd):
+            with lock_path.open("ab") as stream:
+                stream.write(b"agent changed the lock\n")
+            return self.write_tests(prompt, cwd)
+
+        c = self.init(agents={"test_writer": tamper})
+        handle = acquire_lock(self.state)
+        self.assertIsNotNone(handle)
+        handle.close()  # Permit the fake agent to append on Windows as well.
+        self.assertTrue(lock_path.exists())
+        status_before = json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"]
+        result = c.step()
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertEqual(result, "killed")
+        self.assertTrue(any("tamper" in subject.lower() and "conductor.lock" in body
+                            for subject, body in self.mails))
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertEqual(task["status"], status_before)
+        self.assertNotIn("tests/core/test_feat.py", self.branch_files())
+        self.assertNotIn("stage error", (self.state / "errors.log").read_text().lower())
+
+    def test_R15_non_lock_file_becoming_unreadable_is_tamper(self):
+        """R15: an unreadable non-lock file triggers tamper rather than a stage error."""
+        meter_path = self.state / "meter.json"
+        real_read_bytes = Path.read_bytes
+        agent_started = False
+        denied_reads = []
+
+        def read_bytes(path):
+            if agent_started and path == meter_path:
+                denied_reads.append(path)
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_read_bytes(path)
+
+        def writer(prompt, cwd):
+            nonlocal agent_started
+            agent_started = True
+            return self.write_tests(prompt, cwd)
+
+        c = self.init(agents={"test_writer": writer})
+        Meter(self.state).add("codex", 1)
+        self.assertTrue(meter_path.read_bytes())
+        status_before = json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"]
+        # Keep the denial active for the fingerprint taken after the agent returns.
+        with patch.object(Path, "read_bytes", new=read_bytes):
+            result = c.step()
+        self.assertTrue(agent_started)
+        self.assertTrue(denied_reads)
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertEqual(result, "killed")
+        self.assertTrue(any("tamper" in subject.lower() and "meter.json" in body
+                            for subject, body in self.mails))
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertEqual(task["status"], status_before)
+        self.assertNotIn("stage error", (self.state / "errors.log").read_text().lower())
+
+    def test_R15_lock_mtime_change_alone_changes_fingerprint(self):
+        """R15: the lock signature covers mtime even when its size and bytes are unchanged."""
+        from core.bootstrap import acquire_lock
+
+        c = self.make_conductor()
+        handle = acquire_lock(self.state)
+        self.assertIsNotNone(handle)
+        handle.close()
+        lock_path = self.state / "conductor.lock"
+        before = c._fingerprint()
+        self.assertIn("conductor.lock", before)
+        stat = lock_path.stat()
+        os.utime(lock_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+        self.assertEqual(lock_path.stat().st_size, stat.st_size)
+        self.assertNotEqual(lock_path.stat().st_mtime_ns, stat.st_mtime_ns)
+        after = c._fingerprint()
+        self.assertIn("conductor.lock", after)
+        self.assertNotEqual(before["conductor.lock"], after["conductor.lock"])

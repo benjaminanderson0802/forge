@@ -92,3 +92,31 @@ class AdapterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class R16CodexSandboxTests(unittest.TestCase):
+    def test_R16_windows_sandbox_override_is_platform_specific(self):
+        """R16: Codex receives the elevated Windows sandbox override only on Windows."""
+        from unittest.mock import patch
+
+        for is_win in (True, False):
+            with self.subTest(is_win=is_win):
+                completed = json.dumps({"type": "turn.completed", "usage": {}}) + "\n"
+                with patch("core.agents.IS_WIN", is_win), \
+                        patch("core.agents._resolve", return_value=["codex"]), \
+                        patch("core.agents.launch", return_value=(0, completed, "")) as launch_mock:
+                    CodexAgent(sandbox="workspace-write").run("write tests", Path("."))
+                launch_mock.assert_called_once()
+                args = launch_mock.call_args.args[0]
+                self.assertIn("--ignore-user-config", args)
+                self.assertEqual(args[args.index("-s") + 1], "workspace-write")
+                self.assertEqual(args[-1], "-")
+                override = 'windows.sandbox="elevated"'
+                if is_win:
+                    self.assertIn(override, args)
+                    index = args.index(override)
+                    self.assertGreater(index, 0)
+                    self.assertEqual(args[index - 1], "-c")
+                    self.assertLess(index, len(args) - 1)
+                else:
+                    self.assertFalse(any("windows.sandbox" in arg for arg in args))
