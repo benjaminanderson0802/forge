@@ -1,6 +1,8 @@
 name: core-checks
 on:
   pull_request:
+    # labeled: re-check when the owner adds human-approved, so no manual re-run is needed
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [main]
 permissions:
