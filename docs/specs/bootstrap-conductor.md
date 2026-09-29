@@ -292,3 +292,14 @@ The first run with real agents and real email hit four faults no fake-based test
   - a failed or empty fetch (a network problem) doesn't mark the message seen, so it is retried on the next read, and the reader moves on to the next message;
   - an unknown charset falls back to UTF-8, replacing bytes it can't decode;
   - progress (`inbox_seen.json`) is saved even when one message fails.
+
+## Review round 7 amendment (Codex review, 2026-09-29)
+
+- **R37 The token cap is checked before every agent launch.**
+  - `_call` raises `Capped` before launching when that agent's provider is at or over its daily cap. Nothing is launched and no run record is written.
+  - `step()` returns `"capped"`. The attempt is undone cleanly and never counts as a failure:
+    - **test writer or planner capped:** the worktree is reset;
+    - **builder capped:** the ledger claim is released and the worktree is reset to the tests commit;
+    - **reviewer capped** (after the work was submitted): the auditor fails the run and the manager reopens the contract, exactly as a failed judge would, but no failure note or signature is recorded, `fails_since` is unchanged, and the task stays `tests_ok`;
+    - **troubleshooter or drift keeper capped:** nothing changes, and they run when the cap resets.
+  - **smoke test:** a `Capped` stops the smoke run with the problem "token cap reached", and `smoke_ok.json` is not written.
