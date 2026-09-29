@@ -6,9 +6,16 @@
 
 ## Now
 
-- Phase 0 is done. Phase F (Foundation): repo memory written; grilling finished (decisions D-018 to D-033).
-- Layer 1 design written (`docs/specs/layer-1-design.md`), split into sub-plans 1A–1E. 1A (agent runtime) is planned in detail.
-- Next: Ben approves the design, then the bootstrap team builds 1A on the `layer-1` branch.
+- Phase 0 is done. Phase F (Foundation): repo memory written; grilling finished (D-018 to D-034).
+- **Bootstrap conductor** (`core/bootstrap.py`) is built:
+  - Codex wrote the tests (38 conductor tests; 57 unit tests in all), and they pass on Windows and Linux. Drills 1–10 pass.
+  - Mutation testing caught every single-rule breakage of the safeguards.
+  - Codex review: fail, fail, fail, then **pass**. 17 findings fixed, each pinned by a test.
+- Next: Ben approves. Then `scripts/start_conductor.ps1` starts it hidden on the PC, and it builds the rest of Layer 1 from `docs/specs/layer-1-queue.json` with no human relay.
+
+## Known risks
+
+- Claude agents can run Python, and Python can read or write any file Ben's Windows account can. Writes to Forge's state are detected (the tamper alarm halts everything and emails Ben). Reads, and writes elsewhere, are not blocked. The strong fix, running agents under a separate Windows user or in a sandbox, is planned for Layer 3.
 
 ## Machine (Ben's PC)
 
@@ -20,4 +27,4 @@
 
 ## Open items for Ben
 
-- Approve the Layer 1 design and the 1A plan.
+- Approve the bootstrap conductor (one "y"), then run the start script.
