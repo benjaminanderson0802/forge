@@ -6,20 +6,12 @@
 
 ## Now
 
-- Phase F (Foundation). The bootstrap conductor is merged. Its first live start (2026-09-29) exposed faults that fake-based tests could not see:
-  - its own lock crashed the tamper check (fixed: PR #8, R15–R16);
-  - Codex rejected Forge's answer schemas;
-  - Forge read its own emails as Ben's replies and emailed him about 27 times, the messages doubling in size.
-- Forge was stopped and its scheduled task disabled. Branch `live-run-hardening` adds spec amendments R17–R40, each pinned by Codex-written tests:
-  - real schemas;
-  - self-mail rejected three ways, and Ben's read flags never touched;
-  - a mail budget (6 an hour, 30 a day, counted per attempt);
-  - KILL silences everything except one halt alert per 12 hours;
-  - nothing grows without bound;
-  - a live smoke test of every real agent before starting;
-  - token caps enforced before every agent launch (they never were: the real agents had no provider id).
-- Evidence: 170 unit tests pass on Windows and Linux, drills 1–10 pass, and the live smoke test with the real Codex and Claude agents passes. Codex review took 10 rounds and ended with a pass and no findings.
-- Next: Ben approves the pull request. Then the incident's state is archived, the queue is re-initialised, the smoke test is run, and the scheduled task is re-enabled.
+- **First watched live cycle (D-035), 2026-09-29, 19:53-20:57 UTC. Forge was stopped afterwards, pending Ben.**
+  - **Safety held:** 3 emails, all legitimate (start, T1A3 blocked, P1B blocked). No self-reads, no errors. The live smoke test passed. Tokens used: about 4.2M Claude and 1.8M Codex.
+  - **The team worked as designed.** Codex wrote tests that failed before the feature existed. Claude built. Codex reviewed with real findings. The troubleshooter diagnosed the builder going in circles.
+  - **T1A3 (readiness) is blocked:** the ledger parked it after 6 attempts. Reviews kept demanding guaranteed cancellation of hung checks, which Python threads can't provide. Unparking is a human-only ledger action, and the attempt count stays at 6, so this needs Ben. The recommended design (the troubleshooter's option A) is in the last troubleshooter run record.
+  - **P1B (1B plan) is blocked:** the reviewer rejected the plan twice. Its main systemic point, which also applies to P1C-P1E: the plan tasks carry only short labels, not the full instructions from `docs/specs/layer-1-design.md`. The queue needs richer plan-task sections before planning resumes.
+- **Earlier today:** the live-run hardening (R17-R40, PR #9) and the incident record (`docs/incidents/2026-09-29-email-flood.md`).
 
 ## Known risks
 
