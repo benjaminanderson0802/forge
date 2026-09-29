@@ -288,6 +288,7 @@ The first run with real agents and real email hit four faults no fake-based test
   - Each message is handled in its own `try`: if one message raises an error, the error is logged and processing continues with the next.
   - Pending messages follow the R19 caps: at most 50 are kept, and each body is capped.
 - **R36 One bad email can't block the inbox.** The reader handles each message separately:
-  - a message it can't decode is recorded as seen and skipped, and the reader moves on;
+  - a message is recorded as seen only after its body has been fetched and decoded, or after it has been fetched and found malformed (then it is skipped for good);
+  - a failed or empty fetch (a network problem) doesn't mark the message seen, so it is retried on the next read, and the reader moves on to the next message;
   - an unknown charset falls back to UTF-8, replacing bytes it can't decode;
   - progress (`inbox_seen.json`) is saved even when one message fails.
