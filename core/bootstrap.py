@@ -1337,6 +1337,14 @@ def main(argv: list[str]) -> int:
             c._handle_inbox()  # R31: a STOP is honoured before anything is launched
             if (c.state / "KILL").exists():
                 return 0
+            while (c.state / "PAUSED").exists():  # R40: while paused, only wait for Ben's answer
+                (c.state / "conductor.heartbeat").write_text(f"{os.getpid()} {time.time()}")
+                time.sleep(60)
+                if (c.state / "KILL").exists():
+                    return 0
+                c._handle_inbox()
+                if (c.state / "KILL").exists():
+                    return 0
         if a.cmd == "smoke" or _smoke_stale(c.state, c.clock()):
             problems = _guarded_smoke(c, Path(a.work), force=a.cmd == "smoke")
             if a.cmd == "smoke":
