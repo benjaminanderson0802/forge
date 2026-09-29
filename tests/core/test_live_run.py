@@ -1073,7 +1073,7 @@ class ReviewRoundFourReaderTests(Harness):
         self.assertEqual(server.stores, [])
 
     def test_R36_fetch_failure_does_not_block_other_replies_or_saved_progress(self):
-        """A failed body fetch cannot discard good replies before or after it."""
+        """A failed body fetch preserves other replies and is retried next read."""
         server = FakePeekIMAP()
         read = self.reader(server)
         self.assertEqual(read(), [])
@@ -1093,8 +1093,47 @@ class ReviewRoundFourReaderTests(Harness):
             messages = read()
             self.assertEqual([m["message_id"] for m in messages], [ids[0], ids[2]])
             self.assertEqual([m["body"].strip() for m in messages], ["reply 0", "reply 2"])
-            self.assertTrue(set(ids) <= set(self.read_state("inbox_seen.json")))
-            self.assertEqual(self.reader(server)(), [])
+            seen = set(self.read_state("inbox_seen.json"))
+            self.assertTrue({ids[0], ids[2]} <= seen)
+            self.assertNotIn(ids[1], seen)
         self.assertEqual(len(failures), 1)
+        messages = read()
+        self.assertEqual([m["message_id"] for m in messages], [ids[1]])
+        self.assertEqual(messages[0]["body"].strip(), "reply 1")
+        self.assertTrue(set(ids) <= set(self.read_state("inbox_seen.json")))
+        self.assertEqual(read(), [])
+        self.assertEqual(self.reader(server)(), [])
         self.assertEqual(server.stores, [])
 
+    def test_R36_empty_fetch_does_not_block_other_replies_or_saved_progress(self):
+        """An empty body fetch stays unseen and returns once after recovery."""
+        server = FakePeekIMAP()
+        read = self.reader(server)
+        self.assertEqual(read(), [])
+        ids = [f"<r36-empty-{i}@example.com>" for i in range(3)]
+        for i, mid in enumerate(ids):
+            server.add(mid, f"reply {i}")
+        fetch = server.fetch
+        empty_fetches = []
+
+        def empty_middle(num, message_parts):
+            if int(num) == 2 and message_parts == "(BODY.PEEK[])":
+                empty_fetches.append(num)
+                return "OK", [None]
+            return fetch(num, message_parts)
+
+        with patch.object(server, "fetch", side_effect=empty_middle):
+            messages = read()
+            self.assertEqual([m["message_id"] for m in messages], [ids[0], ids[2]])
+            self.assertEqual([m["body"].strip() for m in messages], ["reply 0", "reply 2"])
+            seen = set(self.read_state("inbox_seen.json"))
+            self.assertTrue({ids[0], ids[2]} <= seen)
+            self.assertNotIn(ids[1], seen)
+        self.assertEqual(len(empty_fetches), 1)
+        messages = read()
+        self.assertEqual([m["message_id"] for m in messages], [ids[1]])
+        self.assertEqual(messages[0]["body"].strip(), "reply 1")
+        self.assertTrue(set(ids) <= set(self.read_state("inbox_seen.json")))
+        self.assertEqual(read(), [])
+        self.assertEqual(self.reader(server)(), [])
+        self.assertEqual(server.stores, [])
