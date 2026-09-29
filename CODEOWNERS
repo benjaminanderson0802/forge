@@ -1,9 +1,9 @@
 # Changes to the trusted core need the owner's review.
-/core/ @OWNER_GITHUB_USERNAME
-/drills/ @OWNER_GITHUB_USERNAME
-/tests/acceptance/ @OWNER_GITHUB_USERNAME
-/charter/ @OWNER_GITHUB_USERNAME
-/spec/ @OWNER_GITHUB_USERNAME
-/.github/ @OWNER_GITHUB_USERNAME
-/roles.json @OWNER_GITHUB_USERNAME
-/CODEOWNERS @OWNER_GITHUB_USERNAME
+/core/ @benjaminanderson0802
+/drills/ @benjaminanderson0802
+/tests/acceptance/ @benjaminanderson0802
+/charter/ @benjaminanderson0802
+/spec/ @benjaminanderson0802
+/.github/ @benjaminanderson0802
+/roles.json @benjaminanderson0802
+/CODEOWNERS @benjaminanderson0802
