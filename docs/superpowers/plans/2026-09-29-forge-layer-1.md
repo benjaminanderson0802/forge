@@ -1,4 +1,6 @@
-# Forge Layer 1: Orchestrator Loop Implementation Plan
+# Forge Layer 1: Orchestrator Loop Implementation Plan (SUPERSEDED)
+
+> **Superseded on 2026-09-29** by `docs/specs/layer-1-design.md` and its sub-plans (1A–1E). This draft predates decisions D-018 to D-033 (build team, always-on service, contact rules). It is kept for history only. Do not implement from it.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

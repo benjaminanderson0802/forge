@@ -7,7 +7,8 @@
 ## Now
 
 - Phase 0 is done. Phase F (Foundation): repo memory written; grilling finished (decisions D-018 to D-033).
-- Next: revise the Layer 1 plan to match D-018 to D-033, then the build team (D-025) starts on a layer branch.
+- Layer 1 design written (`docs/specs/layer-1-design.md`), split into sub-plans 1A–1E. 1A (agent runtime) is planned in detail.
+- Next: Ben approves the design, then the bootstrap team builds 1A on the `layer-1` branch.
 
 ## Machine (Ben's PC)
 
@@ -19,4 +20,4 @@
 
 ## Open items for Ben
 
-- Approve the grilling decisions (D-018 to D-033).
+- Approve the Layer 1 design and the 1A plan.
