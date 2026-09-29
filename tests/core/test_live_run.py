@@ -1210,3 +1210,189 @@ class RealTeamTokenCapTests(Harness):
         self.add_codex_usage(self.cap - 1)
         self.assertIs(self.c._capped(), False)
         self.launch.assert_not_called()
+class R37PerLaunchCapTests(Harness):
+    cap = 10
+
+    def capped_conductor(self, *tasks, agents=None):
+        from core.usage import Meter
+
+        c = self.init(*tasks, agents=agents, limits={
+            "claude_daily_token_cap": self.cap,
+            "codex_daily_token_cap": self.cap,
+        })
+        # Simulate concurrent provider usage without changing guarded state
+        # during an agent call: retain the real Meter in a sibling temp directory.
+        c.meter = Meter(self.state.parent / "shared-usage", c.clock)
+        runner = patch.object(c, "_run_tests", side_effect=lambda task: (
+            (0, "Ran 1 test\nOK", False) if (c.wt / "feat.py").exists()
+            else (1, "Ran 1 test\nFAILED (errors=1)", False)
+        ))
+        runner.start()
+        self.addCleanup(runner.stop)
+        return c
+
+    def assert_tests_commit_restored(self, c):
+        self.assertEqual(bootstrap._git(c.wt, "rev-parse", "HEAD"),
+                         c._task("T1")["tests_commit"])
+        self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+        self.assertFalse((c.wt / "feat.py").exists())
+        self.assertTrue((c.wt / "tests/core/test_feat.py").is_file())
+
+    def test_R37_build_reviewer_cap_reopens_without_failure_and_resumes(self):
+        """R37: a cap reached inside the builder defers review cleanly and permits retry."""
+        def builder(prompt, cwd):
+            answer = self.build_feature(prompt, cwd)
+            c.meter.add("codex", self.cap + 1)
+            return answer
+
+        c = self.capped_conductor(agents={"test_writer": self.write_tests, "builder": builder})
+        self.assertEqual(c.step(), "worked")
+        c._update("T1", fails_since=1, notes=["earlier failure"], fail_signatures=["earlier-signature"])
+        before = c._task("T1")
+        self.assertFalse(c._capped())
+        result = c.step()
+        self.assertEqual(len(c.team.builder.prompts), 1)
+        self.assertGreater(c.meter.used_today("codex"), self.cap)
+        self.assertFalse((self.state / "KILL").exists())
+        with self.subTest(check="reviewer not launched"):
+            self.assertEqual(c.team.reviewer.prompts, [])
+        with self.subTest(check="capped result"):
+            self.assertEqual(result, "capped")
+        with self.subTest(check="contract reopened"):
+            self.assertEqual(c._ledger().contracts()["T1"]["status"], "open")
+        with self.subTest(check="no failure recorded"):
+            after = c._task("T1")
+            for field in ("status", "fails_since", "notes", "fail_signatures"):
+                self.assertEqual(after[field], before[field], field)
+        with self.subTest(check="worktree restored"):
+            self.assert_tests_commit_restored(c)
+
+        c.limits["codex_daily_token_cap"] = 1000
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(c.step(), "worked")  # Deferred drift check after successful review.
+        self.assertEqual(c._task("T1")["status"], "done")
+        self.assertEqual(c._ledger().contracts()["T1"]["status"], "done")
+        self.assertEqual(len(c.team.builder.prompts), 2)
+        self.assertEqual(len(c.team.reviewer.prompts), 1)
+        self.assertTrue({"feat.py", "tests/core/test_feat.py"} <= self.branch_files())
+
+    def test_R37_builder_cap_releases_claim_and_resets_worktree(self):
+        """R37: a builder capped before launch releases its claim and keeps tests_ok."""
+        c = self.capped_conductor(agents={"test_writer": self.write_tests, "builder": self.build_feature})
+        self.assertEqual(c.step(), "worked")
+        before = c._task("T1")
+        (c.wt / "stray.txt").write_text("unfinished attempt", encoding="utf-8")
+        c.meter.add("claude", self.cap + 1)
+        with patch.object(Conductor, "_capped", return_value=False):
+            result = c.step()
+        with self.subTest(check="builder not launched"):
+            self.assertEqual(c.team.builder.prompts, [])
+        with self.subTest(check="capped result"):
+            self.assertEqual(result, "capped")
+        with self.subTest(check="claim released"):
+            self.assertEqual(c._ledger().contracts()["T1"]["status"], "open")
+        with self.subTest(check="task unchanged"):
+            self.assertEqual(c._task("T1"), before)
+        with self.subTest(check="worktree restored"):
+            self.assert_tests_commit_restored(c)
+            self.assertFalse((c.wt / "stray.txt").exists())
+
+    def test_R37_troubleshooter_cap_preserves_bookkeeping(self):
+        """R37: a failing builder crosses Claude's cap before the troubleshooter is due."""
+        attempts = []
+
+        def failing_builder(prompt, cwd):
+            attempts.append(prompt)
+            # No implementation means the fake judge fails on both attempts.
+            return '{"status":"done"}', self.cap + 1 if len(attempts) == 2 else 1
+
+        c = self.capped_conductor(agents={"test_writer": self.write_tests, "builder": failing_builder})
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(c.step(), "worked")
+        before = c._task("T1")
+        self.assertEqual(before["fails_since"], 1)
+        self.assertEqual(c.team.troubleshooter.prompts, [])
+        self.assertFalse(c._capped())
+        result = c.step()
+        self.assertEqual(len(attempts), 2)
+        self.assertGreater(c.meter.used_today("claude"), self.cap)
+        with self.subTest(check="troubleshooter not launched"):
+            self.assertEqual(c.team.troubleshooter.prompts, [])
+        with self.subTest(check="capped result"):
+            self.assertEqual(result, "capped")
+        with self.subTest(check="no troubleshoot bookkeeping"):
+            after = c._task("T1")
+            for field in ("troubleshot", "troubleshoots", "trouble_notes"):
+                self.assertEqual(after[field], before[field], field)
+            self.assertEqual(after["fails_since"], 2)
+            self.assertFalse((self.state / "dead_ends.jsonl").exists())
+
+    def test_R37_plan_reviewer_cap_resets_plan_and_keeps_todo(self):
+        """R37: a planner crossing Codex's cap leaves no plan or queued child tasks."""
+        def planner(prompt, cwd):
+            (cwd / "plan.md").write_text("Implement feature value 42 with acceptance tests.\n", encoding="utf-8")
+            c.meter.add("codex", self.cap + 1)
+            return json.dumps({"tasks": [self.task(id="T2")]}), 1
+
+        c = self.capped_conductor(self.task(kind="plan", plan_file="plan.md"), agents={"planner": planner})
+        before = c._task("T1")
+        result = c.step()
+        self.assertEqual(len(c.team.planner.prompts), 1)
+        self.assertGreater(c.meter.used_today("codex"), self.cap)
+        self.assertFalse((self.state / "KILL").exists())
+        with self.subTest(check="reviewer not launched"):
+            self.assertEqual(c.team.reviewer.prompts, [])
+        with self.subTest(check="capped result"):
+            self.assertEqual(result, "capped")
+        with self.subTest(check="plan stays todo"):
+            self.assertEqual(c._queue()["tasks"], [before])
+        with self.subTest(check="plan reset"):
+            self.assertFalse((c.wt / "plan.md").exists())
+            self.assertNotIn("plan.md", self.branch_files())
+            self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+
+    def test_R37_smoke_stops_later_codex_roles_at_cap(self):
+        """R37: smoke usage from the test writer prevents later Codex launches and success."""
+        c = self.capped_conductor()
+        team, calls = SmokeTests.smoke_team(self)
+        for role in Team.__dataclass_fields__:
+            getattr(team, role).provider = "codex" if role in ("test_writer", "reviewer") else "claude"
+        writer = team.test_writer.script
+
+        def costly_writer(prompt, cwd):
+            text, _ = writer(prompt, cwd)
+            return text, self.cap + 1
+
+        team.test_writer = FakeAgent(costly_writer, provider="codex")
+        c.team = team
+        self.assertFalse(c._capped())
+        problems = bootstrap._guarded_smoke(c, self.work)
+        self.assertEqual(len(team.test_writer.prompts), 1)
+        self.assertGreater(c.meter.used_today("codex"), self.cap)
+        with self.subTest(check="later Codex roles not launched"):
+            self.assertEqual(team.reviewer.prompts, [])
+            self.assertNotIn("reviewer", [role for role, cwd in calls])
+        with self.subTest(check="cap problem"):
+            self.assertTrue(any("token cap reached" in problem.lower() for problem in problems), problems)
+        with self.subTest(check="no success stamp"):
+            self.assertFalse((self.state / "smoke_ok.json").exists())
+
+    def test_R37_call_raises_capped_without_launch_or_run_record(self):
+        """R37: _call raises Capped at or above either provider's cap without recording a run."""
+        c = self.capped_conductor()
+        for role, provider in (("builder", "claude"), ("reviewer", "codex")):
+            for usage in (self.cap, self.cap + 1):
+                with self.subTest(provider=provider, usage=usage):
+                    c.meter.add(provider, usage - c.meter.used_today(provider))
+                    before = set((self.state / "runs").rglob("*"))
+                    caught = None
+                    try:
+                        c._call(role, "Must not launch", None, cwd=self.work)
+                    except Exception as exc:
+                        caught = exc
+                    self.assertEqual(getattr(c.team, role).prompts, [])
+                    self.assertEqual(set((self.state / "runs").rglob("*")), before)
+                    self.assertIsNotNone(caught, "_call must raise core.bootstrap.Capped")
+                    capped = getattr(bootstrap, "Capped", None)
+                    self.assertIsNotNone(capped, "core.bootstrap must expose Capped")
+                    self.assertIsInstance(caught, capped)
