@@ -255,17 +255,21 @@ class Conductor:
 
     def _fingerprint(self) -> dict:
         """R9/R10/R14: every file in state/. The conductor writes nothing there while an agent runs, so nothing
-        is exempt. Run records (which only grow) use a fast size+mtime signature; everything else a sha256."""
+        is exempt. Run records (which only grow) and the lock file use a size+mtime signature; everything else a
+        sha256 (R15)."""
         fp = {}
         for f in self.state.rglob("*"):
             if not f.is_file():
                 continue
             rel = f.relative_to(self.state).as_posix()
-            if rel.startswith("runs/"):
-                st = f.stat()
+            st = f.stat()
+            if rel.startswith("runs/") or rel == LOCK_NAME:  # R15: the lock is unreadable to us on Windows
                 fp[rel] = f"{st.st_size}:{st.st_mtime_ns}"
-            else:
+                continue
+            try:
                 fp[rel] = hashlib.sha256(f.read_bytes()).hexdigest()
+            except OSError:  # R15: never skip; an unreadable file can't match its readable hash
+                fp[rel] = f"unreadable:{st.st_size}:{st.st_mtime_ns}"
         return fp
 
     def _log(self, msg: str) -> None:
@@ -882,10 +886,13 @@ def real_team(limits: dict) -> Team:
                                     allowed_tools=["Read", "Edit", "Write", "Glob", "Grep"]))
 
 
+LOCK_NAME = "conductor.lock"
+
+
 def acquire_lock(state: Path):
     """R11: OS-level exclusive lock held for the life of the process. Returns a handle, or None if taken."""
     state.mkdir(parents=True, exist_ok=True)
-    f = open(state / "conductor.lock", "a+")
+    f = open(state / LOCK_NAME, "a+")
     try:
         if os.name == "nt":
             import msvcrt

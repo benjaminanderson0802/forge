@@ -200,3 +200,8 @@ A `kind == "plan"` task with status `todo`:
 ## Review round 3 amendment
 
 - **R14 Nothing is exempt.** The tamper fingerprint covers every file in `state/`, including `runs/` and `meter.json`. The conductor never writes to `state/` while an agent run is in progress: the run's `prompt.md` is written before the "before" fingerprint, and `output.json` and meter updates only after the "after" comparison. Files under `runs/` use a size+mtime signature, for speed; all other files use sha256.
+
+## Live-run amendments (first start on Ben's PC, 2026-09-29)
+
+- **R15 The lock file is fingerprinted by signature.** On Windows the R11 lock makes `state/conductor.lock` unreadable to its own process, so hashing it crashed every agent run with `PermissionError`. `conductor.lock` uses the size+mtime signature, as `runs/` does. Any other file that can't be read gets an `unreadable:<size>:<mtime>` signature. That differs from its sha256, so an unreadable file still trips the tamper alarm; it is never skipped.
+- **R16 Codex keeps the Windows sandbox.** `--ignore-user-config` also drops Ben's `windows.sandbox` setting, and without it Codex silently downgrades `workspace-write` to read-only, so the test writer could never write. On Windows, `CodexAgent` passes `-c windows.sandbox="elevated"`.
