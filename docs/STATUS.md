@@ -2,16 +2,24 @@
 
 > Forge updates this file after every cycle once Layer 1 runs. Until then, whoever finishes a piece of work updates it. Keep it short: where things stand now, not history (history is in git and the ledger).
 
-**Updated:** 2026-09-29
+**Updated:** 2026-09-29 (evening)
 
 ## Now
 
-- Phase 0 is done. Phase F (Foundation): repo memory written; grilling finished (D-018 to D-034).
-- **Bootstrap conductor** (`core/bootstrap.py`) is built:
-  - Codex wrote the tests (38 conductor tests; 57 unit tests in all), and they pass on Windows and Linux. Drills 1–10 pass.
-  - Mutation testing caught every single-rule breakage of the safeguards.
-  - Codex review: fail, fail, fail, then **pass**. 17 findings fixed, each pinned by a test.
-- Next: Ben approves. Then `scripts/start_conductor.ps1` starts it hidden on the PC, and it builds the rest of Layer 1 from `docs/specs/layer-1-queue.json` with no human relay.
+- Phase F (Foundation). The bootstrap conductor is merged. Its first live start (2026-09-29) exposed faults that fake-based tests could not see:
+  - its own lock crashed the tamper check (fixed: PR #8, R15–R16);
+  - Codex rejected Forge's answer schemas;
+  - Forge read its own emails as Ben's replies and emailed him about 27 times, the messages doubling in size.
+- Forge was stopped and its scheduled task disabled. Branch `live-run-hardening` adds spec amendments R17–R40, each pinned by Codex-written tests:
+  - real schemas;
+  - self-mail rejected three ways, and Ben's read flags never touched;
+  - a mail budget (6 an hour, 30 a day, counted per attempt);
+  - KILL silences everything except one halt alert per 12 hours;
+  - nothing grows without bound;
+  - a live smoke test of every real agent before starting;
+  - token caps enforced before every agent launch (they never were: the real agents had no provider id).
+- Evidence: 170 unit tests pass on Windows and Linux, drills 1–10 pass, and the live smoke test with the real Codex and Claude agents passes. Codex review took 10 rounds and ended with a pass and no findings.
+- Next: Ben approves the pull request. Then the incident's state is archived, the queue is re-initialised, the smoke test is run, and the scheduled task is re-enabled.
 
 ## Known risks
 
@@ -27,4 +35,4 @@
 
 ## Open items for Ben
 
-- Approve the bootstrap conductor (one "y"), then run the start script.
+- Approve the live-run-hardening pull request (one "y").
