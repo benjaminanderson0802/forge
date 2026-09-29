@@ -338,8 +338,8 @@ class Conductor:
             c2, o2 = self.gh(["pr", "merge", pr, "--merge", "--delete-branch"]) if c1 == 0 else (c1, o1)
             if c1 != 0 or c2 != 0:  # R3: stay open, tell Ben, a new "y" can retry
                 self._log(f"gate merge failed for PR {pr}: {o1} {o2}")
-                self._mail_notice(qid, "approval received, but the merge failed",
-                                  f"GitHub said:\n{(o2 or o1)[:2000]}\n\nReply y again to retry once it's fixed.")
+                self._mail_notice(qid, "merge error: approval received, but the merge failed",
+                                  f"Error from GitHub:\n{(o2 or o1)[:2000]}\n\nReply y again to retry once it's fixed.")
                 return
         elif q["kind"] == "blocked":
             qd = self._queue()
