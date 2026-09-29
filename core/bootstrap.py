@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -57,11 +58,60 @@ def _git(cwd: Path, *args: str, check: bool = True) -> str:
     return p.stdout.strip()
 
 
+class Tampered(Exception):
+    """An agent run changed the conductor's own state files (R9)."""
+
+
+ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
 def _norm(p: str) -> str:
     p = p.replace("\\", "/")
     while p.startswith("./"):
         p = p[2:]
     return p
+
+
+def parse_test_cmd(cmd: str, test_files: list[str]) -> list[str] | None:
+    """R1: accept only `python -m unittest <paths>` where every path is one of test_files."""
+    m = re.match(r'^\s*("[^"]+"|\S+)\s+-m\s+unittest\s+(.+?)\s*$', str(cmd))
+    if not m:
+        return None
+    exe = m.group(1).strip('"').replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if not re.match(r"^python(3(\.\d+)?)?(\.exe)?$", exe):
+        return None
+    allowed = {_norm(x) for x in test_files}
+    paths = []
+    for tok in m.group(2).split():
+        path = _norm(tok) if tok.endswith(".py") or "/" in tok or "\\" in tok else tok.replace(".", "/") + ".py"
+        if path not in allowed or ".." in path:
+            return None
+        paths.append(path)
+    return paths or None
+
+
+def validate_task(t: dict) -> str | None:
+    """R1: returns a problem description, or None if the task is safe to run."""
+    if not isinstance(t.get("id"), str) or not ID_RE.match(t["id"]):
+        return f"bad id {t.get('id')!r}"
+    if t.get("kind", "build") == "plan":
+        pf = _norm(str(t.get("plan_file", "")))
+        return None if pf and ".." not in pf and not re.match(r"^([A-Za-z]:|/)", pf) else "bad plan_file"
+    tf, scope = t.get("test_files"), t.get("files_in_scope")
+    if not isinstance(tf, list) or not tf or not all(isinstance(x, str) for x in tf):
+        return "test_files must be a non-empty list"
+    for x in tf:
+        n = _norm(x)
+        if not n.startswith("tests/") or not n.endswith(".py") or ".." in n:
+            return f"bad test file {x!r}"
+    if not isinstance(scope, list) or not scope or not all(isinstance(x, str) for x in scope):
+        return "files_in_scope must be a non-empty list"
+    for x in scope:
+        if ".." in x or re.match(r"^([A-Za-z]:|/|\\)", x):
+            return f"bad scope entry {x!r}"
+    if parse_test_cmd(t.get("test_cmd", ""), tf) is None:
+        return "unsafe test_cmd"
+    return None
 
 
 class Conductor:
@@ -105,6 +155,10 @@ class Conductor:
 
     # ------------------------------------------------------------------ setup
     def init_queue(self, layer: str, tasks: list[dict]) -> None:
+        for t in tasks:
+            problem = validate_task(t)
+            if problem:
+                raise ValueError(f"task {t.get('id')!r}: {problem}")
         (self.state / "roles.json").write_bytes(json.dumps(ROLES, indent=2).encode("utf-8"))
         norm = [self._new_task(t) for t in tasks]
         self._save_queue({"layer": layer, "tasks": norm})
@@ -121,6 +175,7 @@ class Conductor:
         t.setdefault("fails_since", 0)
         t.setdefault("review_feedback", [])
         t.setdefault("trouble_notes", [])
+        t.setdefault("troubleshoots", 0)
         return t
 
     def _ensure_worktree(self, layer: str) -> None:
@@ -144,6 +199,8 @@ class Conductor:
         """Every added, modified, deleted or untracked path in the worktree (NUL-separated: no trimming bugs)."""
         p = subprocess.run(["git", "status", "--porcelain", "-z", "-uall"], cwd=str(self.wt), capture_output=True,
                            stdin=subprocess.DEVNULL, **NOWIN)
+        if p.returncode != 0:
+            raise RuntimeError("git error: status failed: " + p.stderr.decode("utf-8", "replace").strip()[:300])
         entries = p.stdout.decode("utf-8", "replace").split("\0")
         files, i = [], 0
         while i < len(entries):
@@ -174,17 +231,42 @@ class Conductor:
         d = self.state / "runs" / run_id
         d.mkdir(parents=True, exist_ok=True)
         (d / "prompt.md").write_bytes(prompt.encode("utf-8"))
+        before = self._fingerprint()
         try:
             r = agent.run(prompt, self.wt, schema)
         except Exception as e:  # noqa: BLE001 - an agent crash is a failed result
             from core.agents import AgentResult
             r = AgentResult("", 0, False, repr(e), None, getattr(agent, "provider", "unknown"))
+        after = self._fingerprint()
+        if after != before:
+            changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+            (self.state / "KILL").write_text("state tampered during an agent run\n")
+            self._log(f"TAMPER during {role} run {run_id}: {changed}")
+            self._ask("tamper", f"Forge stopped: a {role} agent changed Forge's own state files",
+                      "Files changed during the agent run:\n" + "\n".join(changed) +
+                      "\n\nForge is halted (KILL). Nothing from that run was recorded.")
+            raise Tampered(", ".join(changed))
         if r.tokens:
             self.meter.add(r.provider or "unknown", r.tokens)
         (d / "output.json").write_bytes(json.dumps({"ok": r.ok, "error": r.error, "text": r.text, "data": r.data,
                                                     "tokens": r.tokens, "provider": r.provider},
                                                    indent=2).encode("utf-8"))
         return r
+
+    def _fingerprint(self) -> dict:
+        fp = {}
+        for f in self.state.rglob("*"):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(self.state).as_posix()
+            if rel.startswith("runs/") or rel == "meter.json" or rel.startswith(".tmp") or rel.endswith(".tmp"):
+                continue
+            fp[rel] = hashlib.sha256(f.read_bytes()).hexdigest()
+        return fp
+
+    def _log(self, msg: str) -> None:
+        with (self.state / "errors.log").open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
 
     def _capped(self) -> bool:
         providers = {getattr(getattr(self.team, f), "provider", None) for f in Team.__dataclass_fields__}
@@ -194,15 +276,41 @@ class Conductor:
     def _ask(self, kind: str, subject: str, body: str, **extra) -> str:
         qs = self._read("questions.json", {})
         qid = f"{kind}-{len(qs) + 1}"
-        qs[qid] = {"kind": kind, "status": "open", **extra}
+        code = secrets.token_urlsafe(6)[:8]
+        qs[qid] = {"kind": kind, "status": "open", "code": code, "subject": subject, "body": body,
+                   "delivered": False, **extra}
         self._write("questions.json", qs)
-        self.mailer(f"[Forge Q-{qid}] {subject}", body)
+        self._deliver(qid)
         return qid
 
+    def _deliver(self, qid: str) -> None:
+        qs = self._read("questions.json", {})
+        q = qs[qid]
+        try:
+            self.mailer(f"[Forge Q-{qid} {q['code']}] {q['subject']}", q["body"])
+        except Exception as e:  # noqa: BLE001 - retried every step (R7)
+            self._log(f"mail to owner failed for {qid}: {e!r}")
+            return
+        qs = self._read("questions.json", {})
+        qs[qid]["delivered"] = True
+        self._write("questions.json", qs)
+
+    def _mail_notice(self, qid: str, subject: str, body: str) -> None:
+        """Follow-up email on an existing question (keeps its reply code)."""
+        q = self._read("questions.json", {}).get(qid, {})
+        try:
+            self.mailer(f"[Forge Q-{qid} {q.get('code', '')}] {subject}", body)
+        except Exception as e:  # noqa: BLE001
+            self._log(f"notice mail failed for {qid}: {e!r}")
+
     def _handle_inbox(self) -> None:
+        for qid, q in self._read("questions.json", {}).items():
+            if q.get("delivered") is False:
+                self._deliver(qid)
         try:
             messages = self.inbox() or []
-        except Exception:  # noqa: BLE001 - email trouble never stops the conductor
+        except Exception as e:  # noqa: BLE001 - email trouble never stops the conductor (R7)
+            self._log(f"inbox read failed: {e!r}")
             return
         for m in messages:
             sender = re.findall(r"[\w.+-]+@[\w.-]+", str(m.get("from", "")).lower())
@@ -211,14 +319,14 @@ class Conductor:
             subject, body = str(m.get("subject", "")), str(m.get("body", ""))
             if re.search(r"\bstop\b", subject + " " + body, re.I):
                 (self.state / "KILL").write_text("stopped by owner email\n")
-            mq = re.search(r"\[Forge Q-([\w-]+)\]", subject)
+            mq = re.search(r"\[Forge Q-([\w-]+) ([\w-]{8})\]", subject)
             if mq:
-                self._answer(mq.group(1), body)
+                self._answer(mq.group(1), body, mq.group(2))
 
-    def _answer(self, qid: str, body: str) -> None:
+    def _answer(self, qid: str, body: str, code: str) -> None:
         qs = self._read("questions.json", {})
         q = qs.get(qid)
-        if not q or q.get("status") != "open":
+        if not q or q.get("status") != "open" or not secrets.compare_digest(str(q.get("code", "")), code):
             return
         reply = body.strip().splitlines()[0].strip() if body.strip() else ""
         if q["kind"] == "gate":
@@ -226,15 +334,20 @@ class Conductor:
             if first not in {"y", "yes"}:
                 return
             pr = str(q["pr"])
-            self.gh(["pr", "edit", pr, "--add-label", "human-approved"])
-            self.gh(["pr", "merge", pr, "--merge", "--delete-branch"])
+            c1, o1 = self.gh(["pr", "edit", pr, "--add-label", "human-approved"])
+            c2, o2 = self.gh(["pr", "merge", pr, "--merge", "--delete-branch"]) if c1 == 0 else (c1, o1)
+            if c1 != 0 or c2 != 0:  # R3: stay open, tell Ben, a new "y" can retry
+                self._log(f"gate merge failed for PR {pr}: {o1} {o2}")
+                self._mail_notice(qid, "approval received, but the merge failed",
+                                  f"GitHub said:\n{(o2 or o1)[:2000]}\n\nReply y again to retry once it's fixed.")
+                return
         elif q["kind"] == "blocked":
             qd = self._queue()
             for t in qd["tasks"]:
                 if t["id"] == q.get("task"):
                     t["trouble_notes"].append(f"Ben: {body.strip()}")
                     t["status"] = "tests_ok" if t.get("tests_commit") else "todo"
-                    t["fail_signatures"], t["fails_since"], t["troubleshot"] = [], 0, False
+                    t["fail_signatures"], t["fails_since"], t["troubleshot"], t["troubleshoots"] = [], 0, False, 0
                     t["test_rejects"] = 0
                     t["plan_rejects"] = 0
             self._save_queue(qd)
@@ -258,23 +371,37 @@ class Conductor:
             return "capped"
         q = self._queue()
         if q.get("drift_due"):
-            q["drift_due"] = False
-            self._save_queue(q)
-            self._drift_check()
+            try:
+                self._drift_check()
+            except Tampered:
+                return "killed"
             return "worked"
         for t in q["tasks"]:
             if t["status"] in ("todo", "tests_ok"):
-                self._ensure_worktree(q["layer"])
-                if t["kind"] == "plan":
-                    self._plan_stage(t["id"])
-                elif t["status"] == "todo":
-                    self._tests_stage(t["id"])
-                else:
-                    self._build_stage(t["id"])
+                try:
+                    self._ensure_worktree(q["layer"])
+                    if t["kind"] == "plan":
+                        self._plan_stage(t["id"])
+                    elif t["status"] == "todo":
+                        self._tests_stage(t["id"])
+                    else:
+                        self._build_stage(t["id"])
+                except Tampered:
+                    return "killed"
+                except (RuntimeError, OSError) as e:  # R8: git or filesystem trouble is a failed attempt
+                    self._log(f"stage error on {t['id']}: {e!r}")
+                    try:
+                        cur = self._task(t["id"])
+                        self._update(t["id"], notes=cur["notes"] + [f"git error: {e}"[:300]])
+                        if cur["status"] == "tests_ok":
+                            self._after_failure(t["id"], f"git error: {e}"[:300], "git-error", "")
+                    except Exception as e2:  # noqa: BLE001
+                        self._log(f"could not record stage error: {e2!r}")
                 return "worked"
         tasks = q["tasks"]
         qs = self._read("questions.json", {})
-        if tasks and all(t["status"] == "done" for t in tasks) and not any(v["kind"] == "gate" for v in qs.values()):
+        if tasks and all(t["status"] == "done" for t in tasks) and not q.get("drift_due") \
+                and not any(v["kind"] == "gate" for v in qs.values()):
             self._gate()
             return "gate"
         return "idle"
@@ -311,6 +438,19 @@ class Conductor:
                   "\n\nReply to this email with guidance and the task will be retried with it. "
                   "Otherwise Forge continues with other work.", task=tid)
 
+    def _run_tests(self, t: dict) -> tuple[int, str, bool]:
+        """R1: run a task's unittest command without a shell. Returns (exit, output, timed_out)."""
+        paths = parse_test_cmd(t["test_cmd"], t["test_files"])
+        if paths is None:
+            return 2, "unsafe test_cmd", False
+        try:
+            p = subprocess.run([sys.executable, "-m", "unittest", *paths], cwd=str(self.wt), capture_output=True,
+                               text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+                               timeout=int(self.limits.get("test_timeout_s", 600)), **NOWIN)
+            return p.returncode, (p.stdout or "") + (p.stderr or ""), False
+        except subprocess.TimeoutExpired:
+            return 124, "test command timed out", True
+
     def _run_cmd(self, cmd: str) -> tuple[int, str]:
         try:
             p = subprocess.run(cmd, shell=True, cwd=str(self.wt), capture_output=True, text=True, encoding="utf-8",
@@ -344,8 +484,11 @@ class Conductor:
             reason = "tests rejected: wrote outside test_files: " + ", ".join(
                 f for f in changed if f not in [_norm(x) for x in t["test_files"]])
         else:
-            code, _ = self._run_cmd(t["test_cmd"])
-            if code == 0:
+            code, out, timed_out = self._run_tests(t)
+            ran = re.search(r"Ran ([1-9]\d*) tests?", out)
+            if timed_out or not ran:
+                reason = "tests rejected: no real failing run (timed out or no tests ran)"
+            elif code == 0:
                 reason = "tests rejected: weak (they pass before the feature exists)"
         if reason:
             self._reset_wt()
@@ -402,7 +545,9 @@ class Conductor:
         dead = self._dead_ends()
         if dead:
             prompt += "\nKNOWN DEAD ENDS:\n" + "\n".join(dead) + "\n"
-        prompt += "\nAnswer with JSON: {\"status\": \"done\" | \"blocked\", \"summary\": \"...\"}"
+        prompt += ("\nAnswer with JSON: {\"status\": \"done\" | \"blocked\", \"summary\": \"...\"}. "
+                   "A blocked answer must also include \"tried\" (at least 2 different routes you actually tried) "
+                   "and \"error\" (the real error output); without them it is rejected as an easy way out.")
         r = self._call("builder", prompt, S_BUILD)
 
         tests = [_norm(x) for x in t["test_files"]]
@@ -428,8 +573,14 @@ class Conductor:
         if not r.ok:
             return fail(f"builder output unusable: {r.error}", f"builder-error:{r.error}")
         if (r.data or {}).get("status") == "blocked":
-            summary = (r.data or {}).get("summary") or (r.data or {}).get("blocker") or "no detail"
-            return fail(f"blocker: {summary}", f"blocker:{summary}")
+            d = r.data or {}
+            summary = d.get("summary") or "no detail"
+            tried, err = d.get("tried"), d.get("error")
+            if not (isinstance(tried, list) and len(tried) >= 2 and isinstance(err, str) and err.strip()):
+                with (self.state / "easy_outs.jsonl").open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"task": tid, "kind": "easy_out", "summary": summary}) + "\n")
+                return fail("blocker rejected: no evidence (easy out)", "easy-out")
+            return fail(f"blocker: {summary} (tried: {'; '.join(map(str, tried))}; error: {err})", f"blocker:{summary}")
         if violations:  # D-025 / drill 7: an attempt that touched its own tests can never pass
             return fail("touched test files (reverted): " + ", ".join(violations),
                         "touched tests: " + ",".join(violations))
@@ -442,8 +593,8 @@ class Conductor:
             "violations": violations, "out_of_scope": []})
         self._apply(f"{tag}-submit", "submit", cid, "forge-executor", {"commit": sha})
 
-        for cmd in [t["test_cmd"], *self.judge_cmds]:
-            code, output = self._run_cmd(cmd)
+        results = [("task tests", *self._run_tests(t)[:2])] + [(cmd, *self._run_cmd(cmd)) for cmd in self.judge_cmds]
+        for cmd, code, output in results:
             if code != 0:
                 self._apply(f"{tag}-ci", "test_run", cid, "ci", {"run_id": f"{tag}-ci", "commit": sha, "passed": False})
                 tail = "\n".join(output.splitlines()[-20:])
@@ -482,7 +633,8 @@ class Conductor:
         fails = t.get("fails_since", 0) + 1
         t = self._update(tid, fail_signatures=sigs, fails_since=fails, notes=t["notes"] + [reason])
         zero_progress = len(sigs) >= 2 and sigs[-1] == sigs[-2]
-        if t.get("troubleshot"):
+        rounds = t.get("troubleshoots", 0)
+        if rounds >= 3:
             if fails >= 2:
                 self._block(tid, reason)
             return
@@ -510,7 +662,8 @@ class Conductor:
                                         "alternative": d.get("alternative", "")}) + "\n")
         else:
             notes = notes + [f"(troubleshooter failed: {r.error})"]
-        self._update(tid, trouble_notes=notes, troubleshot=True, fails_since=0)
+        self._update(tid, trouble_notes=notes, troubleshot=True, fails_since=0,
+                     troubleshoots=t.get("troubleshoots", 0) + 1)
 
     # ------------------------------------------------------------------ drift
     def _drift_check(self) -> None:
@@ -522,7 +675,20 @@ class Conductor:
                                        "the design? Say replan only if it is drifting.\n\nTASKS:\n" + listing +
                        "\n\nDESIGN:\n" + text[:40000] +
                        "\nAnswer with JSON: {\"status\": \"ok\" | \"replan\", \"reasons\": [...]}", S_DRIFT)
-        if r.ok and (r.data or {}).get("status") == "replan":
+        status = (r.data or {}).get("status") if r.ok else None
+        q = self._queue()
+        if status not in ("ok", "replan"):  # R6: unusable result, retry; escalate after 3
+            q["drift_failures"] = q.get("drift_failures", 0) + 1
+            self._save_queue(q)
+            if q["drift_failures"] >= 3:
+                (self.state / "PAUSED").write_text("drift keeper failed 3 times\n")
+                self._ask("replan", "Forge paused: the drift check keeps failing",
+                          f"The drift keeper returned unusable output 3 times (last error: {r.error}).\n\n"
+                          "Reply with guidance to resume.")
+            return
+        q["drift_due"], q["drift_failures"] = False, 0
+        self._save_queue(q)
+        if status == "replan":
             reasons = (r.data or {}).get("reasons") or []
             if isinstance(reasons, str):
                 reasons = [reasons]
@@ -551,6 +717,9 @@ class Conductor:
         elif not isinstance(tasks, list) or not tasks or not all(
                 isinstance(x, dict) and all(k in x for k in TASK_FIELDS) for x in tasks):
             reason = "plan rejected: tasks missing required fields"
+        elif any(validate_task(dict(x, kind="build")) for x in tasks):
+            bad = next(validate_task(dict(x, kind="build")) for x in tasks if validate_task(dict(x, kind="build")))
+            reason = "plan rejected: unsafe test_cmd" if "test_cmd" in bad else f"plan rejected: {bad}"
         else:
             existing = {x["id"] for x in self._queue()["tasks"]}
             if any(x["id"] in existing for x in tasks):
@@ -593,7 +762,19 @@ class Conductor:
         code, out = self.gh(["pr", "create", "--base", "main", "--head", q["layer"],
                              "--title", f"{q['layer']}: ready for approval", "--body", report])
         m = re.search(r"/pull/(\d+)", out or "")
-        pr = m.group(1) if m else ""
+        if code != 0 or not m:  # R3: no gate question without a real PR; tell Ben (not on every retry)
+            n = q.get("gate_errors", 0) + 1
+            q["gate_errors"] = n
+            self._save_queue(q)
+            self._log(f"gate PR create failed: {out}")
+            if n == 1 or n % 20 == 0:
+                try:
+                    self.mailer(f"[Forge] {q['layer']} is done but the pull request failed",
+                                f"GitHub said:\n{(out or '')[:2000]}\n\nForge keeps retrying.")
+                except Exception as e:  # noqa: BLE001
+                    self._log(f"mail failed: {e!r}")
+            return
+        pr = m.group(1)
         self._ask("gate", f"{q['layer']} is ready: reply y to approve",
                   report + f"\n\nPull request: {out.strip()}\n\nReply y to approve and merge into main.", pr=pr)
 
