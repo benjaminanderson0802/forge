@@ -210,3 +210,108 @@ A `kind == "plan"` task with status `todo`:
   - **Tamper after a run.** A file that becomes unreadable during a run gets an `unreadable:<size>:<mtime>` signature. That never equals a sha256, so the tamper alarm fires.
   - **The check itself must complete.** The fingerprint walks `state/` strictly: any error listing a folder or reading a file's details raises, and nothing inaccessible is silently left out. Before a run, a fingerprint that fails means the agent is not launched (stage error). After a run, a fingerprint that fails counts as tampering: KILL is written, Ben is emailed, and nothing from the run is recorded.
 - **R16 Codex keeps the Windows sandbox.** `--ignore-user-config` also drops Ben's `windows.sandbox` setting, and without it Codex silently downgrades `workspace-write` to read-only, so the test writer could never write. On Windows, `CodexAgent` passes `-c windows.sandbox="elevated"` for every sandbox mode. The setting only chooses Windows' sandbox implementation, so the reviewer stays `read-only`. Prerequisite for unattended runs: the Codex Windows sandbox has been set up once on the PC (done 2026-09-28).
+
+## Live-run amendments, round 2 (first real agent runs, 2026-09-29)
+
+The first run with real agents and real email hit four faults no fake-based test could see. It sent Ben about 27 emails, each blocked email twice the size of the last. These rules stop each fault and bound the damage from any fault like it.
+
+- **R17 Real answer schemas.** Each role's schema (`S_TESTS`, `S_BUILD`, `S_REVIEW`, `S_TROUBLE`, `S_DRIFT`, `S_PLAN`) is a full JSON Schema: `"type": "object"`, `properties` with types, and `required` listing the keys the conductor needs. Codex receives a strict form built by `agents.strict_schema(schema)`:
+  - every object gets `additionalProperties: false`, and every property is listed in `required`;
+  - properties that weren't required become nullable;
+  - this applies recursively, through nested objects and array items.
+
+  The conductor's own shape check (`_shape_ok`) still checks only the original `required` keys. When Codex fails, `AgentResult.error` includes Codex's own error message (the `turn.failed` or `error` event), not only the exit code.
+- **R18 Forge never reads its own mail.** Every email Forge sends carries the header `X-Forge-Outgoing: 1`. The inbox reader reports it as `"outgoing": True`, and the conductor ignores every message marked outgoing. A reply is also cleaned before use: quoted lines (starting `>`) and everything from `On … wrote:` onward are dropped, and the result is capped at 2000 characters.
+- **R19 Nothing grows without bound.** Every entry stored in a task's `notes` or `trouble_notes` is capped at 2000 characters, and each list keeps only its last 30 entries. The body of every email Forge sends is capped at 20000 characters.
+- **R20 Mail budget.** All outgoing email goes through one method, `_send(subject, body) -> bool`. It sends at most `mail_per_hour` (default 6) and `mail_per_day` (default 30) emails, counted in `state/mail_log.json`. Over budget, nothing is sent: `_send` returns False, a question stays undelivered and is retried later, and the budget hit is logged once per window.
+- **R21 KILL means everything stops.** `step()` checks KILL before anything else, including the inbox, and returns `"killed"`. No email is read or sent while KILL is set.
+- **R22 The start email is rare.** "conductor started" is sent only when KILL is absent, and at most once every 12 hours (the time of the last one is kept in `state/notices.json`). The same once-per-12-hours rule covers the "keeps hitting an error" email and the smoke-test failure email (R23).
+- **R23 Live smoke test before running.** `smoke(team, workdir) -> list[str]` runs each role once for real, on a tiny throwaway git repo, and returns a list of problems (empty means all passed):
+  - the roles that write files (test writer, builder, planner) must create `smoke.txt`;
+  - the read-only roles (reviewer, drift keeper) must not change anything;
+  - every role must return JSON that passes its schema.
+
+  `main run` runs the smoke test when `state/smoke_ok.json` is missing or more than 24 hours old. If the smoke test fails, the conductor logs the problems, emails Ben (R22 rate), and exits without starting the loop. `python -m core.bootstrap smoke` runs it on demand and prints the result.
+
+## Review round 1 amendments to R17–R23 (Codex review, 2026-09-29)
+
+- **R24 KILL silences everything except one halt alert.**
+  - While KILL is set, `_send` refuses every email except a halt alert: `_send(..., halt=True)`.
+  - A halt alert still counts against the mail budget and goes out at most once every 12 hours (notice key `halt`), so Ben always learns that Forge stopped, and why, but never gets a stream of alerts.
+  - The tamper path records its question and then delivers it as a halt alert.
+  - `_handle_inbox` stops processing the moment a STOP sets KILL.
+- **R25 The budget counts attempts.** `_send` records the attempt in `mail_log.json` before calling SMTP, and an attempt that fails still counts. `_notice_once` records its throttle time before sending, too. A retry can therefore never exceed the budget, even if SMTP failed after the message went out.
+- **R26 Self-mail is rejected three ways, and Ben's read status is never touched.**
+  1. The `X-Forge-Outgoing` header.
+  2. Every email Forge sends gets its own `Message-ID`. The last 500 are kept in `mail_log.json`, and any incoming message with one of those IDs is ignored.
+  3. The inbox reader keeps the IDs of the messages it has already handled in `state/inbox_seen.json`. On its first read, when that file is missing, it records every current Forge message as handled and returns nothing. So no email from before the first start (the incident's included) can ever count as an answer.
+
+  The inbox reader searches the last 3 days for subjects containing `[Forge` (and for a subject of just `STOP`). It uses peek-only fetches, so it never changes Ben's read or unread flags. It fetches headers first, and then bodies only for new messages that aren't Forge's own.
+- **R27 STOP means Ben wrote "stop".** KILL is set when the subject, with any `Re:` or `Fwd:` prefixes removed, is exactly `stop`, or when the cleaned reply (quoted text removed) contains the word `stop`, unless it is negated ("don't stop", "do not stop", "never stop"). Stopping when Ben didn't mean it is the safe way to fail: pressing Start Forge undoes it. STOP works as a reply to any Forge email, including the notices.
+- **R28 Every stored thing is bounded.**
+  - Question subjects are capped at 300 characters and bodies at 20000 before they are stored.
+  - `questions.json` keeps every open question and the 50 most recent closed ones.
+  - Queue-level `notes` follow the R19 caps.
+- **R29 The smoke test is guarded like real work.**
+  - `smoke(team, workdir, call=None)` runs each role through `call(role, prompt, schema, cwd)`. `main` passes the conductor's `_call` (which now takes a `cwd`), so every smoke run gets the fail-closed checks, the tamper guard (KILL plus a halt alert), metering and a run record.
+  - The smoke test doesn't start if the token cap has been reached.
+  - Each role gets a fresh throwaway repo.
+  - A role passes only if:
+    - its answer passes full schema validation (`agents.schema_ok`: types, enums, required keys, nested items);
+    - a writer role produced `smoke.txt` as a regular file containing `ok`, and nothing else changed;
+    - a read-only role changed nothing: git `HEAD` and the file list both match the starting snapshot.
+  - Git errors count as problems, and a folder that can't be cleaned up is reported.
+  - Before each attempt, `smoke_ok.json` is deleted, and it is written again only on full success.
+  - After a failed attempt, `smoke_fail.json` holds the time, and watchdog restarts skip the smoke test (and don't start the loop) for the next 30 minutes.
+- **R30 `strict_schema` is complete for the forms Forge uses.** An optional field that has an `enum` also gets `null` added to the enum. `anyOf`, `$defs` and `definitions` are converted recursively.
+
+## Review round 2 amendments (Codex review, 2026-09-29)
+
+- **R31 STOP is checked before anything runs.**
+  - Every `main run` start that doesn't find KILL reads the inbox first (`_handle_inbox`: it applies STOP and answers, and retries undelivered questions within budget), then checks KILL again.
+  - Only after that may the smoke test or the loop start. So a STOP reply to any notice, the smoke-failure notice included, is honoured on the next watchdog start.
+- **R32 A halt alert isn't lost.**
+  - A question asked with `halt=True` is stored with `"halt": true`.
+  - Every `main run` start that finds KILL does nothing except retry undelivered halt questions (`_retry_halts`), within the budget and the 12-hour halt throttle, and then exits.
+  - The halt throttle is recorded only when an attempt actually goes ahead, after the budget check passes.
+- **R33 More quoting styles are removed.** `clean_reply` first turns CRLF and lone CR line endings into LF (real email bodies use CRLF), then cuts everything from the first of these lines onward:
+  - an `On … wrote:` line, including when it wraps over two lines;
+  - `-----Original Message-----`;
+  - a line of 10 or more underscores;
+  - a line starting with `From:` that is followed within the next 4 lines by `Sent:`, `Date:` or `To:`.
+- **R34 Null optional fields count as missing.** Before the shape check, an agent's answer drops any key whose value is `null` and which isn't in the schema's `required` list, recursively. Nullable optionals from Codex's strict schema then validate, and the conductor sees them as absent.
+
+## Review round 4 amendments (Codex review, 2026-09-29)
+
+- **R35 No reply is lost.**
+  - When a STOP ends inbox processing, the rest of that batch is saved to `state/inbox_pending.json`. It is processed first on the next `_handle_inbox`, which only runs once KILL is cleared.
+  - Each message is handled in its own `try`: if one message raises an error, the error is logged and processing continues with the next.
+  - Pending messages follow the R19 caps: at most 50 are kept, and each body is capped.
+- **R36 One bad email can't block the inbox.** The reader handles each message separately:
+  - a message is recorded as seen only after its body has been fetched and decoded, or after it has been fetched and found malformed (then it is skipped for good);
+  - a failed or empty fetch (a network problem) doesn't mark the message seen, so it is retried on the next read, and the reader moves on to the next message;
+  - an unknown charset falls back to UTF-8, replacing bytes it can't decode;
+  - progress (`inbox_seen.json`) is saved even when one message fails.
+
+## Review round 7 amendment (Codex review, 2026-09-29)
+
+- **R37 The token cap is checked before every agent launch.**
+  - `_call` raises `Capped` before launching when that agent's provider is at or over its daily cap. Nothing is launched and no run record is written.
+  - `step()` returns `"capped"`. The attempt is undone cleanly and never counts as a failure:
+    - **test writer or planner capped:** the worktree is reset;
+    - **builder capped:** the ledger claim is released and the worktree is reset to the tests commit;
+    - **reviewer capped** (after the work was submitted): the auditor fails the run and the manager reopens the contract, exactly as a failed judge would, but no failure note or signature is recorded, `fails_since` is unchanged, and the task stays `tests_ok`;
+    - **troubleshooter or drift keeper capped:** nothing changes, and they run when the cap resets.
+  - **smoke test:** a `Capped` stops the smoke run with the problem "token cap reached", and `smoke_ok.json` is not written.
+
+## Review round 8 amendments (Codex review and live smoke run, 2026-09-29)
+
+- **R38 Deferred troubleshooting is never lost.** When the troubleshooter is capped (R37), the task records `troubleshoot_pending` with the failure's reason and the last 4000 characters of its output. Before any further builder attempt on that task, the pending troubleshooting runs first; that step does nothing else. `troubleshoot_pending` is cleared only when the troubleshooter has actually run.
+- **R39 A smoke folder that can't be deleted yet doesn't block the start.** On Windows, an agent's child process can briefly keep its folder busy. Deleting a smoke folder is retried 5 times, 2 seconds apart. If it still fails, the folder is logged and left in place, and it is not counted as a smoke problem. Each smoke test first sweeps away any `forge-smoke-*` folders left over from earlier runs (best effort).
+
+## Review round 9 amendment (Codex review, 2026-09-29)
+
+- **R40 While paused, nothing launches.** On a `main run` start, after the R31 inbox read:
+  - **If PAUSED is set:** the conductor only waits. It reads the inbox every minute (answers can clear the pause), writes its heartbeat, and runs no smoke test and no agents.
+  - **When the pause clears:** it goes on to the smoke test (if stale) and then the loop.
+  - **If KILL appears** while waiting, it exits.

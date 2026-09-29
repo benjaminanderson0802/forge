@@ -146,3 +146,14 @@ Restarting requires Ben to deliberately clear the stop.
 ## Build order
 
 **D-034 (2026-09-29) Build the conductor first, and let it build the rest.** A small bootstrap conductor (`core/bootstrap.py`) runs the D-025 team by itself on Ben's PC. It's a hidden, self-restarting scheduled task, and it builds the rest of Layer 1 from `docs/specs/layer-1-queue.json`. Ben is reached only by email: questions carry a secret reply code, and "STOP" halts everything. Chat sessions become optional. This replaces "Cowork plays the conductor for 1A and 1B" in `docs/specs/layer-1-design.md` §7.
+
+## After the first live run
+
+**D-035 (2026-09-29, proposed) Nothing goes live on fake tests alone.** Before any part of Forge that sends, spends, posts or runs unattended is switched on:
+1. It passes a live test against the real services it uses.
+2. Its possible damage is capped by hard limits in the charter.
+3. Its first real cycle is watched and the evidence is shown to Ben.
+
+This comes from the email-flood incident (`docs/incidents/2026-09-29-email-flood.md`).
+
+**D-036 (2026-09-29, proposed) The rabbit-hole limit applies to every agent, including the one talking to Ben.** A fix-and-review loop gets at most 3 rounds or about 45 minutes. Then Ben gets a short report (what is fixed, what is left, a recommendation) and chooses whether to continue.

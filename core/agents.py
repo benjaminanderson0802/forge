@@ -58,6 +58,92 @@ def _resolve(cmd: list[str]) -> list[str] | None:
     return [exe, *cmd[1:]] if exe else None
 
 
+def strict_schema(schema: dict) -> dict:
+    """R17/R30: the strict form Codex's structured output requires. Every object lists all its properties as
+    required and forbids extras; properties that weren't required become nullable (enums gain null too).
+    anyOf, $defs and definitions are converted recursively. Never mutates the input."""
+    def conv(node, optional: bool = False):
+        if not isinstance(node, dict):
+            return node
+        n = dict(node)
+        if n.get("type") == "object" or "properties" in n:
+            props = n.get("properties", {})
+            req = set(n.get("required", []))
+            n["properties"] = {k: conv(v, k not in req) for k, v in props.items()}
+            n["required"] = list(props)
+            n["additionalProperties"] = False
+            n.setdefault("type", "object")
+        if "items" in n:
+            n["items"] = conv(n["items"])
+        if isinstance(n.get("anyOf"), list):
+            n["anyOf"] = [conv(x) for x in n["anyOf"]]
+        for key in ("$defs", "definitions"):
+            if isinstance(n.get(key), dict):
+                n[key] = {k: conv(v) for k, v in n[key].items()}
+        if optional:
+            t = n.get("type")
+            if isinstance(t, str) and t != "null":
+                n["type"] = [t, "null"]
+            elif isinstance(t, list) and "null" not in t:
+                n["type"] = [*t, "null"]
+            if isinstance(n.get("enum"), list) and None not in n["enum"]:
+                n["enum"] = [*n["enum"], None]
+            if isinstance(n.get("anyOf"), list) and not any(x.get("type") == "null" for x in n["anyOf"]
+                                                           if isinstance(x, dict)):
+                n["anyOf"] = [*n["anyOf"], {"type": "null"}]
+        return n
+    return conv(schema)
+
+
+_TYPES = {"object": dict, "array": list, "string": str, "boolean": bool, "null": type(None)}
+
+
+def schema_ok(data, schema: dict | None) -> bool:
+    """R29: full validation for the schema forms Forge uses: type, enum, required, properties, items, anyOf."""
+    if schema is None:
+        return True
+    if isinstance(schema.get("anyOf"), list):
+        return any(schema_ok(data, s) for s in schema["anyOf"])
+    t = schema.get("type")
+    if t is not None:
+        types = t if isinstance(t, list) else [t]
+        def is_type(name):
+            if name == "integer":
+                return isinstance(data, int) and not isinstance(data, bool)
+            if name == "number":
+                return isinstance(data, (int, float)) and not isinstance(data, bool)
+            return name in _TYPES and isinstance(data, _TYPES[name])
+        if not any(is_type(x) for x in types):
+            return False
+    if "enum" in schema and data not in schema["enum"]:
+        return False
+    if isinstance(data, dict):
+        if any(k not in data for k in schema.get("required", [])):
+            return False
+        props = schema.get("properties", {})
+        if schema.get("additionalProperties") is False and any(k not in props for k in data):
+            return False
+        return all(schema_ok(data[k], sub) for k, sub in props.items() if k in data)
+    if isinstance(data, list) and isinstance(schema.get("items"), dict):
+        return all(schema_ok(x, schema["items"]) for x in data)
+    return True
+
+
+def _codex_error(events_out: str) -> str:
+    """R17: Codex's own reason for a failed run, from its JSON events."""
+    msgs = []
+    for line in events_out.splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "turn.failed":
+            msgs.append(str((ev.get("error") or {}).get("message", "")))
+        elif ev.get("type") == "error":
+            msgs.append(str(ev.get("message", "")))
+    return " | ".join(m for m in msgs if m)[:1500]
+
+
 def _extract_json(text: str) -> dict | None:
     for m in re.finditer(r"\{.*\}", text, re.S):
         try:
@@ -77,10 +163,24 @@ def _shape_ok(data: dict | None, schema: dict | None) -> bool:
     return all(k in data for k in schema.get("required", []))
 
 
+def drop_null_optionals(data, schema: dict | None):
+    """R34: a null value for a key the schema doesn't require counts as missing (Codex's strict form makes
+    optional fields nullable). Recursive through nested objects and array items."""
+    if not isinstance(schema, dict):
+        return data
+    if isinstance(data, dict):
+        req = set(schema.get("required", []))
+        props = schema.get("properties", {})
+        return {k: drop_null_optionals(v, props.get(k)) for k, v in data.items() if not (v is None and k not in req)}
+    if isinstance(data, list) and isinstance(schema.get("items"), dict):
+        return [drop_null_optionals(x, schema["items"]) for x in data]
+    return data
+
+
 def _finish(provider: str, text: str, tokens: int, schema: dict | None) -> AgentResult:
     if schema is None:
         return AgentResult(text, tokens, True, None, None, provider)
-    data = _extract_json(text)
+    data = drop_null_optionals(_extract_json(text), schema)
     if not _shape_ok(data, schema):
         return AgentResult(text, tokens, False, "output did not match the required shape", None, provider)
     return AgentResult(text, tokens, True, None, data, provider)
@@ -114,11 +214,15 @@ def parse_codex(code: int, events_out: str, last_message: str, schema: dict | No
             tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "output_tokens", "reasoning_output_tokens"))
             done = True
     if code != 0 or not done or not last_message.strip():
-        return AgentResult(last_message, tokens, False, f"Codex run failed (exit {code})", None, "codex")
+        why = _codex_error(events_out)
+        return AgentResult(last_message, tokens, False, f"Codex run failed (exit {code})" + (f": {why}" if why else ""),
+                           None, "codex")
     return _finish("codex", last_message.strip(), tokens, schema)
 
 
 class ClaudeAgent:
+    provider = "claude"  # R6/R29: the id the Meter and the token caps use
+
     def __init__(self, timeout_s: int = 1800, permission_mode: str = "acceptEdits",
                  allowed_tools: list[str] | None = None, cmd: list[str] | None = None):
         self.timeout_s, self.permission_mode, self.allowed_tools = timeout_s, permission_mode, allowed_tools
@@ -141,6 +245,8 @@ class ClaudeAgent:
 
 
 class CodexAgent:
+    provider = "codex"  # R6/R29: the id the Meter and the token caps use
+
     def __init__(self, timeout_s: int = 1800, sandbox: str = "read-only", cmd: list[str] | None = None):
         self.timeout_s, self.sandbox = timeout_s, sandbox
         self.cmd = cmd or ["codex"]
@@ -156,7 +262,7 @@ class CodexAgent:
         if IS_WIN:  # R16: --ignore-user-config drops the Windows sandbox; without it writes silently fail
             args += ["-c", 'windows.sandbox="elevated"']
         if schema:
-            (tmp / "schema.json").write_text(json.dumps(schema), encoding="utf-8")
+            (tmp / "schema.json").write_text(json.dumps(strict_schema(schema)), encoding="utf-8")
             args += ["--output-schema", str(tmp / "schema.json")]
         args += ["-"]
         try:
