@@ -264,3 +264,19 @@ The first run with real agents and real email hit four faults no fake-based test
   - Before each attempt, `smoke_ok.json` is deleted, and it is written again only on full success.
   - After a failed attempt, `smoke_fail.json` holds the time, and watchdog restarts skip the smoke test (and don't start the loop) for the next 30 minutes.
 - **R30 `strict_schema` is complete for the forms Forge uses.** An optional field that has an `enum` also gets `null` added to the enum. `anyOf`, `$defs` and `definitions` are converted recursively.
+
+## Review round 2 amendments (Codex review, 2026-09-29)
+
+- **R31 STOP is checked before anything runs.**
+  - Every `main run` start that doesn't find KILL reads the inbox first (`_handle_inbox`: it applies STOP and answers, and retries undelivered questions within budget), then checks KILL again.
+  - Only after that may the smoke test or the loop start. So a STOP reply to any notice, the smoke-failure notice included, is honoured on the next watchdog start.
+- **R32 A halt alert isn't lost.**
+  - A question asked with `halt=True` is stored with `"halt": true`.
+  - Every `main run` start that finds KILL does nothing except retry undelivered halt questions (`_retry_halts`), within the budget and the 12-hour halt throttle, and then exits.
+  - The halt throttle is recorded only when an attempt actually goes ahead, after the budget check passes.
+- **R33 More quoting styles are removed.** `clean_reply` cuts everything from the first of these lines onward:
+  - an `On … wrote:` line, including when it wraps over two lines;
+  - `-----Original Message-----`;
+  - a line of 10 or more underscores;
+  - a line starting with `From:` that is followed within the next 4 lines by `Sent:`, `Date:` or `To:`.
+- **R34 Null optional fields count as missing.** Before the shape check, an agent's answer drops any key whose value is `null` and which isn't in the schema's `required` list, recursively. Nullable optionals from Codex's strict schema then validate, and the conductor sees them as absent.
