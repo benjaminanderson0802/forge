@@ -1396,3 +1396,155 @@ class R37PerLaunchCapTests(Harness):
                     capped = getattr(bootstrap, "Capped", None)
                     self.assertIsNotNone(capped, "core.bootstrap must expose Capped")
                     self.assertIsInstance(caught, capped)
+
+
+class R38DeferredTroubleshootingTests(Harness):
+    cap = 10
+    capped_conductor = R37PerLaunchCapTests.capped_conductor
+    read_state = LiveRunTests.read_state
+    failure_output = "Ran 1 test\nFAILED: R38 discarded prefix:" + "diagnostic detail " * 300 + " LAST FAILURE"
+    advice = "R38: implement feat.VALUE as 42 before retrying the judge."
+
+    def defer_troubleshooter(self):
+        attempts = []
+
+        def builder(prompt, cwd):
+            attempts.append(prompt)
+            if len(attempts) == 2:
+                c.meter.add("claude", self.cap + 1)
+            if len(attempts) > 2:
+                return self.build_feature(prompt, cwd)
+            return '{"status":"done"}', 1
+
+        def troubleshoot(prompt, cwd):
+            return json.dumps({"kind": "fix", "notes": self.advice}), 1
+
+        c = self.capped_conductor(agents={
+            "test_writer": self.write_tests, "builder": builder,
+            "troubleshooter": troubleshoot,
+        })
+        runner = patch.object(c, "_run_tests", side_effect=lambda task: (
+            (0, "Ran 1 test\nOK", False) if (c.wt / "feat.py").exists()
+            else (1, self.failure_output, False)
+        ))
+        runner.start()
+        self.addCleanup(runner.stop)
+        self.assertEqual(c.step(), "worked")  # Acceptance tests.
+        self.assertEqual(c._task("T1")["status"], "tests_ok")
+        self.assertEqual(c.step(), "worked")  # First builder failure.
+        self.assertEqual(c._task("T1")["fails_since"], 1)
+        self.assertFalse(c._capped())
+        self.assertEqual(c.step(), "capped")  # Second failure needs troubleshooting.
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(c.team.troubleshooter.prompts, [])
+        self.assertFalse((self.state / "KILL").exists())
+        return c
+
+    def test_R38_capped_troubleshooter_persists_failure_reason_and_output_tail(self):
+        """R38: a cap saves the actual failure and exactly its last 4000 characters."""
+        c = self.defer_troubleshooter()
+        task = self.read_state("queue.json")["tasks"][0]
+        pending = task.get("troubleshoot_pending")
+        self.assertIsInstance(pending, dict)
+        self.assertEqual(pending["reason"], "judge failed: task tests")
+        self.assertEqual(pending["output"], self.failure_output[-4000:])
+        self.assertEqual(task["fails_since"], 2)
+        self.assertEqual(c.team.troubleshooter.prompts, [])
+
+    def test_R38_resume_runs_only_troubleshooter_then_builder_receives_notes(self):
+        """R38: lifting the cap reserves one step for diagnosis before rebuilding."""
+        c = self.defer_troubleshooter()
+        c.limits["claude_daily_token_cap"] = 1000
+        before = {role: len(getattr(c.team, role).prompts) for role in vars(c.team)}
+        self.assertEqual(c.step(), "worked")
+        for role, count in before.items():
+            with self.subTest(role=role):
+                self.assertEqual(len(getattr(c.team, role).prompts),
+                                 count + (role == "troubleshooter"))
+        task = self.read_state("queue.json")["tasks"][0]
+        self.assertFalse(task.get("troubleshoot_pending"))
+        self.assertIn(self.advice, task["trouble_notes"])
+        self.assertIn(self.failure_output[-4000:], c.team.troubleshooter.prompts[-1])
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(c.team.builder.prompts), before["builder"] + 1)
+        self.assertIn(self.advice, c.team.builder.prompts[-1])
+        self.assertEqual(len(c.team.troubleshooter.prompts), 1)
+
+    def test_R38_repeated_cap_retains_pending_without_builder_attempt(self):
+        """R38: another capped retry cannot discard diagnosis or run the builder."""
+        c = self.defer_troubleshooter()
+        expected = {"reason": "judge failed: task tests", "output": self.failure_output[-4000:]}
+        c.limits["claude_daily_token_cap"] = 1000
+        c.meter.add("claude", 1001)
+        self.assertEqual(c.step(), "capped")
+        self.assertEqual(len(c.team.builder.prompts), 2)
+        self.assertEqual(c.team.troubleshooter.prompts, [])
+        self.assertEqual(self.read_state("queue.json")["tasks"][0].get("troubleshoot_pending"), expected)
+
+
+class R39SmokeCleanupTests(Harness):
+    smoke_team = SmokeTests.smoke_team
+
+    def busy_smoke_folder(self, guarded):
+        import shutil
+
+        team, calls = self.smoke_team()
+        c = self.make_conductor() if guarded else None
+        if c is not None:
+            c.team = team
+        remove = shutil.rmtree
+        attempts = []
+
+        def busy_builder(path, *args, **kwargs):
+            if Path(path).name.startswith("forge-smoke-builder-"):
+                attempts.append(Path(path))
+                raise PermissionError("R39 fake child process still holds this folder")
+            return remove(path, *args, **kwargs)
+
+        with patch("shutil.rmtree", side_effect=busy_builder), patch("time.sleep") as sleep:
+            problems = (bootstrap._guarded_smoke(c, self.work) if guarded
+                        else bootstrap.smoke(team, self.work))
+        with self.subTest(check="cleanup failure is not a smoke problem"):
+            self.assertEqual(problems, [])
+        with self.subTest(check="all fake agents pass"):
+            self.assertCountEqual([role for role, cwd in calls], list(vars(team)))
+        with self.subTest(check="five attempts at the same folder"):
+            self.assertEqual(len(attempts), 5)
+            self.assertEqual(len(set(attempts)), 1)
+        with self.subTest(check="two seconds between attempts"):
+            self.assertEqual([call.args for call in sleep.call_args_list], [(2,)] * 4)
+        self.assertTrue(attempts[0].is_dir())
+        if guarded:
+            with self.subTest(check="conductor logs the leftover folder"):
+                log = self.state / "errors.log"
+                self.assertTrue(log.is_file(), "cleanup warning must be logged")
+                self.assertIn(attempts[0].name, log.read_text(encoding="utf-8"))
+
+    def test_R39_plain_smoke_tolerates_busy_folder_after_five_attempts(self):
+        """R39: exhausted deletion retries do not make passing smoke agents fail."""
+        self.busy_smoke_folder(guarded=False)
+
+    def test_R39_guarded_smoke_logs_busy_folder_without_failing(self):
+        """R39: guarded smoke logs the retained folder and still returns no problems."""
+        self.busy_smoke_folder(guarded=True)
+
+    def test_R39_smoke_sweeps_previous_run_folder_before_first_agent(self):
+        """R39: old forge-smoke folders are swept before any new smoke agent runs."""
+        stale = self.work / "forge-smoke-old-xyz"
+        stale.mkdir()
+        (stale / "leftover.txt").write_text("old smoke run", encoding="utf-8")
+        team, calls = self.smoke_team()
+        stale_at_launch = []
+        for role in vars(team):
+            agent = getattr(team, role)
+            script = agent.script
+
+            def observe(prompt, cwd, script=script):
+                stale_at_launch.append(stale.exists())
+                return script(prompt, cwd)
+
+            agent.script = observe
+        self.assertEqual(bootstrap.smoke(team, self.work), [])
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(stale_at_launch, [False] * 6)
+        self.assertFalse(stale.exists())
