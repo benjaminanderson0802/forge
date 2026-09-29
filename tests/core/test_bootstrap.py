@@ -825,3 +825,132 @@ class R15BootstrapTests(Harness):
         self.assertEqual(result, "killed")
         self.assertTrue(any("tamper" in subject.lower() and "conductor.lock" in body
                             for subject, body in self.mails))
+
+    def test_R15_after_run_stat_failure_is_tamper(self):
+        """R15: a failed post-run stat kills even when the agent also rewrites the queue."""
+        meter_path = self.state / "meter.json"
+        real_path_stat, real_os_stat = Path.stat, os.stat
+        agent_started = False
+        denied_stats = []
+
+        def deny_stat(path):
+            if agent_started and not isinstance(path, int) and Path(path) == meter_path:
+                denied_stats.append(path)
+                raise PermissionError(13, "Permission denied", str(path))
+
+        def path_stat(path, *args, **kwargs):
+            deny_stat(path)
+            return real_path_stat(path, *args, **kwargs)
+
+        def os_stat(path, *args, **kwargs):
+            deny_stat(path)
+            return real_os_stat(path, *args, **kwargs)
+
+        def writer(prompt, cwd):
+            nonlocal agent_started
+            queue_path = self.state / "queue.json"
+            queue = json.loads(queue_path.read_text(encoding="utf-8"))
+            queue["tasks"][0]["title"] = "Agent rewrote the task"
+            queue_path.write_text(json.dumps(queue), encoding="utf-8")
+            result = self.write_tests(prompt, cwd)
+            agent_started = True
+            return result
+
+        c = self.init(agents={"test_writer": writer})
+        Meter(self.state).add("codex", 1)
+        meter_before = meter_path.read_bytes()
+        status_before = json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"]
+        with patch.object(Path, "stat", new=path_stat), patch.object(os, "stat", new=os_stat):
+            result = c.step()
+        self.assertTrue(agent_started)
+        self.assertTrue(denied_stats, "the post-run fingerprint must encounter the stat failure")
+        self.assertEqual(result, "killed")
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertTrue(any("tamper" in subject.lower() and "meter.json" in body
+                            and any(word in body.lower() for word in ("permission", "denied", "fail", "unreadable"))
+                            for subject, body in self.mails))
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertEqual(task["status"], status_before)
+        self.assertEqual(meter_path.read_bytes(), meter_before)
+        self.assertFalse(list((self.state / "runs").glob("*/output.json")))
+        self.assertNotIn("tests/core/test_feat.py", self.branch_files())
+        # Restoring access must not let the next step accept the rewritten queue.
+        self.assertEqual(c.step(), "killed")
+        self.assertEqual(len(self.team.test_writer.prompts), 1)
+        self.assertEqual(json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"],
+                         status_before)
+
+    def test_R15_after_run_directory_listing_failure_is_tamper(self):
+        """R15: a denied directory listing must not silently hide an agent's state changes."""
+        denied_dir = self.state / "extra"
+        real_scandir, real_iterdir = os.scandir, Path.iterdir
+        agent_started = False
+        denied_listings = []
+
+        def deny_listing(path):
+            if agent_started and not isinstance(path, int) and Path(path) == denied_dir:
+                denied_listings.append(path)
+                raise PermissionError(13, "Permission denied", str(path))
+
+        def scandir(path="."):
+            deny_listing(path)
+            return real_scandir(path)
+
+        def iterdir(path):
+            deny_listing(path)
+            return real_iterdir(path)
+
+        def writer(prompt, cwd):
+            nonlocal agent_started
+            (denied_dir / "hidden.txt").write_text("agent state change\n", encoding="utf-8")
+            result = self.write_tests(prompt, cwd)
+            agent_started = True
+            return result
+
+        c = self.init(agents={"test_writer": writer})
+        # An empty baseline avoids detecting a missing old file by accident when
+        # traversal silently skips the directory containing the new hidden file.
+        denied_dir.mkdir()
+        with patch.object(os, "scandir", new=scandir), patch.object(Path, "iterdir", new=iterdir):
+            result = c.step()
+        self.assertTrue(agent_started)
+        self.assertTrue(denied_listings, "the post-run fingerprint must try listing the directory")
+        self.assertEqual(result, "killed")
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertTrue(any("tamper" in subject.lower() and "extra" in body
+                            and any(word in body.lower() for word in ("permission", "denied", "fail", "unreadable"))
+                            for subject, body in self.mails))
+        self.assertFalse(list((self.state / "runs").glob("*/output.json")))
+        self.assertNotIn("tests/core/test_feat.py", self.branch_files())
+
+    def test_R15_before_run_stat_failure_prevents_agent_launch(self):
+        """R15: a failed baseline stat prevents agent launch and returns error without KILL."""
+        meter_path = self.state / "meter.json"
+        real_path_stat, real_os_stat = Path.stat, os.stat
+        calls, denied_stats = [], []
+
+        def deny_stat(path):
+            if not isinstance(path, int) and Path(path) == meter_path:
+                denied_stats.append(path)
+                raise PermissionError(13, "Permission denied", str(path))
+
+        def path_stat(path, *args, **kwargs):
+            deny_stat(path)
+            return real_path_stat(path, *args, **kwargs)
+
+        def os_stat(path, *args, **kwargs):
+            deny_stat(path)
+            return real_os_stat(path, *args, **kwargs)
+
+        def writer(prompt, cwd):
+            calls.append((prompt, cwd))
+            return self.write_tests(prompt, cwd)
+
+        c = self.init(agents={"test_writer": writer})
+        Meter(self.state).add("codex", 1)
+        with patch.object(Path, "stat", new=path_stat), patch.object(os, "stat", new=os_stat):
+            result = c.step()
+        self.assertTrue(denied_stats, "the baseline fingerprint must encounter the stat failure")
+        self.assertFalse(calls, "a failed baseline stat must prevent agent launch")
+        self.assertEqual(result, "error")
+        self.assertFalse((self.state / "KILL").exists())
