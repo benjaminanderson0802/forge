@@ -221,6 +221,8 @@ def parse_codex(code: int, events_out: str, last_message: str, schema: dict | No
 
 
 class ClaudeAgent:
+    provider = "claude"  # R6/R29: the id the Meter and the token caps use
+
     def __init__(self, timeout_s: int = 1800, permission_mode: str = "acceptEdits",
                  allowed_tools: list[str] | None = None, cmd: list[str] | None = None):
         self.timeout_s, self.permission_mode, self.allowed_tools = timeout_s, permission_mode, allowed_tools
@@ -243,6 +245,8 @@ class ClaudeAgent:
 
 
 class CodexAgent:
+    provider = "codex"  # R6/R29: the id the Meter and the token caps use
+
     def __init__(self, timeout_s: int = 1800, sandbox: str = "read-only", cmd: list[str] | None = None):
         self.timeout_s, self.sandbox = timeout_s, sandbox
         self.cmd = cmd or ["codex"]
