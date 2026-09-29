@@ -736,6 +736,10 @@ class Conductor:
 
     def _build_stage(self, tid: str) -> None:
         t = self._task(tid)
+        pending = t.get("troubleshoot_pending")
+        if pending:  # R38: deferred troubleshooting comes before any further builder attempt
+            self._troubleshoot(tid, str(pending.get("reason", "")), str(pending.get("output", "")))
+            return
         cid = t["id"]
         led = self._ledger()
         if cid not in led.contracts():
@@ -869,7 +873,12 @@ class Conductor:
                 self._block(tid, reason)
             return
         if zero_progress or fails >= 2:
-            self._troubleshoot(tid, reason, output)
+            try:
+                self._troubleshoot(tid, reason, output)
+            except Capped:  # R38: kept, and run before the next builder attempt
+                self._update(tid, troubleshoot_pending={"reason": str(reason)[:NOTE_CAP],
+                                                        "output": str(output)[-4000:]})
+                raise
 
     def _troubleshoot(self, tid: str, reason: str, output: str) -> None:
         t = self._task(tid)
@@ -893,7 +902,7 @@ class Conductor:
         else:
             notes = notes + [f"(troubleshooter failed: {r.error})"]
         self._update(tid, trouble_notes=notes, troubleshot=True, fails_since=0,
-                     troubleshoots=t.get("troubleshoots", 0) + 1)
+                     troubleshoots=t.get("troubleshoots", 0) + 1, troubleshoot_pending=None)
 
     # ------------------------------------------------------------------ drift
     def _drift_check(self) -> None:
@@ -1190,7 +1199,8 @@ SMOKE_ROLES = {  # role: (schema, writes a file?, example answer)
 }
 
 
-def smoke(team: Team, workdir: Path, call: Callable | None = None) -> list[str]:
+def smoke(team: Team, workdir: Path, call: Callable | None = None,
+          warn: Callable[[str], None] | None = None) -> list[str]:
     """R23/R29: run every role once for real, each in a fresh throwaway repo. Returns problems; empty = passed.
     call(role, prompt, schema, cwd) runs the agent; main passes the conductor's guarded _call."""
     import shutil
@@ -1211,11 +1221,29 @@ def smoke(team: Team, workdir: Path, call: Callable | None = None) -> list[str]:
                 found[f.relative_to(root).as_posix()] = hashlib.sha256(f.read_bytes()).hexdigest()
         return found
 
+    def unlock(fn, path, _exc):
+        os.chmod(path, stat.S_IWRITE)
+        fn(path)
+
     def rm(root: Path) -> None:
-        def unlock(fn, path, _exc):
-            os.chmod(path, stat.S_IWRITE)
-            fn(path)
-        shutil.rmtree(root, onerror=unlock)
+        """R39: an agent's child process can keep the folder busy for a moment; retry, then leave it."""
+        for attempt in range(5):
+            try:
+                shutil.rmtree(root, onerror=unlock)
+                return
+            except OSError as e:
+                if attempt == 4:
+                    if warn:
+                        warn(f"smoke folder left for the next sweep: {root}: {e}"[:500])
+                    return
+                time.sleep(2)
+
+    for old in Path(workdir).glob("forge-smoke-*"):  # R39: sweep leftovers from earlier runs (best effort)
+        if old.is_dir():
+            try:
+                shutil.rmtree(old, onerror=unlock)
+            except OSError:
+                pass
 
     for role, (schema, writes, example) in SMOKE_ROLES.items():
         # Plain mkdir, not mkdtemp: on Windows mkdtemp locks the folder to this user, and Codex's sandbox runs as
@@ -1258,10 +1286,7 @@ def smoke(team: Team, workdir: Path, call: Callable | None = None) -> list[str]:
         except (RuntimeError, OSError) as e:  # git and file errors are problems, never a pass or a crash
             problems.append(f"{role}: {type(e).__name__}: {e}"[:500])
         finally:
-            try:
-                rm(root)
-            except OSError as e:
-                problems.append(f"{role}: could not clean up {root}: {e}"[:500])
+            rm(root)
     return problems
 
 
@@ -1352,7 +1377,8 @@ def _guarded_smoke(c: Conductor, workdir: Path, force: bool = False) -> list[str
         problems = ["token cap reached; smoke test not run"]
     else:
         try:
-            problems = smoke(c.team, workdir, lambda role, prompt, schema, cwd: c._call(role, prompt, schema, cwd=cwd))
+            problems = smoke(c.team, workdir, lambda role, prompt, schema, cwd: c._call(role, prompt, schema, cwd=cwd),
+                             warn=c._log)
         except Capped as e:  # R37
             problems = [f"token cap reached during the smoke test ({e})"]
         except Tampered as e:
