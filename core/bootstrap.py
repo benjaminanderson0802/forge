@@ -406,10 +406,27 @@ class Conductor:
             return "gate"
         return "idle"
 
-    def run(self, max_steps: int | None = None, idle_sleep_s: int = 60) -> str:
-        n, status = 0, "idle"
+    def run(self, max_steps: int | None = None, idle_sleep_s: int = 60, heartbeat: Path | None = None) -> str:
+        """Loop forever (or max_steps). An unexpected error never ends the loop: it is logged, Ben is told once,
+        and the conductor backs off and tries again."""
+        n, status, crashes = 0, "idle", 0
         while max_steps is None or n < max_steps:
-            status = self.step()
+            if heartbeat:
+                heartbeat.write_text(f"{os.getpid()} {time.time()}")
+            try:
+                status = self.step()
+                crashes = 0
+            except Exception as e:  # noqa: BLE001
+                crashes += 1
+                status = "error"
+                self._log(f"step crashed ({crashes} in a row): {e!r}")
+                if crashes == 3:
+                    try:
+                        self.mailer("[Forge] the conductor keeps hitting an error",
+                                    f"Last error:\n{e!r}\n\nIt keeps retrying with a pause. Details: state/bootstrap/errors.log")
+                    except Exception:  # noqa: BLE001
+                        pass
+                time.sleep(min(idle_sleep_s * crashes, 1800))
             n += 1
             if status == "killed":
                 return status
@@ -856,11 +873,26 @@ def real_team(limits: dict) -> Team:
                                     allowed_tools=["Read", "Edit", "Write", "Glob", "Grep"]))
 
 
+def _single_instance(state: Path, stale_s: int) -> bool:
+    """Only one conductor at a time. A heartbeat older than stale_s means the old one died."""
+    hb = state / "conductor.heartbeat"
+    if hb.exists():
+        try:
+            age = time.time() - float(hb.read_text().split()[1])
+        except (ValueError, IndexError, OSError):
+            age = stale_s + 1
+        if age < stale_s:
+            return False
+    state.mkdir(parents=True, exist_ok=True)
+    hb.write_text(f"{os.getpid()} {time.time()}")
+    return True
+
+
 def main(argv: list[str]) -> int:
     from core.agents import load_limits
     forge = Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["init", "run", "step"])
+    ap.add_argument("cmd", choices=["init", "run", "step", "status"])
     ap.add_argument("--layer")
     ap.add_argument("--tasks")
     ap.add_argument("--owner", default="benjaminanderson0802@gmail.com")
@@ -868,6 +900,14 @@ def main(argv: list[str]) -> int:
     a = ap.parse_args(argv)
     limits = load_limits(forge)
     state = forge / "state" / "bootstrap"
+    if a.cmd == "status":
+        q = json.loads((state / "queue.json").read_text(encoding="utf-8")) if (state / "queue.json").exists() else {}
+        for t in q.get("tasks", []):
+            print(f"{t['status']:9} {t['id']:6} {t['title']}")
+        for f in ("KILL", "PAUSED"):
+            if (state / f).exists():
+                print(f"{f} is set")
+        return 0
     c = Conductor(forge, Path(a.work), state, real_team(limits), limits, owner_email=a.owner,
                   mailer=gmail_mailer(a.owner), inbox=gmail_inbox(a.owner, state), gh=gh_cli(forge),
                   judge_cmds=["python drills/run_drills.py", "python -m unittest discover -s tests/core"])
@@ -878,7 +918,16 @@ def main(argv: list[str]) -> int:
     if a.cmd == "step":
         print(c.step())
         return 0
-    print(c.run())
+    stale = int(limits.get("agent_timeout_s", 1800)) * 2 + 600
+    if not _single_instance(state, stale):
+        return 0  # another conductor is alive; the watchdog calls us harmlessly
+    try:
+        c.mailer("[Forge] conductor started", "The conductor is running in the background. You'll hear from it only "
+                 "when something needs you, when a layer is ready for approval, or if it hits trouble.\n\n"
+                 "To stop everything: reply STOP to any Forge email.")
+    except Exception as e:  # noqa: BLE001
+        c._log(f"start mail failed: {e!r}")
+    print(c.run(heartbeat=state / "conductor.heartbeat"))
     return 0
 
 
