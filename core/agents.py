@@ -58,6 +58,47 @@ def _resolve(cmd: list[str]) -> list[str] | None:
     return [exe, *cmd[1:]] if exe else None
 
 
+def strict_schema(schema: dict) -> dict:
+    """R17: the strict form Codex's structured output requires. Every object lists all its properties as
+    required and forbids extras; properties that weren't required become nullable. Never mutates the input."""
+    def conv(node, optional: bool = False):
+        if not isinstance(node, dict):
+            return node
+        n = {k: v for k, v in node.items()}
+        if n.get("type") == "object" or "properties" in n:
+            props = n.get("properties", {})
+            req = set(n.get("required", []))
+            n["properties"] = {k: conv(v, k not in req) for k, v in props.items()}
+            n["required"] = list(props)
+            n["additionalProperties"] = False
+            n.setdefault("type", "object")
+        if "items" in n:
+            n["items"] = conv(n["items"])
+        if optional:
+            t = n.get("type")
+            if isinstance(t, str) and t != "null":
+                n["type"] = [t, "null"]
+            elif isinstance(t, list) and "null" not in t:
+                n["type"] = [*t, "null"]
+        return n
+    return conv(schema)
+
+
+def _codex_error(events_out: str) -> str:
+    """R17: Codex's own reason for a failed run, from its JSON events."""
+    msgs = []
+    for line in events_out.splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "turn.failed":
+            msgs.append(str((ev.get("error") or {}).get("message", "")))
+        elif ev.get("type") == "error":
+            msgs.append(str(ev.get("message", "")))
+    return " | ".join(m for m in msgs if m)[:1500]
+
+
 def _extract_json(text: str) -> dict | None:
     for m in re.finditer(r"\{.*\}", text, re.S):
         try:
@@ -114,7 +155,9 @@ def parse_codex(code: int, events_out: str, last_message: str, schema: dict | No
             tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "output_tokens", "reasoning_output_tokens"))
             done = True
     if code != 0 or not done or not last_message.strip():
-        return AgentResult(last_message, tokens, False, f"Codex run failed (exit {code})", None, "codex")
+        why = _codex_error(events_out)
+        return AgentResult(last_message, tokens, False, f"Codex run failed (exit {code})" + (f": {why}" if why else ""),
+                           None, "codex")
     return _finish("codex", last_message.strip(), tokens, schema)
 
 
@@ -156,7 +199,7 @@ class CodexAgent:
         if IS_WIN:  # R16: --ignore-user-config drops the Windows sandbox; without it writes silently fail
             args += ["-c", 'windows.sandbox="elevated"']
         if schema:
-            (tmp / "schema.json").write_text(json.dumps(schema), encoding="utf-8")
+            (tmp / "schema.json").write_text(json.dumps(strict_schema(schema)), encoding="utf-8")
             args += ["--output-schema", str(tmp / "schema.json")]
         args += ["-"]
         try:

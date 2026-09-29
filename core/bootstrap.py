@@ -31,13 +31,33 @@ ROLES = {"ci": "ci", "forge-manager": "manager", "forge-executor": "executor",
          "forge-auditor": "auditor", "forge-core": "core", "benjamin": "human"}
 NOWIN = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 TASK_FIELDS = ("id", "title", "section", "files_in_scope", "test_files", "test_cmd")
+NOTE_CAP, NOTES_KEEP, BODY_CAP = 2000, 30, 20000  # R19
 
-S_TESTS = {"required": ["files"]}
-S_BUILD = {"required": ["status"]}
-S_REVIEW = {"required": ["verdict", "reasons"]}
-S_TROUBLE = {"required": ["kind", "notes"]}
-S_DRIFT = {"required": ["status"]}
-S_PLAN = {"required": ["tasks"]}
+
+def clean_reply(body: str) -> str:
+    """R18: only the new text of a reply: no quoted lines, nothing from "On ... wrote:" onward, capped."""
+    body = re.split(r"(?m)^\s*On .+wrote:\s*$", body or "", maxsplit=1)[0]
+    lines = [ln for ln in body.splitlines() if not ln.lstrip().startswith(">")]
+    return "\n".join(lines).strip()[:NOTE_CAP]
+
+_STR, _STRS = {"type": "string"}, {"type": "array", "items": {"type": "string"}}
+
+
+def _obj(props: dict, required: list[str]) -> dict:
+    return {"type": "object", "properties": props, "required": required}
+
+
+# R17: full JSON Schemas; "required" is what the conductor needs, the rest is optional.
+S_TESTS = _obj({"files": _STRS, "summary": _STR}, ["files"])
+S_BUILD = _obj({"status": {"type": "string", "enum": ["done", "blocked"]}, "summary": _STR, "tried": _STRS,
+                "error": _STR}, ["status"])
+S_REVIEW = _obj({"verdict": {"type": "string", "enum": ["pass", "fail"]}, "reasons": _STRS}, ["verdict", "reasons"])
+S_TROUBLE = _obj({"kind": {"type": "string", "enum": ["fix", "dead_end", "suggestion"]}, "notes": _STR,
+                  "alternative": _STR}, ["kind", "notes"])
+S_DRIFT = _obj({"status": {"type": "string", "enum": ["ok", "replan"]}, "reasons": _STRS}, ["status"])
+S_PLAN = _obj({"tasks": {"type": "array", "items": _obj(
+    {"id": _STR, "title": _STR, "section": _STR, "files_in_scope": _STRS, "test_files": _STRS, "test_cmd": _STR},
+    list(TASK_FIELDS))}}, ["tasks"])
 
 
 @dataclass
@@ -147,6 +167,10 @@ class Conductor:
         return self._read("queue.json", {"layer": "", "tasks": []})
 
     def _save_queue(self, q: dict) -> None:
+        for t in q.get("tasks", []):  # R19: nothing grows without bound
+            for key in ("notes", "trouble_notes"):
+                if isinstance(t.get(key), list):
+                    t[key] = [str(x)[:NOTE_CAP] for x in t[key]][-NOTES_KEEP:]
         self._write("queue.json", q)
 
     @property
@@ -314,13 +338,48 @@ class Conductor:
         self._deliver(qid)
         return qid
 
+    def _send(self, subject: str, body: str) -> bool:
+        """R20: every email goes through here. Capped body; at most mail_per_hour / mail_per_day."""
+        now = self.clock()
+        log = self._read("mail_log.json", {"sent": [], "budget_logged": ""})
+        sent = [x for x in log.get("sent", []) if (now - datetime.fromisoformat(x)).total_seconds() < 86400]
+        hour = [x for x in sent if (now - datetime.fromisoformat(x)).total_seconds() < 3600]
+        if len(hour) >= int(self.limits.get("mail_per_hour", 6)) or len(sent) >= int(self.limits.get("mail_per_day", 30)):
+            stamp = now.strftime("%Y-%m-%dT%H")
+            if log.get("budget_logged") != stamp:
+                self._log(f"mail budget reached; held back: {subject[:120]}")
+                log["budget_logged"] = stamp
+            log["sent"] = sent
+            self._write("mail_log.json", log)
+            return False
+        try:
+            self.mailer(subject, body[:BODY_CAP])
+        except Exception as e:  # noqa: BLE001 - retried later (R7)
+            self._log(f"mail failed: {subject[:120]}: {e!r}")
+            return False
+        log["sent"] = sent + [now.isoformat()]
+        self._write("mail_log.json", log)
+        return True
+
+    def _notice_once(self, key: str, subject: str, body: str, every_h: float = 12) -> bool:
+        """R22: a notice goes out at most once per every_h hours, and never while KILL is set."""
+        if (self.state / "KILL").exists():
+            return False
+        now = self.clock()
+        notes = self._read("notices.json", {})
+        last = notes.get(key)
+        if last and (now - datetime.fromisoformat(last)).total_seconds() < every_h * 3600:
+            return False
+        if not self._send(subject, body):
+            return False
+        notes[key] = now.isoformat()
+        self._write("notices.json", notes)
+        return True
+
     def _deliver(self, qid: str) -> None:
         qs = self._read("questions.json", {})
         q = qs[qid]
-        try:
-            self.mailer(f"[Forge Q-{qid} {q['code']}] {q['subject']}", q["body"])
-        except Exception as e:  # noqa: BLE001 - retried every step (R7)
-            self._log(f"mail to owner failed for {qid}: {e!r}")
+        if not self._send(f"[Forge Q-{qid} {q['code']}] {q['subject']}", q["body"]):
             return
         qs = self._read("questions.json", {})
         qs[qid]["delivered"] = True
@@ -329,10 +388,7 @@ class Conductor:
     def _mail_notice(self, qid: str, subject: str, body: str) -> None:
         """Follow-up email on an existing question (keeps its reply code)."""
         q = self._read("questions.json", {}).get(qid, {})
-        try:
-            self.mailer(f"[Forge Q-{qid} {q.get('code', '')}] {subject}", body)
-        except Exception as e:  # noqa: BLE001
-            self._log(f"notice mail failed for {qid}: {e!r}")
+        self._send(f"[Forge Q-{qid} {q.get('code', '')}] {subject}", body)
 
     def _handle_inbox(self) -> None:
         for qid, q in self._read("questions.json", {}).items():
@@ -344,6 +400,8 @@ class Conductor:
             self._log(f"inbox read failed: {e!r}")
             return
         for m in messages:
+            if m.get("outgoing"):  # R18: Forge's own mail is never an answer
+                continue
             sender = re.findall(r"[\w.+-]+@[\w.-]+", str(m.get("from", "")).lower())
             if self.owner not in sender:
                 continue
@@ -352,7 +410,7 @@ class Conductor:
                 (self.state / "KILL").write_text("stopped by owner email\n")
             mq = re.search(r"\[Forge Q-([\w-]+) ([\w-]{8})\]", subject)
             if mq:
-                self._answer(mq.group(1), body, mq.group(2))
+                self._answer(mq.group(1), clean_reply(body), mq.group(2))
 
     def _answer(self, qid: str, body: str, code: str) -> None:
         qs = self._read("questions.json", {})
@@ -393,6 +451,8 @@ class Conductor:
 
     # ------------------------------------------------------------------ main step
     def step(self) -> str:
+        if (self.state / "KILL").exists():  # R21: KILL stops everything, email included
+            return "killed"
         self._handle_inbox()
         if (self.state / "KILL").exists():
             return "killed"
@@ -459,8 +519,8 @@ class Conductor:
                 if errors >= 3 and not told:
                     told = True
                     try:
-                        self.mailer("[Forge] the conductor keeps hitting an error",
-                                    "It keeps retrying with a growing pause. Details: state/bootstrap/errors.log")
+                        self._notice_once("error", "[Forge] the conductor keeps hitting an error",
+                                          "It keeps retrying with a growing pause. Details: state/bootstrap/errors.log")
                     except Exception:  # noqa: BLE001
                         pass
                 sleep(min(idle_sleep_s * errors, 1800))
@@ -821,11 +881,8 @@ class Conductor:
             self._save_queue(q)
             self._log(f"gate PR create failed: {out}")
             if n == 1 or n % 20 == 0:
-                try:
-                    self.mailer(f"[Forge] {q['layer']} is done but the pull request failed",
-                                f"GitHub said:\n{(out or '')[:2000]}\n\nForge keeps retrying.")
-                except Exception as e:  # noqa: BLE001
-                    self._log(f"mail failed: {e!r}")
+                self._send(f"[Forge] {q['layer']} is done but the pull request failed",
+                           f"GitHub said:\n{(out or '')[:2000]}\n\nForge keeps retrying.")
             return
         pr = m.group(1)
         self._ask("gate", f"{q['layer']} is ready: reply y to approve",
@@ -841,6 +898,7 @@ def gmail_mailer(owner: str) -> Callable[[str, str], None]:
         pw = keyring.get_password("forge-gmail", owner)
         msg = EmailMessage()
         msg["From"], msg["To"], msg["Subject"] = owner, owner, subject
+        msg["X-Forge-Outgoing"] = "1"  # R18: lets the inbox reader skip Forge's own mail
         msg.set_content(body)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
             s.login(owner, pw)
@@ -875,7 +933,7 @@ def gmail_inbox(owner: str, state: Path) -> Callable[[], list[dict]]:
                 # keep only the new reply text, not the quoted original
                 body = re.split(r"\n\s*On .+wrote:\s*\n", body, maxsplit=1)[0]
                 out.append({"from": str(msg.get("From", "")), "subject": str(make_header(decode_header(msg.get("Subject", "")))),
-                            "body": body})
+                            "body": body, "outgoing": str(msg.get("X-Forge-Outgoing", "")).strip() == "1"})
                 m.store(i, "+FLAGS", "\\Seen")
         finally:
             try:
@@ -932,11 +990,66 @@ def acquire_lock(state: Path):
     return f
 
 
+SMOKE_ROLES = {  # role: (schema, writes a file?, example answer)
+    "test_writer": (S_TESTS, True, '{"files": ["smoke.txt"], "summary": "ok"}'),
+    "builder": (S_BUILD, True, '{"status": "done", "summary": "ok"}'),
+    "reviewer": (S_REVIEW, False, '{"verdict": "pass", "reasons": []}'),
+    "troubleshooter": (S_TROUBLE, None, '{"kind": "fix", "notes": "ok"}'),
+    "drift_keeper": (S_DRIFT, False, '{"status": "ok", "reasons": []}'),
+    "planner": (S_PLAN, True, '{"tasks": []}'),
+}
+
+
+def smoke(team: Team, workdir: Path) -> list[str]:
+    """R23: run every role once for real on a throwaway repo. Returns problems; empty means all passed."""
+    import shutil
+    import tempfile
+    from core.agents import _shape_ok
+    Path(workdir).mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="forge-smoke-", dir=str(workdir)))
+    problems: list[str] = []
+    try:
+        _git(root, "init", "-q")
+        _git(root, "config", "user.name", "Forge smoke")
+        _git(root, "config", "user.email", "forge@localhost")
+        (root / "README.md").write_bytes(b"Forge smoke test repo\n")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "smoke")
+        for role, (schema, writes, example) in SMOKE_ROLES.items():
+            if writes:
+                ask = "Create a file named smoke.txt containing the word ok in the current folder. Change nothing else."
+            elif writes is False:
+                ask = "Do not create or change any files."
+            else:
+                ask = "You may read files but do not need to change any."
+            prompt = f"SMOKE TEST for Forge (role: {role}). {ask} Then answer with ONLY this JSON: {example}"
+            try:
+                r = getattr(team, role).run(prompt, root, schema)
+            except Exception as e:  # noqa: BLE001
+                problems.append(f"{role}: crashed: {e!r}"[:500])
+                continue
+            status = subprocess.run(["git", "status", "--porcelain", "-uall"], cwd=str(root), capture_output=True,
+                                    text=True, stdin=subprocess.DEVNULL, **NOWIN).stdout.strip()
+            if not r.ok:
+                problems.append(f"{role}: failed: {r.error}"[:500])
+            elif not _shape_ok(r.data, schema):
+                problems.append(f"{role}: answer missing required keys {schema.get('required')}")
+            if writes and not (root / "smoke.txt").exists():
+                problems.append(f"{role}: could not write smoke.txt (no write access?)")
+            if writes is False and status:
+                problems.append(f"{role}: changed files but must be read-only: {status[:200]}")
+            _git(root, "reset", "-q", "--hard")
+            _git(root, "clean", "-q", "-fd")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return problems
+
+
 def main(argv: list[str]) -> int:
     from core.agents import load_limits
     forge = Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["init", "run", "step", "status"])
+    ap.add_argument("cmd", choices=["init", "run", "step", "status", "smoke"])
     ap.add_argument("--layer")
     ap.add_argument("--tasks")
     ap.add_argument("--owner", default="benjaminanderson0802@gmail.com")
@@ -972,13 +1085,50 @@ def main(argv: list[str]) -> int:
     if lock is None:
         return 0  # another conductor holds the lock; the watchdog calls us harmlessly
     try:
-        c.mailer("[Forge] conductor started", "The conductor is running in the background. You'll hear from it only "
-                 "when something needs you, when a layer is ready for approval, or if it hits trouble.\n\n"
-                 "To stop everything: reply STOP to any Forge email.")
-    except Exception as e:  # noqa: BLE001
-        c._log(f"start mail failed: {e!r}")
-    print(c.run(heartbeat=state / "conductor.heartbeat"))
+        if a.cmd == "smoke" or (not (state / "KILL").exists() and _smoke_stale(state, c.clock())):
+            problems = _guarded_smoke(c, Path(a.work))
+            if a.cmd == "smoke":
+                print("\n".join(problems) or "smoke test passed")
+                return 1 if problems else 0
+            if problems:
+                c._log("smoke test failed: " + " | ".join(problems))
+                c._notice_once("smoke", "[Forge] not started: the live smoke test failed",
+                               "Before starting, Forge runs every agent once for real. These failed:\n\n" +
+                               "\n".join(problems) + "\n\nForge retries every few minutes.")
+                return 0
+        c._notice_once("start", "[Forge] conductor started",
+                       "The conductor is running in the background. You'll hear from it only when something "
+                       "needs you, when a layer is ready for approval, or if it hits trouble.\n\n"
+                       "To stop everything: reply STOP to any Forge email.")
+        print(c.run(heartbeat=state / "conductor.heartbeat"))
+    finally:
+        lock.close()
     return 0
+
+
+def _smoke_stale(state: Path, now: datetime) -> bool:
+    try:
+        last = datetime.fromisoformat(json.loads((state / "smoke_ok.json").read_text(encoding="utf-8"))["at"])
+        return (now - last).total_seconds() > 86400
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
+
+
+def _guarded_smoke(c: Conductor, workdir: Path) -> list[str]:
+    """R23 with the R9 tamper check around it: smoke agents run for real, so state is fingerprinted too."""
+    before = c._fingerprint()
+    problems = smoke(c.team, workdir)
+    try:
+        changed = before != c._fingerprint()
+    except OSError:
+        changed = True
+    if changed:
+        (c.state / "KILL").write_text("state tampered during the smoke test\n")
+        c._log("TAMPER during smoke test")
+        return ["state files changed during the smoke test (Forge halted)"]
+    if not problems:
+        c._write("smoke_ok.json", {"at": c.clock().isoformat()})
+    return problems
 
 
 if __name__ == "__main__":
