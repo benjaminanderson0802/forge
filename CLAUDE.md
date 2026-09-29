@@ -24,6 +24,7 @@ Forge is Ben's autonomous build-and-venture system. This repo is its memory. **N
 - **Honest and legal:** real identity, official APIs, platform rules respected, no CAPTCHA bypass. When an idea crosses a line, build the compliant version.
 - **Don't interfere with Ben.** Nothing may take over his screen, mouse or keyboard while he's using the PC.
 - **Workflow:** Superpowers (brainstorming → writing-plans → executing → verification-before-completion). Test first. Commit often. Keep drills and core unit tests passing: `python drills/run_drills.py`, `python -m unittest discover -s tests/core`.
+- **Talking to Ben:** plain language. Any step he must do comes as an exact line to paste into Win + R or PowerShell, never just a folder or file name. No quotes around paths in those lines.
 - **Before ending a session,** update `docs/STATUS.md`. Record any new decision Ben made as a proposed entry in `docs/DECISIONS.md`, in a pull request he approves.
 
 ## Environment (Ben's Windows PC)
