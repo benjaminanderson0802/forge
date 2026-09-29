@@ -6,18 +6,17 @@
 
 ## Now
 
-- Phase 0 is done. Phase F (Foundation) is in progress: repo memory files written; the grilling session on Forge's own spec is next.
-- Layer 1 plan is drafted but **not approved**. It will be revised after the grilling (always-on service, anti-drift guards, communication).
+- Phase 0 is done. Phase F (Foundation): repo memory written; grilling finished (decisions D-018 to D-033).
+- Next: revise the Layer 1 plan to match D-018 to D-033, then the build team (D-025) starts on a layer branch.
 
 ## Machine (Ben's PC)
 
 - **Forge core:** `C:\Users\benja\Forge`. Drills 1–10 pass.
 - **Repo:** `benjaminanderson0802/forge` (public). `main` is protected, including against admins.
 - **Installed:** Python 3.12 and 3.13, Node LTS, Git, the GitHub command-line tool, Docker (virtualization enabled in BIOS), n8n at `http://localhost:5678`, Ollama, FFmpeg, yt-dlp, Tesseract, LibreOffice, Chrome, Bitwarden plus its command-line tool, and the Claude Code and Codex command-line tools.
-- **Signed in:** GitHub (command-line tool and token), Codex, and Bitwarden (logged in, vault locked).
-- **Not signed in for automation:** Claude Code reports "Not logged in" when run headless. Ben runs `claude` then `/login` once.
+- **Signed in:** GitHub (command-line tool and token), Codex, Bitwarden (logged in, vault locked), and Claude Code (headless verified).
+- **Gmail:** app password verified for sending and reading. Stored in Windows Credential Manager (`forge-gmail`), with the record copy in Bitwarden.
 
 ## Open items for Ben
 
-- Grilling session: answer the questions one at a time.
-- Claude Code `/login` (1 minute), before Layer 1's live test.
+- Approve the grilling decisions (D-018 to D-033).

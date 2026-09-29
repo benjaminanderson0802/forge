@@ -61,3 +61,84 @@ Details and timeline: `docs/source/`. Tariff refunds go first because refund win
 ## Tools
 
 **D-017 (2026-09-29) Agents use the plugins in `PLUGINS_HANDOFF.md` and access GitHub as described in `GITHUB_ACCESS.md`.** Never install anything on its "do not install" list. Vet any new tool for security and terms of service before installing.
+
+## From the Foundation grilling (2026-09-29)
+
+**D-018 (2026-09-29) The PC stays on 24/7, set to never sleep while plugged in (the screen may turn off).** Forge moves to a cloud machine later, once ventures pay for it.
+
+**D-019 (2026-09-29) Forge never gets in Ben's way.**
+- Never uses his screen, mouse or keyboard.
+- Browsers are hidden; anything that truly needs a screen runs in its own virtual machine.
+- No visible windows.
+- Low priority, and lighter while Ben is active.
+- Slower is an accepted trade-off.
+
+**D-020 (2026-09-29) Usage limits apply anytime.**
+- Claude: up to 50% of the Max plan per day. Forge pauses if it hits a limit window.
+- Codex: up to 50% of the ChatGPT plan.
+- If either is capped, the team slows down rather than swapping models between roles that must stay independent.
+
+**D-021 (2026-09-29) Forge emails from Ben's own Gmail (benjaminanderson0802@gmail.com) with an app password.** It sends to him and reads his replies. The working copy lives in Windows Credential Manager (`forge-gmail`), with the record copy in Bitwarden. Connected and verified 2026-09-29.
+
+**D-022 (2026-09-29) The live status page is served on the PC only.**
+
+**D-023 (2026-09-29) Contact rules.**
+- **Instant email** only when:
+  - Ben alone can unblock all progress
+  - a spend or subscription needs approval
+  - a safety stop fires (kill switch, tampering, repeated false claims)
+  - a customer call needs him
+- **Everything else** goes in a daily 8am digest.
+- **Quiet hours** 23:00–07:00, except emergencies.
+- **Ben answers** by email reply, on the status page, or in chat. All three work.
+- **Every question** comes with the default Forge will use if he doesn't answer.
+
+**D-024 (2026-09-29) Emergency stop, three equal ways:**
+- a "Stop Forge" desktop shortcut
+- an email saying STOP
+- a status-page button
+
+Restarting requires Ben to deliberately clear the stop.
+
+**D-025 (2026-09-29) Forge is built by a team, never by one agent alone.**
+- Codex writes each task's tests first.
+- Claude Code builds; it can't edit tests or mark itself done.
+- Mechanical judges with no AI decide: tests, drills, mutation testing.
+- Codex reviews read-only against the plan and PURPOSE.
+- A fresh-session drift keeper checks after each task.
+- Every task is a contract in the real ledger.
+- Agents hand work to each other through the ledger and git, run by plain-code conductor scripts. Ben never relays messages.
+- As each Layer 1 piece works, it replaces the manual step it covers.
+
+**D-026 (2026-09-29) Focus rule: the Builder builds, a separate Troubleshooter fixes.** Supersedes any time-based "stuck" rule.
+- **Non-blocking problems:** the Builder files a side ticket and moves on.
+- **Blocking problems:** 2 attempts or 20 minutes, then the Troubleshooter takes it and the Builder moves to unblocked work.
+- **No progress:** 2 zero-progress attempts in a row (same error, no more tests passing) trigger an immediate handoff.
+- **Troubleshooter:** its own lane, 3 approaches, research tools. Its dead ends go into a shared file everyone reads.
+- **Coverage:** every task names the spec section it serves, and spec coverage must rise.
+- **Re-plan:** no coverage gain in 3 merges, or no merge in 2 hours of active work, sends the drift keeper in to re-plan.
+- **Tuning:** the numbers are first guesses; the Learner tunes them later, with Ben's approval.
+
+**D-027 (2026-09-29) While Forge builds itself, the team works freely on a layer branch.** Ben approves once per layer, when the layer passes its gate, with the full review report. Nothing reaches `main` without that approval.
+
+**D-028 (2026-09-29) Forge builds its own layers from Layer 2 on.** Every change to itself is a protected-file change, so it still needs Ben's approval.
+
+**D-029 (2026-09-29) Secrets at runtime come from Windows Credential Manager; Bitwarden holds the record copy.** Agents never see secret values: plain-code tools fetch and use them on their behalf.
+
+**D-030 (2026-09-29) A readiness check runs before every build session and every cycle.**
+- It tests every connection: Claude Code, Codex, GitHub, Gmail, Docker/n8n, Ollama, Python libraries, the hidden browser.
+- Results go to a capability map (status plus last-checked time) that every agent reads.
+- A builder is never started into a broken setup: the Troubleshooter fixes it first, or the exact fix goes in Ben's queue.
+
+**D-031 (2026-09-29) A blocker claim must show real work before anyone accepts it.**
+- It must include: at least 2 routes tried, the actual error output, the capability needed, and what the agent works on meanwhile.
+- Plain code rejects any claim that contradicts the capability map.
+- The Reviewer rejects claims without real attempts.
+- Rejected easy-outs are logged against the agent, like false claims.
+
+**D-032 (2026-09-29) When a task needs something Forge doesn't have:**
+- **Free tools:** installed automatically if they pass vetting (known publisher, not on the do-not-install list, no account needed), and logged.
+- **New accounts:** prepared up to the human-only step, which goes in Ben's queue.
+- **Anything that costs money:** Ben approves.
+
+**D-033 (2026-09-29) Founding principle: a missing connection is never a reason to stop.** AI agents aren't malicious, but when stumped they commonly take the easy way out. Forge is designed on that assumption. Connections are set up and verified in advance; blocker claims must show work; problems route to whoever can fix them; agents are equipped for the task at hand.
