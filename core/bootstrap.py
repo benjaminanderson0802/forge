@@ -254,14 +254,18 @@ class Conductor:
         return r
 
     def _fingerprint(self) -> dict:
+        """R9/R10/R14: every file in state/. The conductor writes nothing there while an agent runs, so nothing
+        is exempt. Run records (which only grow) use a fast size+mtime signature; everything else a sha256."""
         fp = {}
         for f in self.state.rglob("*"):
             if not f.is_file():
                 continue
             rel = f.relative_to(self.state).as_posix()
-            if rel.startswith("runs/") or rel == "meter.json":  # R10: everything else, temp files included
-                continue
-            fp[rel] = hashlib.sha256(f.read_bytes()).hexdigest()
+            if rel.startswith("runs/"):
+                st = f.stat()
+                fp[rel] = f"{st.st_size}:{st.st_mtime_ns}"
+            else:
+                fp[rel] = hashlib.sha256(f.read_bytes()).hexdigest()
         return fp
 
     def _log(self, msg: str) -> None:

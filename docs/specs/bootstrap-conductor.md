@@ -196,3 +196,7 @@ A `kind == "plan"` task with status `todo`:
 - **R11 One conductor, guaranteed.** `main run` takes an operating-system exclusive lock on `state/conductor.lock`: `msvcrt.locking` on Windows, `fcntl.flock` elsewhere. The lock is held for the life of the process. A second process that can't get the lock exits at once with code 0. The lock is exposed as `acquire_lock(state) -> handle | None` so tests can check that a second acquisition returns `None` while the first is held.
 - **R12 The loop survives everything.** Heartbeat writes happen inside the loop's error handling, so a failed heartbeat is logged and the loop continues.
 - **R13 Stage errors back off.** A stage `RuntimeError` or `OSError` makes `step()` return `"error"`, not `"worked"`. `run()` backs off on `"error"` just as it does on an exception. After 3 consecutive `"error"` steps, Ben is emailed once.
+
+## Review round 3 amendment
+
+- **R14 Nothing is exempt.** The tamper fingerprint covers every file in `state/`, including `runs/` and `meter.json`. The conductor never writes to `state/` while an agent run is in progress: the run's `prompt.md` is written before the "before" fingerprint, and `output.json` and meter updates only after the "after" comparison. Files under `runs/` use a size+mtime signature, for speed; all other files use sha256.
