@@ -280,3 +280,14 @@ The first run with real agents and real email hit four faults no fake-based test
   - a line of 10 or more underscores;
   - a line starting with `From:` that is followed within the next 4 lines by `Sent:`, `Date:` or `To:`.
 - **R34 Null optional fields count as missing.** Before the shape check, an agent's answer drops any key whose value is `null` and which isn't in the schema's `required` list, recursively. Nullable optionals from Codex's strict schema then validate, and the conductor sees them as absent.
+
+## Review round 4 amendments (Codex review, 2026-09-29)
+
+- **R35 No reply is lost.**
+  - When a STOP ends inbox processing, the rest of that batch is saved to `state/inbox_pending.json`. It is processed first on the next `_handle_inbox`, which only runs once KILL is cleared.
+  - Each message is handled in its own `try`: if one message raises an error, the error is logged and processing continues with the next.
+  - Pending messages follow the R19 caps: at most 50 are kept, and each body is capped.
+- **R36 One bad email can't block the inbox.** The reader handles each message separately:
+  - a message it can't decode is recorded as seen and skipped, and the reader moves on;
+  - an unknown charset falls back to UTF-8, replacing bytes it can't decode;
+  - progress (`inbox_seen.json`) is saved even when one message fails.
