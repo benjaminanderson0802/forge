@@ -120,3 +120,23 @@ class R16CodexSandboxTests(unittest.TestCase):
                     self.assertLess(index, len(args) - 1)
                 else:
                     self.assertFalse(any("windows.sandbox" in arg for arg in args))
+
+    def test_R16_windows_override_preserves_each_sandbox_mode(self):
+        """R16: Windows elevation applies to both writer and reviewer sandbox modes."""
+        from unittest.mock import patch
+
+        for sandbox in ("workspace-write", "read-only"):
+            with self.subTest(sandbox=sandbox):
+                completed = json.dumps({"type": "turn.completed", "usage": {}}) + "\n"
+                with patch("core.agents.IS_WIN", True), \
+                        patch("core.agents._resolve", return_value=["codex"]), \
+                        patch("core.agents.launch", return_value=(0, completed, "")) as launch_mock:
+                    CodexAgent(sandbox=sandbox).run("review or write tests", Path("."))
+                launch_mock.assert_called_once()
+                args = launch_mock.call_args.args[0]
+                self.assertEqual(args[args.index("-s") + 1], sandbox)
+                override = 'windows.sandbox="elevated"'
+                self.assertIn(override, args)
+                index = args.index(override)
+                self.assertGreater(index, 0)
+                self.assertEqual(args[index - 1], "-c")

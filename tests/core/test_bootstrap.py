@@ -683,3 +683,79 @@ class R15BootstrapTests(Harness):
         after = c._fingerprint()
         self.assertIn("conductor.lock", after)
         self.assertNotEqual(before["conductor.lock"], after["conductor.lock"])
+
+    def test_R15_acquire_lock_truncates_existing_bytes_while_held(self):
+        """R15: acquiring the lock empties existing bytes while the handle is held."""
+        from core.bootstrap import acquire_lock
+
+        lock_path = self.state / "conductor.lock"
+        lock_path.write_bytes(b"junk")
+        handle = acquire_lock(self.state)
+        self.assertIsNotNone(handle)
+        try:
+            self.assertEqual(lock_path.stat().st_size, 0)
+        finally:
+            handle.close()
+
+    def test_R15_unreadable_baseline_prevents_agent_launch(self):
+        """R15: an unreadable baseline fails the stage before launching the agent."""
+        meter_path = self.state / "meter.json"
+        real_read_bytes = Path.read_bytes
+        calls = []
+        denied_reads = []
+
+        def read_bytes(path):
+            if path == meter_path:
+                denied_reads.append(path)
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_read_bytes(path)
+
+        def writer(prompt, cwd):
+            calls.append((prompt, cwd))
+            return self.write_tests(prompt, cwd)
+
+        c = self.init(agents={"test_writer": writer})
+        Meter(self.state).add("codex", 1)
+        status_before = json.loads((self.state / "queue.json").read_text())["tasks"][0]["status"]
+        # Deny reads throughout the step, including both fingerprints if launched.
+        with patch.object(Path, "read_bytes", new=read_bytes):
+            result = c.step()
+        self.assertTrue(denied_reads)
+        self.assertFalse(calls, "an unreadable baseline must prevent agent launch")
+        self.assertEqual(result, "error")
+        self.assertFalse((self.state / "KILL").exists())
+        task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
+        self.assertEqual(task["status"], status_before)
+        self.assertIn("meter.json", (self.state / "errors.log").read_text(encoding="utf-8"))
+
+    def test_R15_lock_replacement_with_restored_size_and_mtime_is_tamper(self):
+        """R15: replacing an empty lock is tamper even when its timestamps are restored."""
+        from core.bootstrap import acquire_lock
+
+        lock_path = self.state / "conductor.lock"
+        replacement_stats = []
+
+        def tamper(prompt, cwd):
+            lock_path.unlink()
+            lock_path.write_bytes(b"")
+            os.utime(lock_path, ns=(original.st_atime_ns, original.st_mtime_ns))
+            replacement_stats.append(lock_path.stat())
+            return self.write_tests(prompt, cwd)
+
+        c = self.init(agents={"test_writer": tamper})
+        handle = acquire_lock(self.state)
+        self.assertIsNotNone(handle)
+        handle.close()  # Allow deletion and recreation on Windows.
+        original = lock_path.stat()
+        self.assertEqual(original.st_size, 0)
+        result = c.step()
+        self.assertEqual(len(replacement_stats), 1)
+        replacement = replacement_stats[0]
+        self.assertEqual(replacement.st_size, original.st_size)
+        self.assertEqual(replacement.st_atime_ns, original.st_atime_ns)
+        self.assertEqual(replacement.st_mtime_ns, original.st_mtime_ns)
+        self.assertNotEqual(replacement.st_ino, original.st_ino)
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertEqual(result, "killed")
+        self.assertTrue(any("tamper" in subject.lower() and "conductor.lock" in body
+                            for subject, body in self.mails))
