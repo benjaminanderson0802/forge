@@ -24,10 +24,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from core.finalize import ApprovedMerges, Finalizer, Hooks, Journal, safe_push
 from core.ledger import Ledger, Rejected
 from core.mutation import changed_lines, run_mutation
+from core.roles import role_text
 from core.usage import Meter
 from core.weaktest import empty_implementation, real_failing_run, stub_targets
+from core.worktrees import Worktrees
 
 ROLES = {"ci": "ci", "forge-manager": "manager", "forge-executor": "executor",
          "forge-auditor": "auditor", "forge-core": "core", "benjamin": "human"}
@@ -35,6 +38,7 @@ NOWIN = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {
 TASK_FIELDS = ("id", "title", "section", "files_in_scope", "test_files", "test_cmd")
 NOTE_CAP, NOTES_KEEP, BODY_CAP = 2000, 30, 20000  # R19
 SUBJECT_CAP, CLOSED_KEEP, SENT_IDS_KEEP = 300, 50, 500  # R26, R28
+MUTATION_NA = "not applicable: merge commit adds no builder lines"
 
 
 def _prune_questions(qs: dict) -> dict:
@@ -196,27 +200,48 @@ class Conductor:
         except (OSError, json.JSONDecodeError):
             return default
 
-    def _write(self, name: str, data) -> None:
+    def _write(self, name: str, data, durable: bool = False) -> None:
         p = self.state / name
         tmp = p.with_suffix(p.suffix + ".tmp")
-        tmp.write_bytes(json.dumps(data, indent=2, sort_keys=True).encode("utf-8"))
+        raw = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
+        if not durable:
+            tmp.write_bytes(raw)
+            os.replace(tmp, p)
+            return
+        with open(tmp, "wb") as f:  # durable: the bytes reach the disk before the rename, the rename after it
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, p)
+        if os.name != "nt":
+            try:
+                fd = os.open(str(self.state), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
 
     def _queue(self) -> dict:
         return self._read("queue.json", {"layer": "", "tasks": []})
 
-    def _save_queue(self, q: dict) -> None:
+    def _save_queue(self, q: dict, durable: bool = False) -> None:
         if isinstance(q.get("notes"), list):  # R28
             q["notes"] = [str(x)[:NOTE_CAP] for x in q["notes"]][-NOTES_KEEP:]
         for t in q.get("tasks", []):  # R19: nothing grows without bound
             for key in ("notes", "trouble_notes"):
                 if isinstance(t.get(key), list):
                     t[key] = [str(x)[:NOTE_CAP] for x in t[key]][-NOTES_KEEP:]
-        self._write("queue.json", q)
+        self._write("queue.json", q, durable=durable)
 
     @property
     def wt(self) -> Path:
         return self.work / self._queue()["layer"]
+
+    @property
+    def trees(self) -> Worktrees:
+        return Worktrees(self.repo, self.work)
 
     # ------------------------------------------------------------------ setup
     def init_queue(self, layer: str, tasks: list[dict]) -> None:
@@ -260,9 +285,9 @@ class Conductor:
         _git(self.wt, "reset", "-q", "--hard")
         _git(self.wt, "clean", "-q", "-fd")
 
-    def _changed(self) -> list[str]:
+    def _changed(self, cwd: Path | None = None) -> list[str]:
         """Every added, modified, deleted or untracked path in the worktree (NUL-separated: no trimming bugs)."""
-        p = subprocess.run(["git", "status", "--porcelain", "-z", "-uall"], cwd=str(self.wt), capture_output=True,
+        p = subprocess.run(["git", "status", "--porcelain", "-z", "-uall"], cwd=str(cwd or self.wt), capture_output=True,
                            stdin=subprocess.DEVNULL, **NOWIN)
         if p.returncode != 0:
             raise RuntimeError("git error: status failed: " + p.stderr.decode("utf-8", "replace").strip()[:300])
@@ -277,17 +302,23 @@ class Conductor:
             i += 1
         return sorted(set(files))
 
-    def _commit(self, paths: list[str], msg: str) -> str:
+    def _commit(self, paths: list[str], msg: str, cwd: Path | None = None) -> str:
+        wt = Path(cwd) if cwd else self.wt
         if paths:
-            _git(self.wt, "add", "-A", "--", *paths)
-        if not _git(self.wt, "diff", "--cached", "--name-only"):
+            _git(wt, "add", "-A", "--", *paths)
+        if not _git(wt, "diff", "--cached", "--name-only"):
             return ""
-        _git(self.wt, "commit", "-q", "-m", msg)
-        return _git(self.wt, "rev-parse", "HEAD")
+        _git(wt, "-c", "user.name=Forge", "-c", "user.email=forge@localhost", "commit", "-q", "-m", msg)
+        return _git(wt, "rev-parse", "HEAD")
 
     def _push(self) -> None:
-        if self.push:
-            _git(self.wt, "push", "-q", "-u", "origin", self._queue()["layer"], check=False)
+        """Every push goes through finalize.safe_push. Anything but "ok" is a stage error, never a success."""
+        if not self.push:
+            return
+        status, out = safe_push(self.wt, self._queue()["layer"], ApprovedMerges(self.state))
+        if status != "ok":
+            self._log(f"push {status}: {out[:500]}")
+            raise RuntimeError(f"push {status}: {out[:300]}")
 
     # ------------------------------------------------------------------ agents
     def _call(self, role: str, prompt: str, schema: dict | None, cwd: Path | None = None):
@@ -535,6 +566,8 @@ class Conductor:
                     t["test_rejects"] = 0
                     t["plan_rejects"] = 0
             self._save_queue(qd)
+        elif q["kind"] == "merge":  # the only thing that retries a blocked merge record
+            Journal(self.state).unblock(qid, body.strip()[:NOTE_CAP])
         elif q["kind"] == "replan":
             qd = self._queue()
             qd["notes"] = ([str(x)[:NOTE_CAP] for x in qd.get("notes", [])] + [f"Ben: {body.strip()}"[:NOTE_CAP]])[-NOTES_KEEP:]
@@ -557,6 +590,11 @@ class Conductor:
             return "paused"
         if self._capped():
             return "capped"
+        try:
+            self._reconcile_merges()
+        except (RuntimeError, OSError, Rejected) as e:
+            self._log(f"reconcile error: {e!r}")
+            return "error"
         q = self._queue()
         if q.get("drift_due"):
             try:
@@ -565,6 +603,20 @@ class Conductor:
                 return "capped"
             except Tampered:
                 return "killed"
+            return "worked"
+        active = {r["tid"] for r in Journal(self.state).active()}
+        tid = next((t["id"] for t in q["tasks"] if t["id"] in active), None) or min(active, default=None)
+        if tid is not None:  # a started finalization comes before any new work; blocked records never run
+            try:
+                self._ensure_worktree(q["layer"])
+                self._finalizer().run(tid)
+            except Capped:
+                return "capped"
+            except Tampered:
+                return "killed"
+            except (RuntimeError, OSError, Rejected) as e:  # R13; never a failed attempt
+                self._log(f"finalize error on {tid}: {e!r}")
+                return "error"
             return "worked"
         for t in q["tasks"]:
             if t["status"] in ("todo", "tests_ok"):
@@ -594,8 +646,13 @@ class Conductor:
         tasks = q["tasks"]
         qs = self._read("questions.json", {})
         if tasks and all(t["status"] == "done" for t in tasks) and not q.get("drift_due") \
-                and not any(v["kind"] == "gate" for v in qs.values()):
-            self._gate()
+                and not any(v["kind"] == "gate" for v in qs.values()) \
+                and not any(r.get("status") in ("active", "blocked") for r in Journal(self.state).all()):
+            try:
+                self._gate()
+            except (RuntimeError, OSError) as e:  # e.g. a refused push: no pull request is opened
+                self._log(f"gate error: {e!r}")
+                return "error"
             return "gate"
         return "idle"
 
@@ -652,11 +709,11 @@ class Conductor:
                   "\n\nReply to this email with guidance and the task will be retried with it. "
                   "Otherwise Forge continues with other work.", task=tid)
 
-    def _run_tests(self, t: dict) -> tuple[int, str, bool]:
+    def _run_tests(self, t: dict, cwd: Path | None = None) -> tuple[int, str, bool]:
         """R1: run a task's unittest command without a shell. Returns (exit, output, timed_out)."""
-        return self._exec_tests(t)
+        return self._exec_tests(t, cwd=cwd)
 
-    def _exec_tests(self, t: dict) -> tuple[int, str, bool]:
+    def _exec_tests(self, t: dict, cwd: Path | None = None) -> tuple[int, str, bool]:
         """The real test run behind _run_tests. Bytecode goes to a fresh private cache that is deleted afterwards,
         so no run reads a stale .pyc (e.g. of a same-size stub) or leaves one in the worktree."""
         paths = parse_test_cmd(t["test_cmd"], t["test_files"])
@@ -667,7 +724,7 @@ class Conductor:
         cache = tempfile.mkdtemp(prefix="forge-pyc-")
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPYCACHEPREFIX=cache)
         try:
-            p = subprocess.run([sys.executable, "-m", "unittest", *paths], cwd=str(self.wt), capture_output=True,
+            p = subprocess.run([sys.executable, "-m", "unittest", *paths], cwd=str(cwd or self.wt), capture_output=True,
                                text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
                                timeout=int(self.limits.get("test_timeout_s", 600)), env=env, **NOWIN)
             return p.returncode, (p.stdout or "") + (p.stderr or ""), False
@@ -677,8 +734,9 @@ class Conductor:
             shutil.rmtree(cache, ignore_errors=True)
 
     def _run_tests_on_stub(self, t: dict) -> tuple[int, str, bool]:
-        """The empty-implementation run of Stage A (always the real runner, isolated bytecode cache)."""
-        return self._exec_tests(t)
+        """The empty-implementation run of Stage A (always the real runner, isolated bytecode cache). Stage A works
+        in the layer worktree: its code plus the writer's uncommitted tests is exactly what is being checked."""
+        return self._exec_tests(t, cwd=self.wt)
 
     def _empty_impl_check(self, t: dict, changed: list[str]) -> str | None:
         """R4 on an empty implementation: stub the in-scope modules, run the tests, restore. Returns a rejection
@@ -735,9 +793,9 @@ class Conductor:
             return f"tests rejected: no real failing run on the empty implementation ({why})"
         return None
 
-    def _run_cmd(self, cmd: str) -> tuple[int, str]:
+    def _run_cmd(self, cmd: str, cwd: Path | None = None) -> tuple[int, str]:
         try:
-            p = subprocess.run(cmd, shell=True, cwd=str(self.wt), capture_output=True, text=True, encoding="utf-8",
+            p = subprocess.run(cmd, shell=True, cwd=str(cwd or self.wt), capture_output=True, text=True, encoding="utf-8",
                                errors="replace", stdin=subprocess.DEVNULL,
                                timeout=int(self.limits.get("test_timeout_s", 600)), **NOWIN)
             return p.returncode, (p.stdout or "") + (p.stderr or "")
@@ -754,7 +812,7 @@ class Conductor:
     def _tests_stage(self, tid: str) -> None:
         t = self._task(tid)
         self._reset_wt()
-        prompt = ("You are the TEST WRITER. Write only these files: " + ", ".join(t["test_files"]) +
+        prompt = (role_text(self.repo, "test_writer") + "\n\nWrite only these files: " + ", ".join(t["test_files"]) +
                   ". The tests must fail until the feature exists. Do not write any other file.\n\n" +
                   self._task_prompt(t) + "\nAnswer with JSON: {\"files\": [...], \"summary\": \"...\"}")
         try:
@@ -809,6 +867,8 @@ class Conductor:
         return [ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
     def _build_stage(self, tid: str) -> None:
+        if Journal(self.state).load(tid) is not None:  # finalization owns this task; never built again
+            return
         t = self._task(tid)
         pending = t.get("troubleshoot_pending")
         if pending:  # R38: deferred troubleshooting comes before any further builder attempt
@@ -821,6 +881,8 @@ class Conductor:
                 "title": t["title"], "spec_ref": cid, "acceptance": t["test_cmd"],
                 "files_in_scope": list(t["files_in_scope"]), "max_attempts": 6, "token_budget": 10 ** 9})
         c = self._ledger().contracts().get(cid, {})
+        if c.get("status") in ("claimed", "submitted"):  # a crash left the last attempt open
+            c = self._recover_interrupted(tid, cid, c)
         if c.get("status") == "parked":
             self._block(tid, "ledger parked the contract (attempt or budget limit)")
             return
@@ -828,9 +890,10 @@ class Conductor:
         self._apply(f"{tag}-claim", "claim", cid, "forge-executor")
 
         self._reset_wt()
-        tests_commit = t["tests_commit"]
+        base = _git(self.wt, "rev-parse", "HEAD")
+        twt = self.trees.prepare_task(tid, base)  # the builder works in the task's own worktree
 
-        prompt = "You are the BUILDER. Make the tests pass by changing only the files you may change.\n\n" + \
+        prompt = role_text(self.repo, "builder") + "\n\nMake the tests pass by changing only the files you may change.\n\n" + \
                  self._task_prompt(t)
         if t.get("review_feedback"):
             prompt += "\nREVIEW FEEDBACK:\n" + "\n".join(f"- {x}" for x in t["review_feedback"]) + "\n"
@@ -843,26 +906,24 @@ class Conductor:
                    "A blocked answer must also include \"tried\" (at least 2 different routes you actually tried) "
                    "and \"error\" (the real error output); without them it is rejected as an easy way out.")
         try:
-            r = self._call("builder", prompt, S_BUILD)
+            r = self._call("builder", prompt, S_BUILD, cwd=twt)
         except Capped:  # R37: release the claim and undo, no failure recorded
             self._apply(f"{tag}-release", "release", cid, "forge-core")
-            _git(self.wt, "reset", "-q", "--hard", tests_commit)
-            _git(self.wt, "clean", "-q", "-fd")
+            self._reset_to(twt, base)
             raise
 
         tests = [_norm(x) for x in t["test_files"]]
-        changed = self._changed()
+        changed = self._changed(cwd=twt)
         violations = [f for f in changed if f in tests]
         if violations:
-            _git(self.wt, "checkout", "-q", "HEAD", "--", *violations)
-            _git(self.wt, "clean", "-q", "-f", "--", *violations)
+            _git(twt, "checkout", "-q", "HEAD", "--", *violations)
+            _git(twt, "clean", "-q", "-f", "--", *violations)
         changed = [f for f in changed if f not in tests]
         out_of_scope = [f for f in changed if not any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])]
 
         def fail(reason: str, sig: str, output: str = "", submitted: bool = False,
                  payload: dict | None = None) -> None:
-            _git(self.wt, "reset", "-q", "--hard", tests_commit)
-            _git(self.wt, "clean", "-q", "-fd")
+            self._reset_to(twt, base)
             if submitted:
                 self._apply(f"{tag}-fail", "fail", cid, "forge-auditor", payload)
             else:
@@ -888,40 +949,46 @@ class Conductor:
         if out_of_scope:
             return fail("out of scope: " + ", ".join(out_of_scope), "out of scope: " + ",".join(out_of_scope))
 
-        sha = self._commit(changed, f"{cid}: {t['title']}") or _git(self.wt, "rev-parse", "HEAD")
+        sha = self._commit(changed, f"{cid}: {t['title']}", cwd=twt) or _git(twt, "rev-parse", "HEAD")
         self._apply(f"{tag}-report", "run_report", cid, "forge-core", {
             "run_id": tag, "claim": (r.data or {}).get("status"), "commit": sha, "changed": changed,
             "violations": violations, "out_of_scope": []})
         self._apply(f"{tag}-submit", "submit", cid, "forge-executor", {"commit": sha})
 
-        started = time.monotonic()
-        task_run = self._run_tests(t)
-        baseline = time.monotonic() - started
-        results = [("task tests", *task_run[:2])] + [(cmd, *self._run_cmd(cmd)) for cmd in self.judge_cmds]
-        for cmd, code, output in results:
-            if code != 0:
-                self._apply(f"{tag}-ci", "test_run", cid, "ci", {"run_id": f"{tag}-ci", "commit": sha, "passed": False})
-                tail = "\n".join(output.splitlines()[-20:])
-                # numbers (timings, line numbers, addresses) vary between identical failures; ignore them
-                sig = hashlib.sha256(re.sub(r"\d+", "N", tail).encode()).hexdigest()
-                return fail(f"judge failed: {cmd}", sig, tail, submitted=True)
-        self._apply(f"{tag}-ci", "test_run", cid, "ci", {"run_id": f"{tag}-ci", "commit": sha, "passed": True})
-
-        mres = self._mutation_judge(t, tests_commit, sha, baseline)  # D-038: always before the reviewer
+        with self.trees.throwaway(sha) as jw:  # judges run at exactly this commit, never in a shared checkout
+            started = time.monotonic()
+            results = [("task tests", *self._run_tests(t, cwd=jw)[:2])]
+            baseline = time.monotonic() - started
+            for cmd in self.judge_cmds:
+                if results[-1][1] != 0:
+                    break
+                results.append((cmd, *self._run_cmd(cmd, cwd=jw)))
+            for cmd, code, output in results:
+                if code != 0:
+                    self._apply(f"{tag}-ci", "test_run", cid, "ci",
+                                {"run_id": f"{tag}-ci", "commit": sha, "passed": False})
+                    tail = "\n".join(output.splitlines()[-20:])
+                    # numbers (timings, line numbers, addresses) vary between identical failures; ignore them
+                    sig = hashlib.sha256(re.sub(r"\d+", "N", tail).encode()).hexdigest()
+                    return fail(f"judge failed: {cmd}", sig, tail, submitted=True)
+            self._apply(f"{tag}-ci", "test_run", cid, "ci", {"run_id": f"{tag}-ci", "commit": sha, "passed": True})
+            # D-038: always before the reviewer, on the builder's own lines, at exactly S (never the layer checkout)
+            mres = self._mutation_judge(t, base, sha, baseline, jw)
         mutation = mres.as_dict()
-        diff = _git(self.wt, "diff", f"{tests_commit}..{sha}")
+
+        diff = _git(twt, "diff", f"{base}..{sha}")
         try:
-            rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this change against the task. "
+            rv = self._call("reviewer", role_text(self.repo, "reviewer") + "\n\nCheck this change against the task. "
                                         "Reject shortcuts, bare-minimum work, drift from the task, and anything that "
                                         "weakens tests.\n\n" + self._task_prompt(t) + "\nDIFF:\n" + diff[:60000] +
                             self._mutation_evidence(mres) +
-                            "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW)
+                            "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW,
+                            cwd=twt)  # the task worktree is at exactly S
         except Capped:  # R37: undo the submitted run like a failed judge, but record no failure
             self._apply(f"{tag}-capped", "fail", cid, "forge-auditor")
             if self._ledger().contracts().get(cid, {}).get("status") == "failed":
                 self._apply(f"{tag}-reopen", "reopen", cid, "forge-manager")
-            _git(self.wt, "reset", "-q", "--hard", tests_commit)
-            _git(self.wt, "clean", "-q", "-fd")
+            self._reset_to(twt, base)
             raise
         if not rv.ok:
             return fail(f"reviewer output unusable: {rv.error}", f"reviewer-error:{rv.error}", submitted=True,
@@ -946,32 +1013,169 @@ class Conductor:
             return fail("review failed: " + "; ".join(reasons), "review:" + "|".join(reasons), submitted=True,
                         payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "review"})
 
-        if not self._apply(f"{tag}-pass", "pass", cid, "forge-auditor", {
-                "run_id": f"{tag}-ci", "verdict": "pass", "reasons": given, "mutation": mutation}):
-            return fail("ledger refused the pass (evidence incomplete)", "ledger-refused-pass", submitted=True,
-                        payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "review"})
-        self._update(tid, status="done", done_commit=sha)
-        self._push()
-        q = self._queue()
-        q["drift_due"] = True  # the drift keeper runs as the next step, so it can be stopped like any agent
-        self._save_queue(q)
+        # Reviewed: hand S to the crash-safe finalizer. The ledger pass is applied only there, after the push.
+        # The evidence is exactly the pass payload the build stage prepares (P1B1): verdict, reasons, mutation.
+        evidence = {"verdict": "pass", "reasons": given, "mutation": mutation}
+        Journal(self.state).begin(tid, cid, sha, base, f"{tag}-ci", {"verdict": "pass", "reasons": given}, evidence)
+        self._crash("after:journal-begin")
+        self._update(tid, status="merge_pending")
+        self._finalizer().run(tid)
 
-    def _mutation_judge(self, t: dict, tests_commit: str, sha: str, baseline: float):
-        """Layer-1 design 3.4: mutate the builder's changed in-scope lines and run the task tests on each mutant.
-        The worktree must be exactly the builder's commit afterwards (else an R13 stage error)."""
+    def _reset_to(self, wt: Path, sha: str) -> None:
+        _git(wt, "reset", "-q", "--hard", sha)
+        _git(wt, "clean", "-q", "-fd")
+
+    def _recover_interrupted(self, tid: str, cid: str, c: dict) -> dict:
+        """A contract left claimed or submitted by a crash is released, or failed and reopened, before the next
+        attempt. No failure signature: the lost attempt still counts in the ledger's attempts."""
+        n = c.get("attempts", 0)
+        if c.get("status") == "claimed":
+            self._apply(f"{cid}-recover-{n}-release", "release", cid, "forge-core")
+        else:
+            self._apply(f"{cid}-recover-{n}-fail", "fail", cid, "forge-auditor")
+            if self._ledger().contracts().get(cid, {}).get("status") == "failed":
+                self._apply(f"{cid}-recover-{n}-reopen", "reopen", cid, "forge-manager")
+        cur = self._task(tid)
+        self._update(tid, notes=cur["notes"] + ["interrupted attempt recovered"])
+        return self._ledger().contracts().get(cid, {})
+
+    # ------------------------------------------------------------------ finalization (T1B3e)
+    def _crash(self, point: str) -> None:
+        """A named crash point. Does nothing; tests override it to simulate a process dying there."""
+
+    def _reconcile_merges(self) -> None:
+        """Every step: ledger cache from its log, journal against the queue, then stale worktrees swept."""
+        led = self._ledger()
+        if led.events_path.exists() or led.head_path.exists():
+            led.reconcile()
+        self._finalizer().reconcile(self._queue()["tasks"])
+        keep = {t["id"] for t in self._queue()["tasks"] if t.get("status") in ("tests_ok", "merge_pending")}
+        self.trees.sweep(keep_tasks=keep)
+
+    def _finalizer(self) -> Finalizer:
+        return Finalizer(self.wt, self._queue()["layer"], self.trees, Journal(self.state), ApprovedMerges(self.state),
+                         self._hooks(), push=self.push)
+
+    def _hooks(self) -> Hooks:
+        def get_task(tid: str) -> dict | None:
+            return next((t for t in self._queue()["tasks"] if t["id"] == tid), None)
+
+        def set_task(tid: str, changes: dict) -> None:
+            q = self._queue()
+            for t in q["tasks"]:
+                if t["id"] == tid:
+                    t.update(changes)
+                    self._save_queue(q, durable=True)
+                    return
+            raise KeyError(tid)
+
+        def mark_drift(tid: str) -> None:  # one durable write, flushed before the journal records drift_marked
+            q = self._queue()
+            marks = [x for x in q.get("drift_marks") or [] if isinstance(x, str)]
+            if tid not in marks:
+                marks.append(tid)
+            q["drift_due"], q["drift_marks"] = True, marks
+            self._save_queue(q, durable=True)
+
+        def drift_marked(tid: str) -> bool:
+            return tid in (self._queue().get("drift_marks") or [])
+
+        def question_open(qid: str) -> bool:
+            return self._read("questions.json", {}).get(qid, {}).get("status") == "open"
+
+        def find_question(kind: str, subject: str, tid: str) -> str | None:
+            for qid, q in self._read("questions.json", {}).items():
+                if (q.get("kind") == kind and q.get("status") == "open" and q.get("task") == tid
+                        and q.get("subject") == str(subject)[:SUBJECT_CAP]):
+                    return qid
+            return None
+
+        def ledger_pass(rec: dict) -> None:
+            merges = [{"sha": c["sha"], "parents": list(c.get("parents") or []), "kind": c.get("kind"),
+                       "run_id": c.get("run_id"), "verdict": c.get("verdict"), "reasons": list(c.get("reasons") or []),
+                       "mutation": MUTATION_NA}
+                      for c in rec.get("candidates") or [] if c.get("state") == "approved"]
+            payload = dict(rec.get("evidence") or {})
+            payload.update(run_id=rec["ci_run_id"], task_commit=rec["task_sha"], final_sha=rec["final_sha"],
+                           pushed=rec["pushed"], merges=merges)
+            if not self._apply(rec["pass_pid"], "pass", rec["cid"], "forge-auditor", payload) \
+                    and self._ledger().completion(rec["cid"]) is None:
+                raise RuntimeError(f"ledger refused the pass for {rec['cid']}")
+
+        return Hooks(judge=self._merge_judge, review=self._merge_review,
+                     ask=lambda kind, subject, body, tid: self._ask(kind, subject, body, task=tid),
+                     question_open=question_open, mark_drift=mark_drift, drift_marked=drift_marked,
+                     ledger_pass=ledger_pass,
+                     ledger_completed=lambda cid: self._ledger().completion(cid) is not None,
+                     set_task=set_task, crash=self._crash, get_task=get_task, find_question=find_question)
+
+    def _candidate_record(self, sha: str) -> dict:
+        for rec in Journal(self.state).all():
+            if any(c.get("sha") == sha for c in rec.get("candidates") or []):
+                return rec
+        raise RuntimeError(f"no merge journal holds candidate {sha}")
+
+    def _merge_judge(self, sha: str) -> dict:
+        """A merge candidate is judged at exactly its commit: this task's tests, every done task's tests and
+        every judge command. Mutation testing does not apply: a merge commit adds no builder lines."""
+        rec = self._candidate_record(sha)
+        tid, cid = rec["tid"], rec["cid"]
+        tasks = self._queue()["tasks"]
+        mine = [t for t in tasks if t["id"] == tid]
+        done = [t for t in tasks if t["id"] != tid and t.get("status") == "done" and t.get("kind", "build") == "build"
+                and t.get("test_cmd")]
+        run_id = f"ci-merge-{tid}-{sha[:12]}"
+        passed, output = True, ""
+        with self.trees.throwaway(sha) as jw:
+            checks = [(f"tests of {t['id']}", lambda t=t: self._run_tests(t, cwd=jw)[:2]) for t in mine + done]
+            checks += [(cmd, lambda cmd=cmd: self._run_cmd(cmd, cwd=jw)) for cmd in self.judge_cmds]
+            for name, run in checks:
+                code, out = run()
+                if code != 0:
+                    passed, output = False, f"{name} failed:\n" + "\n".join(out.splitlines()[-20:])
+                    break
+        self._apply(run_id, "test_run", cid, "ci", {"run_id": run_id, "commit": sha, "passed": passed})
+        return {"passed": passed, "run_id": run_id, "output": output, "evidence": {"mutation": MUTATION_NA}}
+
+    def _merge_review(self, rec: dict, cand: dict) -> dict:
+        t = self._task(rec["tid"])
+        m = cand["sha"]
+        d_base = _git(self.wt, "diff", f"{cand['base']}..{m}")[:30000]
+        d_other = _git(self.wt, "diff", f"{cand['other']}..{m}")[:30000]
+        judged = (f"run {cand.get('run_id')}: {'passed' if cand.get('passed') else 'failed'}\n"
+                  f"{cand.get('judge_output') or ''}")
+        notes = "\n".join(str(n) for n in rec.get("notes") or []) or "(none)"
+        prompt = (role_text(self.repo, "reviewer") + "\n\nYou are reviewing a MERGE COMMIT created because the layer "
+                  "branch moved while this task was being finalized. Check that the merge keeps both sides' work intact, "
+                  "resolves nothing wrongly, drops nothing and weakens no tests.\n\n" + self._task_prompt(t) +
+                  f"\nMERGE COMMIT: {m} (parents {cand['base']} and {cand['other']})\n"
+                  f"\nDIFF {cand['base']}..{m} (what the merge brings to the task's side):\n{d_base}\n"
+                  f"\nDIFF {cand['other']}..{m} (what the merge brings to the other side):\n{d_other}\n"
+                  f"\nJUDGE RESULT:\n{judged}\n\nBEN'S NOTES:\n{notes}\n"
+                  "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}")
+        with self.trees.throwaway(m) as rw:
+            r = self._call("reviewer", prompt, S_REVIEW, cwd=rw)
+        if not r.ok:
+            return {"verdict": "fail", "reasons": [f"reviewer output unusable: {r.error}"]}
+        d = r.data or {}
+        return {"verdict": d.get("verdict"), "reasons": [str(x) for x in d.get("reasons") or []]}
+
+    def _mutation_judge(self, t: dict, base: str, sha: str, baseline: float, root: Path):
+        """Layer-1 design 3.4: mutate the builder's changed in-scope lines (base..sha) and run the task tests on each
+        mutant, in `root`, a throwaway worktree at exactly sha. It must be exactly sha afterwards (else an R13
+        stage error)."""
         tests = {_norm(x) for x in t["test_files"]}
-        diff = _git(self.wt, "diff", "-U0", f"{tests_commit}..{sha}")
+        diff = _git(root, "diff", "-U0", f"{base}..{sha}")
         changed = {f: lines for f, lines in changed_lines(diff).items()
                    if f not in tests and any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])}
         timeout = float(self.limits.get("test_timeout_s", 600))
-        mres = run_mutation(self.wt, changed,
+        mres = run_mutation(root, changed,
                             [sys.executable, "-m", "unittest", *(parse_test_cmd(t["test_cmd"], t["test_files"]) or [])],
                             mutation_min=float(self.limits.get("mutation_min", 0.8)),
                             budget_s=float(self.limits.get("mutation_budget_s", self.limits.get("test_timeout_s", 600))),
                             per_mutant_timeout_s=min(timeout, max(5.0, 3 * baseline)))
-        if self._changed():
-            _git(self.wt, "reset", "-q", "--hard", sha)
-            _git(self.wt, "clean", "-q", "-fd")
+        if self._changed(cwd=root) or _git(root, "rev-parse", "HEAD") != sha:
+            self._reset_to(root, sha)
             raise RuntimeError("mutation left changes")
         return mres
 
@@ -1012,13 +1216,14 @@ class Conductor:
     def _troubleshoot(self, tid: str, reason: str, output: str) -> None:
         t = self._task(tid)
         self._reset_wt()
-        prompt = ("You are the TROUBLESHOOTER. The builder is stuck on this task. Diagnose the cause and give "
+        prompt = (role_text(self.repo, "troubleshooter") + "\n\nThe builder is stuck on this task. Diagnose the cause and give "
                   "concrete notes the next builder attempt can follow. If this route is a dead end, say so and "
                   "name the alternative.\n\n" + self._task_prompt(t) +
                   "\nRECENT FAILURES:\n" + "\n".join(t["notes"][-6:]) +
                   "\n\nLAST JUDGE OUTPUT:\n" + output[-4000:] +
                   "\nAnswer with JSON: {\"kind\": \"fix\" | \"dead_end\", \"notes\": \"...\", \"alternative\": \"...\"}")
-        r = self._call("troubleshooter", prompt, S_TROUBLE)
+        with self.trees.throwaway(_git(self.wt, "rev-parse", "HEAD")) as tw:  # scratch: its edits are discarded
+            r = self._call("troubleshooter", prompt, S_TROUBLE, cwd=tw)
         self._reset_wt()
         notes = t.get("trouble_notes", [])
         if r.ok:
@@ -1039,7 +1244,7 @@ class Conductor:
         design = self.wt / "docs" / "specs" / "layer-1-design.md"
         text = design.read_text(encoding="utf-8") if design.exists() else "(no design file)"
         listing = "\n".join(f"- {t['id']} [{t['status']}] {t['title']}" for t in q["tasks"])
-        r = self._call("drift_keeper", "You are the DRIFT KEEPER (read-only). Is this work still on course for "
+        r = self._call("drift_keeper", role_text(self.repo, "drift_keeper") + "\n\nIs this work still on course for "
                                        "the design? Say replan only if it is drifting.\n\nTASKS:\n" + listing +
                        "\n\nDESIGN:\n" + text[:40000] +
                        "\nAnswer with JSON: {\"status\": \"ok\" | \"replan\", \"reasons\": [...]}", S_DRIFT)
@@ -1071,7 +1276,7 @@ class Conductor:
         self._reset_wt()
         plan_file = _norm(t["plan_file"])
         try:
-            r = self._call("planner", "You are the PLANNER. Write the implementation plan to " + plan_file +
+            r = self._call("planner", role_text(self.repo, "planner") + "\n\nWrite the implementation plan to " + plan_file +
                            " (and no other file), then return its tasks.\n\n" + self._task_prompt(t) +
                            "\nEach task needs: id, title, section, files_in_scope, test_files, test_cmd.\n"
                            "Answer with JSON: {\"tasks\": [...]}", S_PLAN)
@@ -1099,7 +1304,7 @@ class Conductor:
         if not reason:
             plan_text = (self.wt / plan_file).read_text(encoding="utf-8")
             try:
-                rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this plan against the task and "
+                rv = self._call("reviewer", role_text(self.repo, "reviewer") + "\n\nCheck this plan against the task and "
                                             "design: complete, testable, no placeholders, no drift.\n\n" +
                                 self._task_prompt(t) + "\nPLAN:\n" + plan_text[:60000] + "\nTASKS JSON:\n" +
                                 json.dumps(tasks)[:20000] +

@@ -224,7 +224,8 @@ class JudgePipelineTests(Harness):
         real = bootstrap.run_mutation
 
         def spy(root, changed, argv, **kw):
-            calls.append((root, changed, argv, kw))
+            calls.append((root, changed, argv, kw, git(root, "rev-parse", "HEAD"),
+                          (root / "feat.py").read_text(encoding="utf-8")))
             return real(root, changed, argv, **kw)
 
         c = self.init(agents={"test_writer": self.write_tests, "builder": self.build_feature},
@@ -233,8 +234,14 @@ class JudgePipelineTests(Harness):
         with patch.object(bootstrap, "run_mutation", side_effect=spy):
             c.step()
         self.assertEqual(len(calls), 1)
-        root, changed, argv, kw = calls[0]
-        self.assertEqual(root, c.wt)
+        root, changed, argv, kw, head, feat = calls[0]
+        # T1B3b: the mutation judge runs where the code is, a throwaway worktree at exactly the task commit S,
+        # never the layer checkout; the throwaway is gone afterwards
+        self.assertNotEqual(root, c.wt)
+        self.assertEqual(root.parent, c.work / "tmp")
+        self.assertEqual(head, self.queue_task()["done_commit"])
+        self.assertEqual(feat, "VALUE = 42\n")
+        self.assertFalse(root.exists())
         self.assertEqual(changed, {"feat.py": {1}})
         self.assertEqual(argv[1:], ["-m", "unittest", "tests/core/test_feat.py"])
         self.assertEqual(kw["mutation_min"], 0.5)
@@ -259,6 +266,52 @@ class JudgePipelineTests(Harness):
         self.assertNotEqual(t["status"], "done")
         self.assertTrue(any("mutation left changes" in n for n in t["notes"]), t["notes"])
         self.assertFalse((c.wt / "junk.txt").exists())
+        tmp = c.work / "tmp"
+        self.assertEqual(list(tmp.iterdir()) if tmp.exists() else [], [])  # the throwaway is gone too
+
+    # integration of P1B1 with the worktrees and the finalizer (T1B3b/T1B3e)
+    def test_task_tests_run_at_exact_commit_in_throwaway(self):
+        seen = []
+        real = bootstrap.Conductor._exec_tests
+
+        def spy(self_, t, cwd=None):
+            where = cwd or self_.wt
+            seen.append((where, git(where, "rev-parse", "HEAD"), (where / "feat.py").exists()))
+            return real(self_, t, cwd=cwd)
+
+        c = self.init(agents={"test_writer": self.write_tests, "builder": self.build_feature})
+        c.step()
+        stage_a = git(c.wt, "rev-parse", "HEAD")
+        with patch.object(bootstrap.Conductor, "_exec_tests", spy):
+            c.step()
+        t = self.queue_task()
+        self.assertEqual(t["status"], "done")
+        build_runs = [s for s in seen if s[0] != c.wt]
+        self.assertTrue(build_runs)
+        where, head, has_feat = build_runs[0]
+        self.assertEqual(where.parent, c.work / "tmp")
+        self.assertEqual(head, t["done_commit"])
+        self.assertNotEqual(head, stage_a)
+        self.assertTrue(has_feat)
+        self.assertFalse(where.exists())
+
+    def test_finalizer_pass_evidence_keeps_mutation_evidence(self):
+        c = self.init(agents={"test_writer": self.write_tests, "builder": self.build_feature,
+                              "reviewer": self.reviewer(reasons=["ok"])})
+        c.step()
+        c.step()
+        t = self.queue_task()
+        self.assertEqual(t["status"], "done")
+        passes = self.events("pass")
+        self.assertEqual(len(passes), 1)
+        payload = passes[0]["payload"]
+        self.assertEqual(payload["verdict"], "pass")
+        self.assertEqual(payload["reasons"], ["ok"])
+        self.assertTrue(payload["mutation"]["passed"])
+        self.assertEqual(payload["mutation"]["survivors"], [])
+        self.assertEqual(payload["task_commit"], t["done_commit"])
+        self.assertTrue(payload["final_sha"])
+        self.assertEqual(payload["merges"], [])
 
 
 if __name__ == "__main__":
