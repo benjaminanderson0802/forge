@@ -21,12 +21,25 @@ Rules enforced:
     attempt, showing no protected-file changes and no out-of-scope edits
   * false claims: an executor that said "done" and then fails its audit is
     recorded, so the Learner gets clean data
+  * crash recovery: the event log is the truth and the other files are a
+    cache of it. apply() writes ledger/head.json (the hash of the event it
+    is about to append) before any cache file and appends the event last,
+    so a crash at any point leaves a head marker that disagrees with the
+    log; the next apply() (or reconcile()) then rebuilds the cache from the
+    log before deciding anything. A torn last log line is dropped; a bad
+    line anywhere else freezes the ledger.
+  * completion is event-backed: completion(cid) reads the "pass" event from
+    the log, never the contract cache
+  * merge evidence: a "pass" may carry task_commit, final_sha and merges,
+    each merge backed by a CI run recorded for its exact sha
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -62,6 +75,10 @@ CONTRACT_FIELDS = {
 }
 
 
+_SHA40 = re.compile(r"[0-9a-f]{40}")
+MERGE_KINDS = {"local", "divergence"}
+
+
 class Rejected(Exception):
     """A proposal was refused. The ledger is unchanged."""
 
@@ -90,6 +107,7 @@ class Ledger:
         self.kill_path = self.root / "ledger" / "KILL"
         self.spec_state_path = self.root / "ledger" / "spec.json"
         self.reports_path = self.root / "ledger" / "run_reports.json"
+        self.head_path = self.root / "ledger" / "head.json"
         self.spec_file = self.root / SPEC_FILE
         self._replaying = False  # replay re-checks rules, not today's files on disk
 
@@ -177,6 +195,12 @@ class Ledger:
     # ---------- applying ----------
     def apply(self, proposal: dict, identity: str) -> dict:
         """Validate and apply one proposal. Raises Rejected on any problem."""
+        if not self._replaying:
+            # self-heal before any decision: a cache that got ahead of the log
+            # (crash before the event landed) is rebuilt from the log first
+            self.repair_tail()
+            if self._read_head() != self._last_hash():
+                self.rebuild()
         if self.kill_path.exists():
             raise Rejected("kill switch is on: no changes accepted")
         if not isinstance(proposal, dict):
@@ -268,6 +292,7 @@ class Ledger:
                     raise Rejected("pass needs the core's run report for this attempt")
                 if rep["violations"] or rep["out_of_scope"]:
                     raise Rejected("pass refused: this attempt changed protected or out-of-scope files")
+                self._check_merge_evidence(cid, c, payload, runs)
             if action == "fail":
                 rep = reports.get(cid)
                 if rep and rep["attempt"] == c["attempts"] and rep.get("claim") == "done":
@@ -298,35 +323,200 @@ class Ledger:
             body["note"] = note
         event = dict(body, hash=_hash(body))
 
-        # write order: state files first, event last. If we crash before the
-        # event lands, replay() rebuilds state from events and the proposal is
-        # simply applied again (idempotency key not yet recorded).
+        # write order: head marker first, then the state files, event last.
+        # The marker names an event that is not in the log yet, so a crash
+        # anywhere before the append leaves marker != log head, and the next
+        # apply() rebuilds the cache from the log before deciding anything;
+        # the proposal is then simply applied again (its id never landed).
+        self._write_cache(contracts, runs, reports, spec_state, event["hash"])
+        self._append_event(event)
+        return {"status": "applied", "contract": contracts.get(cid), "note": note}
+
+    def _write_cache(self, contracts: dict, runs: dict, reports: dict, spec_state: dict, head: str) -> None:
+        _atomic_write(self.head_path, json.dumps({"hash": head}, indent=2, sort_keys=True))
         _atomic_write(self.contracts_path, json.dumps(contracts, indent=2, sort_keys=True))
         _atomic_write(self.runs_path, json.dumps(runs, indent=2, sort_keys=True))
         _atomic_write(self.reports_path, json.dumps(reports, indent=2, sort_keys=True))
         _atomic_write(self.spec_state_path, json.dumps(spec_state, indent=2, sort_keys=True))
-        with self.events_path.open("a", encoding="utf-8") as f:
+
+    def _append_event(self, event: dict) -> None:
+        """Append one event line to the log and fsync it. The only writer of events.jsonl."""
+        with self.events_path.open("a", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(event, sort_keys=True) + "\n")
             f.flush()
             os.fsync(f.fileno())
-        return {"status": "applied", "contract": contracts.get(cid), "note": note}
+
+    @staticmethod
+    def _check_merge_evidence(cid: str, c: dict, payload: dict, runs: dict) -> None:
+        """Optional merge evidence on a pass. Absent (or null) fields are not checked."""
+        def bad(why: str):
+            raise Rejected(f"pass merge evidence incomplete: {why}")
+
+        def sha40(v) -> bool:
+            return isinstance(v, str) and _SHA40.fullmatch(v) is not None
+
+        def strs(v) -> bool:
+            return isinstance(v, list) and all(isinstance(x, str) for x in v)
+
+        task_commit = payload.get("task_commit")
+        if task_commit is not None and (not isinstance(task_commit, str) or task_commit != c["commit"]):
+            bad("task_commit is not the submitted commit")
+        final_sha = payload.get("final_sha")
+        if final_sha is not None and not sha40(final_sha):
+            bad("final_sha must be a 40-character lowercase hex sha")
+        merges = payload.get("merges")
+        if merges is None:
+            return
+        if not isinstance(merges, list):
+            bad("merges must be a list")
+        if merges and final_sha is None:
+            bad("merges need final_sha")
+        for i, m in enumerate(merges):
+            if not isinstance(m, dict):
+                bad(f"merge {i} must be an object")
+            if not sha40(m.get("sha")):
+                bad(f"merge {i} sha must be a 40-character lowercase hex sha")
+            if not strs(m.get("parents")):
+                bad(f"merge {i} parents must be a list of text")
+            if m.get("kind") not in MERGE_KINDS:
+                bad(f"merge {i} kind must be one of {sorted(MERGE_KINDS)}")
+            if not isinstance(m.get("run_id"), str):
+                bad(f"merge {i} needs run_id")
+            if m.get("verdict") != "pass":
+                bad(f"merge {i} verdict is not pass")
+            if not strs(m.get("reasons")):
+                bad(f"merge {i} reasons must be a list of text")
+            run = runs.get(m["run_id"])
+            if not run or run["contract_id"] != cid or run["commit"] != m["sha"] or run["passed"] is not True:
+                bad(f"merge {i} needs a CI-recorded passing test run for {m['sha']}")
+
+    # ---------- recovery ----------
+    def _read_head(self):
+        """The hash in head.json, or None if it is missing or unreadable."""
+        try:
+            data = json.loads(self.head_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data.get("hash") if isinstance(data, dict) else None
+
+    def _last_hash(self) -> str:
+        evs = self.events()
+        return evs[-1]["hash"] if evs else "genesis"
+
+    def repair_tail(self) -> bool:
+        """Drop a torn last line of events.jsonl (an append that never completed).
+
+        Returns True if something was dropped. A bad line anywhere before the
+        last raises Rejected: nothing is dropped silently.
+        """
+        if not self.events_path.exists():
+            return False
+        data = self.events_path.read_bytes()
+        if not data:
+            return False
+        lines = data.split(b"\n")  # the piece after the final newline is b"" when terminated
+        def ok(raw: bytes) -> bool:
+            if not raw.strip():
+                return True
+            try:
+                json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                return False
+            return True
+        complete, tail = lines[:-1], lines[-1]
+        last_bad = False
+        if tail:
+            last_bad = True  # not newline-terminated: the append never completed
+        else:
+            # the last non-blank complete line must parse
+            idx = max((i for i, l in enumerate(complete) if l.strip()), default=None)
+            if idx is not None and not ok(complete[idx]):
+                last_bad = True
+                complete = complete[:idx]  # only blank lines followed it
+        if not all(ok(l) for l in complete):
+            raise Rejected("event log corrupt")
+        if not last_bad:
+            return False
+        keep = sum(len(l) + 1 for l in complete)
+        with self.events_path.open("r+b") as f:
+            f.truncate(keep)
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+
+    def derive(self) -> dict:
+        """Replay every event into a fresh ledger in a temporary folder.
+
+        Returns what the cache files should hold. Never writes to this ledger.
+        """
+        if not self.verify_chain():
+            raise Rejected("event log hash chain is broken")
+        events = self.events()
+        tmp = Path(tempfile.mkdtemp(prefix="forge-derive-"))
+        try:
+            if self.roles_path.exists():
+                shutil.copyfile(self.roles_path, tmp / "roles.json")
+            led = Ledger(tmp)
+            led._replaying = True
+            for e in events:
+                led.apply({"proposal_id": e["proposal_id"], "action": e["action"],
+                           "contract_id": e["contract_id"], "payload": e["payload"]}, e["identity"])
+                if led._last_hash() != e["hash"]:
+                    raise Rejected(f"event log does not replay: event {e['proposal_id']!r} came out different")
+            return {"contracts": led.contracts(), "test_runs": led.test_runs(), "reports": led.reports(),
+                    "spec_state": led._read_json(led.spec_state_path, {}), "head": led._last_hash()}
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def rebuild(self) -> None:
+        """Rewrite every cache file (and head.json) from the event log.
+
+        Never truncates or rewrites events.jsonl beyond repair_tail, so a crash
+        at any point leaves the events intact. The head marker is removed
+        first and written last, so a crash inside rebuild is noticed later.
+        """
+        self.repair_tail()
+        d = self.derive()
+        self.head_path.unlink(missing_ok=True)
+        _atomic_write(self.contracts_path, json.dumps(d["contracts"], indent=2, sort_keys=True))
+        _atomic_write(self.runs_path, json.dumps(d["test_runs"], indent=2, sort_keys=True))
+        _atomic_write(self.reports_path, json.dumps(d["reports"], indent=2, sort_keys=True))
+        _atomic_write(self.spec_state_path, json.dumps(d["spec_state"], indent=2, sort_keys=True))
+        _atomic_write(self.head_path, json.dumps({"hash": d["head"]}, indent=2, sort_keys=True))
+
+    def reconcile(self) -> bool:
+        """Check the cache against the log; rebuild it if anything differs. True if rebuilt."""
+        self.repair_tail()
+        if not self.verify_chain():
+            raise Rejected("event log hash chain is broken")
+        d = self.derive()
+        stale = self._read_head() != d["head"]
+        for path, key in ((self.contracts_path, "contracts"), (self.runs_path, "test_runs"),
+                          (self.reports_path, "reports"), (self.spec_state_path, "spec_state")):
+            try:
+                on_disk = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                on_disk = None
+            if on_disk != d[key]:
+                stale = True
+        if stale:
+            self.rebuild()
+        return stale
+
+    def completion(self, cid: str) -> dict | None:
+        """The "pass" event for contract cid, read from the event log, or None.
+
+        This is the only way to decide that a contract is complete; the
+        contract cache can be ahead of the log after a crash.
+        """
+        self.repair_tail()
+        if not self.verify_chain():
+            raise Rejected("event log hash chain is broken")
+        for e in reversed(self.events()):
+            if e.get("action") == "pass" and e.get("contract_id") == cid:
+                return e
+        return None
 
     def replay(self) -> None:
-        """Rebuild contracts and test runs purely from the event log.
-
-        Used after any crash: the event log is the source of truth, the state
-        files are a cache of it.
-        """
-        events = self.events()
-        _atomic_write(self.contracts_path, "{}")
-        _atomic_write(self.runs_path, "{}")
-        _atomic_write(self.reports_path, "{}")
-        _atomic_write(self.spec_state_path, "{}")
-        self.events_path.write_text("", encoding="utf-8")
-        self._replaying = True
-        try:
-            for e in events:
-                self.apply({"proposal_id": e["proposal_id"], "action": e["action"],
-                            "contract_id": e["contract_id"], "payload": e["payload"]}, e["identity"])
-        finally:
-            self._replaying = False
+        """Rebuild the cache files purely from the event log (see rebuild())."""
+        self.rebuild()
