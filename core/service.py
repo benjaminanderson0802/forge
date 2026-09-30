@@ -327,11 +327,64 @@ def snapshot(bootstrap_state: Path, root: Path, limits: dict, now: datetime | No
     return snap
 
 
+# ------------------------------------------------------------------ watchdog (T1D4)
+TASK_NAME = "Forge conductor"
+
+
+def _lock_free(bootstrap_state: Path) -> bool:
+    from core.bootstrap import acquire_lock
+    h = acquire_lock(Path(bootstrap_state))
+    if h is None:
+        return False
+    h.close()
+    return True
+
+
+def _run_hidden(args: list[str]) -> int:
+    kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
+    return subprocess.run(args, capture_output=True, timeout=60, **kw).returncode
+
+
+def watchdog(forge: Path, limits: dict, *, now: float | None = None,
+             lock_free: Callable[[], bool] | None = None, run: Callable[[list[str]], int] | None = None) -> str:
+    """Every 5 minutes. A dead service (lock free, heartbeat stale) is started; a hung one (lock still held,
+    heartbeat stale) is ended and started, because while its task instance runs the task's own 5-minute
+    trigger is ignored. Never acts while KILL is set, and never on a lock holder that wrote no heartbeat."""
+    st, root = Path(forge) / "state" / "bootstrap", Path(forge) / "state" / "service"
+    now = time.time() if now is None else now
+    lock_free = lock_free or (lambda: _lock_free(st))
+    run = run or _run_hidden
+    if (st / "KILL").exists():
+        return "stopped"
+    hb = _read_json(root / "heartbeat.json", {})
+    at = hb.get("at") if isinstance(hb, dict) else None
+    if isinstance(at, (int, float)) and hb.get("phase") != "exited" and \
+            0 <= now - at <= setting(limits, "heartbeat_stale_s"):
+        return "ok"
+
+    def do(args: list[str]) -> None:
+        try:
+            run(args)
+        except (OSError, subprocess.SubprocessError) as e:
+            _log(root, f"watchdog: {' '.join(args)} failed: {e!r}")
+
+    if lock_free():
+        _log(root, "watchdog: the service is not running; starting it")
+        do(["schtasks", "/Run", "/TN", TASK_NAME])
+        return "started"
+    if not isinstance(at, (int, float)):
+        return "unknown"
+    _log(root, f"watchdog: heartbeat is {int(now - at)} s old but the lock is held; ending and restarting the task")
+    do(["schtasks", "/End", "/TN", TASK_NAME])
+    do(["schtasks", "/Run", "/TN", TASK_NAME])
+    return "restarted"
+
+
 # ------------------------------------------------------------------ command line
 def main(argv: list[str], forge: Path | None = None) -> int:
     forge = Path(forge) if forge else Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser(prog="python -m core.service")
-    ap.add_argument("cmd", choices=["status", "stop", "wake"])
+    ap.add_argument("cmd", choices=["status", "stop", "wake", "watchdog"])
     ap.add_argument("--reason", default="stopped from the command line")
     a = ap.parse_args(argv)
     st, root = forge / "state" / "bootstrap", forge / "state" / "service"
@@ -345,6 +398,11 @@ def main(argv: list[str], forge: Path | None = None) -> int:
         print("Forge is stopped. Nothing new will start. Run Start Forge to resume.")
     elif a.cmd == "wake":
         wake(root)
+    elif a.cmd == "watchdog":
+        try:
+            print(watchdog(forge, limits))
+        except Exception as e:  # noqa: BLE001 - a scheduled task with no one to read a traceback
+            _log(root, f"watchdog error: {e!r}")
     else:
         print(json.dumps(snapshot(st, root, limits), indent=2, default=str))
     return 0

@@ -315,3 +315,13 @@ The first run with real agents and real email hit four faults no fake-based test
   - **If PAUSED is set:** the conductor only waits. It reads the inbox every minute (answers can clear the pause), writes its heartbeat, and runs no smoke test and no agents.
   - **When the pause clears:** it goes on to the smoke test (if stale) and then the loop.
   - **If KILL appears** while waiting, it exits.
+
+## Layer 1D amendments: the always-on service (2026-09-30)
+
+Plan: `docs/superpowers/plans/2026-09-30-layer-1d.md`. Module: `core/service.py`.
+
+- **R41 KILL works mid-cycle.** KILL is checked before every agent launch (`_call` and `_guarded_run`), not only at the start of `step()`. A real agent is given the KILL check (`should_stop`), and `launch` polls it every 2 seconds; when KILL appears, the agent's process tree is killed. Both raise `Killed`, a subclass of `Capped`, so every stage undoes the attempt exactly as for a cap (R37) and nothing counts as a failure. If KILL is the *only* file that changed during a run, it is a stop, not tampering (no alarm); any other change is still tampering (R9). `run()` returns `"killed"` right after any step that ended with KILL set. A KILL during the smoke test is not a smoke failure.
+- **R42 Limit windows are caps.** An agent error saying its plan limit is used up ("You've hit your session limit · resets 6am (America/Chicago)") puts that provider on hold until the reset (1 hour if the time can't be read; between 5 minutes and 24 hours). `Meter.over` is true while held, so nothing for that provider is launched, and the attempt is undone like R37, never recorded as a failure.
+- **R43 Launches per day are capped.** `limits["agent_runs_per_day"]` caps all providers by the number of agent launches today (UTC), counted from `state/runs/`.
+- **R44 The service.** `main run` starts a heartbeat thread writing `state/service/heartbeat.json` (outside `state/bootstrap/`, so it never trips R14) and runs the loop through `service.Service.serve()`: sleeps end within 2 seconds on KILL or on `state/service/WAKE`; while Ben is active (input in the last 10 minutes, or unknown) there is a pause of `active_step_gap_s` (30 s) after every work step; `state/service/status.json` is written after every step. One step running longer than `step_stall_s` (4 hours) kills the process tree and exits, so the task restarts it and crash recovery resumes.
+- **R45 Watchdog.** The "Forge watchdog" task runs `python -m core.service watchdog` every 5 minutes. KILL set: nothing. Heartbeat fresh: nothing. Stale heartbeat and the conductor lock free: `schtasks /Run`. Stale heartbeat and the lock held: `schtasks /End` then `/Run`. A lock held with no heartbeat file is left alone.
