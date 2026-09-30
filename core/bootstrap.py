@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -24,6 +25,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from core import coverage as cov_mod
+from core import drift as drift_mod
+from core import manager as manager_mod
 from core import readiness
 from core.finalize import ApprovedMerges, Finalizer, Hooks, Journal, safe_push
 from core.ledger import Ledger, Rejected
@@ -197,7 +201,7 @@ class Conductor:
                  owner_email: str, mailer: Callable[[str, str], None], inbox: Callable[[], list[dict]],
                  gh: Callable[[list[str]], tuple[int, str]], clock: Callable[[], datetime] | None = None,
                  judge_cmds: list[str] | None = None, push: bool = True,
-                 checks: dict | None = None, probes: dict | None = None):
+                 checks: dict | None = None, probes: dict | None = None, manager=None):
         self.repo, self.work, self.state = Path(repo), Path(work), Path(state)
         self.team, self.limits = team, limits
         self.owner = owner_email.strip().lower()
@@ -212,6 +216,8 @@ class Conductor:
         self.probes = dict(real_probes(limits) if probes is None else probes)
         self.diagnose_probe = None  # None: readiness' own hidden probe (docker ps for n8n); tests inject fakes
         self.diagnose_which = None
+        self.manager = manager  # T1C5: the read-only Manager; None keeps the pause-and-ask re-plan
+        self.last_run_s = 0.0  # T1C4: duration of the last guarded agent run, on the conductor clock
 
     # ------------------------------------------------------------------ files
     def _read(self, name: str, default):
@@ -343,16 +349,38 @@ class Conductor:
             raise RuntimeError(f"push {status}: {out[:300]}")
 
     # ------------------------------------------------------------------ agents
-    def _call(self, role: str, prompt: str, schema: dict | None, cwd: Path | None = None, needs=None):
-        agent = getattr(self.team, role)
+    def _call(self, role: str, prompt: str, schema: dict | None, cwd: Path | None = None, needs=None,
+              timeout_s: float | None = None):
+        agent = self._agent(role)
         provider = getattr(agent, "provider", None)
         if provider and self.meter.over(provider, self.limits):  # R37: checked before every launch
             raise Capped(provider)
         self._launch_gate(provider, needs)
         prompt = prompt + self._prompt_blocks(role)
-        return self._guarded_run(role, agent, prompt, cwd, schema)
+        return self._guarded_run(role, agent, prompt, cwd, schema, timeout_s=timeout_s)
 
-    def _guarded_run(self, label: str, agent, prompt: str, cwd: Path | None, schema: dict | None):
+    def _agent(self, role: str):
+        """T1C5: the Manager is a separate, optional member (Team keeps its fixed six roles)."""
+        return getattr(self, "manager", None) if role == "manager" else getattr(self.team, role)
+
+    @staticmethod
+    def _takes_timeout(agent) -> bool:
+        try:
+            return "timeout_s" in inspect.signature(agent.run).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _activity(self) -> drift_mod.Activity:
+        return drift_mod.Activity(self.state)
+
+    def _since(self, t0: datetime) -> float:
+        try:
+            return max(0.0, (self.clock() - t0).total_seconds())
+        except (TypeError, OverflowError):
+            return 0.0
+
+    def _guarded_run(self, label: str, agent, prompt: str, cwd: Path | None, schema: dict | None,
+                     timeout_s: float | None = None):
         """R14/R15 guarded agent run: run record, fingerprint before and after, KILL on tamper, metering."""
         role = label
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + role + "-" + uuid.uuid4().hex[:6]
@@ -368,11 +396,16 @@ class Conductor:
             raise RuntimeError("state file unreadable before agent run: " + ", ".join(unreadable))
         if not before.get(LOCK_NAME, "lock:0:").startswith("lock:0:"):  # R15: only an empty lock is trusted
             raise RuntimeError(f"state file {LOCK_NAME} is not empty before agent run")
+        # T1C4: a deadline (the builder's remaining focus time) is passed to agents that accept one; the run's
+        # duration on the conductor clock is recorded as active time (never for readiness probes).
+        extra = {"timeout_s": timeout_s} if timeout_s is not None and self._takes_timeout(agent) else {}
+        t0 = self.clock()
         try:
-            r = agent.run(prompt, Path(cwd) if cwd else self.wt, schema)
+            r = agent.run(prompt, Path(cwd) if cwd else self.wt, schema, **extra)
         except Exception as e:  # noqa: BLE001 - an agent crash is a failed result
             from core.agents import AgentResult
             r = AgentResult("", 0, False, repr(e), None, getattr(agent, "provider", "unknown"))
+        self.last_run_s = self._since(t0)
         try:
             after = self._fingerprint()
             changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
@@ -390,6 +423,8 @@ class Conductor:
             raise Tampered(", ".join(changed))
         if r.tokens:
             self.meter.add(r.provider or "unknown", r.tokens)
+        if not label.startswith("probe-"):  # after the tamper comparison, like the meter (R14)
+            self._activity().add(self.last_run_s)
         (d / "output.json").write_bytes(json.dumps({"ok": r.ok, "error": r.error, "text": r.text, "data": r.data,
                                                     "tokens": r.tokens, "provider": r.provider},
                                                    indent=2).encode("utf-8"))
@@ -524,7 +559,7 @@ class Conductor:
         return self._cap_map()
 
     def _requirements(self, role: str, task: dict | None = None) -> set[str]:
-        provider = getattr(getattr(self.team, role), "provider", None)
+        provider = getattr(self._agent(role), "provider", None)
         return readiness.requirements(provider, (task.get("needs") or []) if role == "builder" and task else None)
 
     def _unready(self, names, cap_map: dict | None = None) -> dict[str, str]:
@@ -1002,6 +1037,7 @@ class Conductor:
                     t["fail_signatures"], t["fails_since"], t["troubleshot"], t["troubleshoots"] = [], 0, False, 0
                     t["test_rejects"] = 0
                     t["plan_rejects"] = 0
+                    t["focus_s"] = 0
             self._save_queue(qd)
         elif q["kind"] == "merge":  # the only thing that retries a blocked merge record
             Journal(self.state).unblock(qid, body.strip()[:NOTE_CAP])
@@ -1082,7 +1118,12 @@ class Conductor:
         q = self._queue()
         cap_map = self._cap_map()
         self._waiting = False
-        if q.get("drift_due"):
+        try:  # T1C5: merges are recorded before any stall threshold is checked (plain code, no agent)
+            dstate, deferred = self._drift_bookkeeping(q)
+        except (RuntimeError, OSError, Rejected) as e:
+            self._log(f"drift bookkeeping error: {e!r}"[:500])
+            return "error"
+        if (q.get("drift_due") or dstate.get("stall")) and not deferred:
             if self.ready_for("drift_keeper", cap_map=cap_map):
                 self._waiting = True  # the gate stays closed while drift_due is set
             else:
@@ -1113,6 +1154,22 @@ class Conductor:
                     self._log(f"finalize error on {tid}: {e!r}")
                     return "error"
                 return "worked"
+        if (drift_mod.load(self.state) or {}).get("replan"):  # T1C5: a pending re-plan comes before new work
+            if getattr(self, "manager", None) is not None and self.ready_for("manager", cap_map=cap_map):
+                return "not_ready"
+            try:
+                self._ensure_worktree(q["layer"])
+                self._replan_stage()
+            except Capped:
+                return "capped"
+            except NotReady:
+                return "not_ready"
+            except Tampered:
+                return "killed"
+            except (RuntimeError, OSError, Rejected) as e:  # R13: the re-plan stays pending
+                self._log(f"replan error: {e!r}"[:500])
+                return "error"
+            return "worked"
         for t in self._pick_tasks(q, cap_map):
             try:
                 self._ensure_worktree(q["layer"])
@@ -1142,6 +1199,7 @@ class Conductor:
         tasks = q["tasks"]
         qs = self._read("questions.json", {})
         if tasks and all(t["status"] == "done" for t in tasks) and not q.get("drift_due") \
+                and not self._drift_busy() \
                 and not any(v["kind"] == "gate" for v in qs.values()) \
                 and not any(r.get("status") in ("active", "blocked") for r in Journal(self.state).all()):
             if self._gate_ready(cap_map):  # the gate needs git and github
@@ -1221,6 +1279,7 @@ class Conductor:
         import tempfile
         cache = tempfile.mkdtemp(prefix="forge-pyc-")
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPYCACHEPREFIX=cache)
+        t0 = self.clock()
         try:
             p = subprocess.run([sys.executable, "-m", "unittest", *paths], cwd=str(cwd or self.wt), capture_output=True,
                                text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
@@ -1230,6 +1289,7 @@ class Conductor:
             return 124, "test command timed out", True
         finally:
             shutil.rmtree(cache, ignore_errors=True)
+            self._activity().add(self._since(t0))  # T1C4: judges are active work
 
     def _run_tests_on_stub(self, t: dict) -> tuple[int, str, bool]:
         """The empty-implementation run of Stage A (always the real runner, isolated bytecode cache). Stage A works
@@ -1292,6 +1352,13 @@ class Conductor:
         return None
 
     def _run_cmd(self, cmd: str, cwd: Path | None = None) -> tuple[int, str]:
+        t0 = self.clock()
+        try:
+            return self._run_cmd_timed(cmd, cwd)
+        finally:
+            self._activity().add(self._since(t0))  # T1C4: judges are active work
+
+    def _run_cmd_timed(self, cmd: str, cwd: Path | None = None) -> tuple[int, str]:
         try:
             p = subprocess.run(cmd, shell=True, cwd=str(cwd or self.wt), capture_output=True, text=True, encoding="utf-8",
                                errors="replace", stdin=subprocess.DEVNULL,
@@ -1372,6 +1439,11 @@ class Conductor:
         if pending:  # R38: deferred troubleshooting comes before any further builder attempt
             self._troubleshoot(tid, str(pending.get("reason", "")), str(pending.get("output", "")))
             return
+        focus_limit = self._focus_limit()
+        used = self._focus_used(t)
+        if used >= focus_limit:  # D-026: the budget is spent (e.g. no handoff recorded yet): hand off, launch nothing
+            self._after_failure(tid, self._focus_reason(focus_limit), "focus-limit", "", handoff=True, focus=True)
+            return
         cid = t["id"]
         led = self._ledger()
         if cid not in led.contracts():
@@ -1402,12 +1474,15 @@ class Conductor:
                    "actually tried), \"error\" (the real error output), \"capability\" (the capability-map name you "
                    "need, or a new short name) and \"meanwhile\" (what you will work on instead); without all four "
                    "it is rejected as an easy way out.")
+        remaining = focus_limit - used
         try:
-            r = self._call("builder", prompt, S_BUILD, cwd=twt, needs=t.get("needs") or [])
+            r = self._call("builder", prompt, S_BUILD, cwd=twt, needs=t.get("needs") or [], timeout_s=remaining)
         except (Capped, NotReady):  # R37: release the claim and undo, no failure recorded
             self._apply(f"{tag}-release", "release", cid, "forge-core")
             self._reset_to(twt, base)
             raise
+        spent = self.last_run_s  # D-026 focus time: builder run time only, never waits or probes
+        self._update(tid, focus_s=used + spent)
 
         tests = [_norm(x) for x in t["test_files"]]
         changed = self._changed(cwd=twt)
@@ -1419,7 +1494,7 @@ class Conductor:
         out_of_scope = [f for f in changed if not any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])]
 
         def fail(reason: str, sig: str, output: str = "", submitted: bool = False,
-                 payload: dict | None = None, handoff: bool = False) -> None:
+                 payload: dict | None = None, handoff: bool = False, focus: bool = False) -> None:
             self._reset_to(twt, base)
             if submitted:
                 self._apply(f"{tag}-fail", "fail", cid, "forge-auditor", payload)
@@ -1427,8 +1502,14 @@ class Conductor:
                 self._apply(f"{tag}-release", "release", cid, "forge-core")
             if self._ledger().contracts().get(cid, {}).get("status") == "failed":
                 self._apply(f"{tag}-reopen", "reopen", cid, "forge-manager")
-            self._after_failure(tid, reason, sig, output, handoff=handoff)
+            self._after_failure(tid, reason, sig, output, handoff=handoff, focus=focus)
 
+        exceeded = spent >= remaining
+        if exceeded and not (r.ok and (r.data or {}).get("status") == "blocked"):
+            # D-026: 20 minutes of builder time without passing: the Troubleshooter takes it. A blocker claim is
+            # still checked first (it is a handoff of its own, and a rejected one is an easy-out on record).
+            return fail(self._focus_reason(focus_limit), "focus-limit", str((r.error or "") if not r.ok else ""),
+                        handoff=True, focus=True)
         if not r.ok:
             return fail(f"builder output unusable: {r.error}", f"builder-error:{r.error}")
         if (r.data or {}).get("status") == "blocked":
@@ -1437,7 +1518,7 @@ class Conductor:
             rejected = self._check_blocker(t, d, tag, cid, twt, base)  # Capped/NotReady: undone, re-raised
             if rejected:  # D-031: every rejection is an easy-out, logged against the builder
                 self._record_easy_out(tid, tag, cid, rejected, d, summary)
-                return fail(rejected, "easy-out")
+                return fail(rejected, "easy-out", handoff=exceeded, focus=exceeded)
             tried, err, cap = d.get("tried"), d.get("error"), d["capability"]
             cur = self._task(tid)
             needs = list(cur.get("needs") or [])
@@ -1448,7 +1529,7 @@ class Conductor:
             # handoff: the first accepted blocker goes to the Troubleshooter now, not after a second failure the
             # readiness gate would never let happen
             return fail(f"blocker: {summary} (tried: {'; '.join(map(str, tried))}; error: {err})", f"blocker:{summary}",
-                        output=str(err), handoff=True)
+                        output=str(err), handoff=True, focus=exceeded)
         if violations:  # D-025 / drill 7: an attempt that touched its own tests can never pass
             return fail("touched test files (reverted): " + ", ".join(violations),
                         "touched tests: " + ",".join(violations))
@@ -1675,15 +1756,22 @@ class Conductor:
         changed = {f: lines for f, lines in changed_lines(diff).items()
                    if f not in tests and any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])}
         timeout = float(self.limits.get("test_timeout_s", 600))
-        mres = run_mutation(root, changed,
-                            [sys.executable, "-m", "unittest", *(parse_test_cmd(t["test_cmd"], t["test_files"]) or [])],
-                            mutation_min=float(self.limits.get("mutation_min", 0.8)),
-                            budget_s=float(self.limits.get("mutation_budget_s", self.limits.get("test_timeout_s", 600))),
-                            per_mutant_timeout_s=min(timeout, max(5.0, 3 * baseline)))
+        t0 = self.clock()
+        try:
+            mres = self._run_mutation(root, changed, t, timeout, baseline)
+        finally:
+            self._activity().add(self._since(t0))  # T1C4: judges are active work
         if self._changed(cwd=root) or _git(root, "rev-parse", "HEAD") != sha:
             self._reset_to(root, sha)
             raise RuntimeError("mutation left changes")
         return mres
+
+    def _run_mutation(self, root: Path, changed: dict, t: dict, timeout: float, baseline: float):
+        return run_mutation(root, changed,
+                            [sys.executable, "-m", "unittest", *(parse_test_cmd(t["test_cmd"], t["test_files"]) or [])],
+                            mutation_min=float(self.limits.get("mutation_min", 0.8)),
+                            budget_s=float(self.limits.get("mutation_budget_s", self.limits.get("test_timeout_s", 600))),
+                            per_mutant_timeout_s=min(timeout, max(5.0, 3 * baseline)))
 
     @staticmethod
     def _survivor_listing(mres) -> str:
@@ -1766,7 +1854,23 @@ class Conductor:
         return subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], cwd=str(self.wt),
                               capture_output=True, **NOWIN).returncode == 0
 
-    def _after_failure(self, tid: str, reason: str, sig: str, output: str, handoff: bool = False) -> None:
+    def _focus_limit(self) -> float:
+        try:
+            return float(self.limits.get("builder_focus_s", 1200))
+        except (TypeError, ValueError):
+            return 1200.0
+
+    @staticmethod
+    def _focus_used(t: dict) -> float:
+        v = t.get("focus_s") or 0
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else 0.0
+
+    @staticmethod
+    def _focus_reason(limit: float) -> str:
+        return f"focus limit: {limit / 60:g} minutes of builder time without passing (D-026); handed to the Troubleshooter"
+
+    def _after_failure(self, tid: str, reason: str, sig: str, output: str, handoff: bool = False,
+                       focus: bool = False) -> None:
         t = self._task(tid)
         sigs = t["fail_signatures"] + [sig]
         fails = t.get("fails_since", 0) + 1
@@ -1774,7 +1878,7 @@ class Conductor:
         zero_progress = len(sigs) >= 2 and sigs[-1] == sigs[-2]
         rounds = t.get("troubleshoots", 0)
         if rounds >= 3:
-            if fails >= 2:
+            if fails >= 2 or focus:  # D-026: focus spent and no troubleshooter round left
                 self._block(tid, reason)
             return
         if zero_progress or fails >= 2 or handoff:
@@ -1807,17 +1911,25 @@ class Conductor:
                                         "alternative": d.get("alternative", "")}) + "\n")
         else:
             notes = notes + [f"(troubleshooter failed: {r.error})"]
-        self._update(tid, trouble_notes=notes, troubleshot=True, fails_since=0,
+        self._update(tid, trouble_notes=notes, troubleshot=True, fails_since=0, focus_s=0,
                      troubleshoots=t.get("troubleshoots", 0) + 1, troubleshoot_pending=None)
 
     # ------------------------------------------------------------------ drift
     def _drift_check(self) -> None:
+        """Design §3.7 / D-026: the drift keeper, after every merge and whenever a stall rule fired. It sees the
+        tasks, the spec coverage map and the stall facts. A stall forces a re-plan whatever it answers. The
+        re-plan is saved durably before drift_due and the stall are cleared (T1C5)."""
         q = self._queue()
         design = self.wt / "docs" / "specs" / "layer-1-design.md"
         text = design.read_text(encoding="utf-8") if design.exists() else "(no design file)"
         listing = "\n".join(f"- {t['id']} [{t['status']}] {t['title']}" for t in q["tasks"])
+        d0 = drift_mod.load(self.state) or {}
+        trigger = (d0.get("stall") or {}).get("trigger")
+        facts = self._coverage_block(q) + (f"\n\nSTALL RULE FIRED: {trigger}. A re-plan is required (D-026); give the "
+                                           "reasons the work stalled and what the re-plan must change." if trigger else "")
         r = self._call("drift_keeper", role_text(self.repo, "drift_keeper") + "\n\nIs this work still on course for "
-                                       "the design? Say replan only if it is drifting.\n\nTASKS:\n" + listing +
+                                       "the design? Say replan only if it is drifting. Coverage must rise with "
+                                       "every merge.\n\nTASKS:\n" + listing + "\n\n" + facts +
                        "\n\nDESIGN:\n" + text[:40000] +
                        "\nAnswer with JSON: {\"status\": \"ok\" | \"replan\", \"reasons\": [...]}", S_DRIFT)
         status = (r.data or {}).get("status") if r.ok else None
@@ -1831,16 +1943,211 @@ class Conductor:
                           f"The drift keeper returned unusable output 3 times (last error: {r.error}).\n\n"
                           "Reply with guidance to resume.")
             return
+        reasons = (r.data or {}).get("reasons") or []
+        if isinstance(reasons, str):
+            reasons = [reasons]
+        reasons = [str(x) for x in reasons]
+        d = drift_mod.load(self.state) or drift_mod.adopt([], [], False, self._activity().total())
+        trigger = (d.get("stall") or {}).get("trigger")
+        replan = status == "replan" or bool(trigger)
+        use_manager = replan and getattr(self, "manager", None) is not None
+        if replan:
+            if use_manager and not d.get("replan"):
+                drift_mod.new_replan(d, ([f"stall rule: {trigger}"] if trigger else []) + reasons,
+                                     trigger or "drift keeper")
+            d["stall"] = None
+            drift_mod.restart_window(d, self._activity().total())
+            drift_mod.save(self.state, d)  # durable before drift_due is cleared: a crash never loses the re-plan
+            self._crash("after:replan-pending")
+        q = self._queue()
         q["drift_due"], q["drift_failures"] = False, 0
-        self._save_queue(q)
-        if status == "replan":
-            reasons = (r.data or {}).get("reasons") or []
-            if isinstance(reasons, str):
-                reasons = [reasons]
+        self._save_queue(q, durable=True)
+        if replan and not use_manager:  # no Manager configured: pause and ask Ben, as before
             (self.state / "PAUSED").write_text("drift keeper asked for a re-plan\n")
             self._ask("replan", "Forge paused: the drift keeper wants a re-plan",
-                      "Reasons:\n" + "\n".join(f"- {x}" for x in reasons) +
-                      "\n\nReply with guidance to resume.")
+                      ("Stall rule: " + trigger + "\n\n" if trigger else "") + "Reasons:\n" +
+                      "\n".join(f"- {x}" for x in reasons) + "\n\nReply with guidance to resume.")
+
+    # ------------------------------------------------------------------ coverage, stall rules, re-plans (T1C5)
+    def _spec(self) -> tuple[str, dict] | None:
+        """(spec text, requirements) from the layer worktree, or None when there is no usable spec."""
+        rel = _norm(str(self.limits.get("spec_file", "docs/specs/layer-1-design.md")))
+        if ".." in rel or re.match(r"^([A-Za-z]:|/)", rel):
+            return None
+        try:
+            text = (self.wt / rel).read_text(encoding="utf-8")
+            reqs = cov_mod.parse_requirements(text)
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        return (text, reqs) if reqs else None
+
+    def _coverage_block(self, q: dict) -> str:
+        spec = self._spec()
+        if spec is None:
+            return "COVERAGE: unavailable (no spec with numbered sections)"
+        tasks = q["tasks"]
+        cov = cov_mod.compute(spec[1], tasks, cov_mod.verified_done(tasks, self._ledger()))
+        d = drift_mod.load(self.state) or {}
+        return ("COVERAGE (verified by the ledger; requirement id [status] text):\n" + cov.report(20000) +
+                f"\nMerges in a row without coverage gain: {d.get('no_gain', 0)}")
+
+    def _int_limit(self, key: str, default: float) -> float:
+        try:
+            return float(self.limits.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _drift_bookkeeping(self, q: dict) -> tuple[dict, set]:
+        """Every step, plain code: adopt the baseline on first use, record each newly marked merge exactly once
+        (gain measured on the same task set, only ledger-verified work counts), then check the stall rules.
+        Returns (drift state, merges deferred because their finalization is still running)."""
+        activity = self._activity().total()
+        tasks = q["tasks"]
+        marks = [x for x in q.get("drift_marks") or [] if isinstance(x, str)]
+        verified = cov_mod.verified_done(tasks, self._ledger())
+        d = drift_mod.load(self.state)
+        dirty = d is None
+        if d is None:
+            done = {t["id"] for t in tasks if t.get("status") == "done"}
+            d = drift_mod.adopt(marks, verified | done, bool(q.get("drift_due")), activity)
+        journal = Journal(self.state)
+        deferred = set()
+        for tid in marks:
+            if tid not in d["counted"]:
+                rec = journal.load(tid)
+                if rec is not None and rec.get("status") == "active":
+                    deferred.add(tid)
+        spec = self._spec()
+        score = None
+        if spec is not None:
+            reqs = spec[1]
+
+            def score(done: set, reqs=reqs):
+                return cov_mod.compute(reqs, tasks, done).score
+        if drift_mod.record_merges(d, marks, verified, activity, score, deferred):
+            dirty = True
+        if not d.get("stall") and not d.get("replan"):
+            n = int(self._int_limit("drift_no_gain_merges", 3))
+            idle_s = self._int_limit("drift_no_merge_active_s", 7200)
+            work_left = any(t.get("kind", "build") == "build" and t.get("status") in ("todo", "tests_ok", "merge_pending")
+                            for t in tasks)
+            if spec is not None and drift_mod.no_gain_due(d, n):
+                d["stall"] = {"trigger": f"no coverage gain in {n} merges", "active_s": activity}
+            elif work_left and drift_mod.idle_due(d, activity, idle_s):
+                d["stall"] = {"trigger": f"no merge in {idle_s / 3600:g} active hours", "active_s": activity}
+            dirty = dirty or bool(d.get("stall"))
+        if dirty:
+            drift_mod.save(self.state, d)
+        return d, deferred
+
+    def _drift_busy(self) -> bool:
+        d = drift_mod.load(self.state) or {}
+        return bool(d.get("stall") or d.get("replan"))
+
+    def _replan_stage(self) -> None:
+        """The Manager re-plans from the ledger and the spec only, in a throwaway checkout it may not change.
+        Its proposal is validated completely, reviewed, validated again at acceptance and appended in one durable
+        queue write that also records the re-plan id; only then is the pending re-plan cleared."""
+        d = drift_mod.load(self.state)
+        rp = (d or {}).get("replan")
+        if not rp:
+            return
+        q = self._queue()
+        if rp["id"] in (q.get("replans") or []):  # accepted before a crash: just finish the bookkeeping
+            self._finish_replan(d)
+            return
+        spec = self._spec()
+        if getattr(self, "manager", None) is None:
+            return self._escalate_replan(d, "no Manager is configured")
+        if spec is None:
+            return self._escalate_replan(d, "there is no usable spec to plan from")
+        if int(d.get("auto_replans", 0)) >= int(self._int_limit("max_auto_replans", 2)):
+            return self._escalate_replan(d, "re-plans keep happening without coverage rising")
+        text, reqs = spec
+        led = self._ledger()
+        tasks = q["tasks"]
+        cov = cov_mod.compute(reqs, tasks, cov_mod.verified_done(tasks, led))
+        prompt = manager_mod.build_prompt(text, cov, manager_mod.ledger_rows(led), rp.get("reasons") or [])
+        tip = _git(self.wt, "rev-parse", "HEAD")
+        with self.trees.throwaway(tip) as mw:
+            r = self._call("manager", prompt, manager_mod.S_MANAGER, cwd=mw)
+            wrote = self._changed(cwd=mw)
+        problems: list[str] = []
+        new: list[dict] = []
+        if not r.ok:
+            problems = [f"manager failed ({r.error})"]
+        elif wrote:
+            problems = ["manager is read-only but changed: " + ", ".join(wrote[:20])]
+        else:
+            existing = {t["id"] for t in tasks} | set(led.contracts())
+            new, problems = manager_mod.validate_proposal(r.data, reqs, existing)
+        if not problems:
+            rv = self._call("reviewer", role_text(self.repo, "reviewer") + "\n\nCheck this RE-PLAN from the Manager "
+                                        "against the spec and the coverage map: it must make coverage rise, be "
+                                        "testable, small tasks, no placeholders, no drift.\n\nWHY:\n" +
+                            "\n".join(f"- {x}" for x in rp.get("reasons") or []) + "\n\n" + cov.report(20000) +
+                            "\n\nPROPOSED TASKS:\n" + json.dumps(new, indent=1)[:40000] +
+                            "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW)
+            if not rv.ok or (rv.data or {}).get("verdict") != "pass":
+                problems = ["replan review failed: " + "; ".join(
+                    str(x) for x in ((rv.data or {}).get("reasons") or [rv.error or "no reasons given"]))]
+        if not problems:
+            problems = self._accept_replan(rp, new)
+        if problems:
+            self._reject_replan(problems)
+
+    def _accept_replan(self, rp: dict, new: list[dict]) -> list[str]:
+        """Validate once more against the queue and ledger as they are now, then append in one durable write."""
+        spec = self._spec()
+        if spec is None:
+            return ["the spec is no longer usable"]
+        q = self._queue()
+        existing = {t["id"] for t in q["tasks"]} | set(self._ledger().contracts())
+        clean, problems = manager_mod.validate_proposal({"tasks": new}, spec[1], existing)
+        if not problems:
+            problems = [f"task {x['id']!r}: {why}" for x in clean for why in [validate_task(dict(x, kind="build"))] if why]
+        if problems:
+            return problems
+        for x in clean:
+            nt = self._new_task(x)
+            nt["kind"], nt["status"] = "build", "todo"
+            q["tasks"].append(nt)
+        q["replans"] = [str(i) for i in q.get("replans") or []][-200:] + [rp["id"]]
+        q["notes"] = [str(n)[:NOTE_CAP] for n in q.get("notes") or []] + [
+            f"re-plan {rp['id']} ({rp.get('trigger')}) added: " + ", ".join(x["id"] for x in clean)]
+        self._save_queue(q, durable=True)
+        self._crash("after:replan-accepted")
+        self._finish_replan(drift_mod.load(self.state))
+        return []
+
+    def _finish_replan(self, d: dict) -> None:
+        d["replan"] = None
+        d["auto_replans"] = int(d.get("auto_replans", 0)) + 1
+        drift_mod.restart_window(d, self._activity().total())
+        drift_mod.save(self.state, d)
+
+    def _reject_replan(self, problems: list[str]) -> None:
+        d = drift_mod.load(self.state)
+        rp = d["replan"]
+        rp["attempts"] = int(rp.get("attempts", 0)) + 1
+        rp["notes"] = ([str(x)[:NOTE_CAP] for x in rp.get("notes") or []] + [str(x)[:NOTE_CAP] for x in problems])[-NOTES_KEEP:]
+        if rp["attempts"] >= 2:
+            return self._escalate_replan(d, "the Manager's proposals were rejected twice")
+        drift_mod.save(self.state, d)
+
+    def _escalate_replan(self, d: dict, why: str) -> None:
+        """PAUSED and a replan question to Ben; the pending re-plan is cleared only after both exist."""
+        rp = d.get("replan") or {}
+        (self.state / "PAUSED").write_text("a re-plan needs Ben\n")
+        self._ask("replan", "Forge paused: a re-plan needs you",
+                  f"Forge needs a re-plan and can't make one itself: {why}.\n\nTrigger: {rp.get('trigger')}\n\n"
+                  "Reasons:\n" + "\n".join(f"- {x}" for x in rp.get("reasons") or []) +
+                  ("\n\nRejected proposals:\n" + "\n".join(f"- {x}" for x in rp.get("notes") or []) if rp.get("notes") else "") +
+                  "\n\nReply with guidance to resume.")
+        d["replan"] = None
+        d["auto_replans"] = 0
+        drift_mod.restart_window(d, self._activity().total())
+        drift_mod.save(self.state, d)
 
     # ------------------------------------------------------------------ plan tasks
     def _plan_stage(self, tid: str) -> None:
@@ -2087,6 +2394,12 @@ def real_team(limits: dict) -> Team:
                                     allowed_tools=["Read", "Edit", "Write", "Glob", "Grep"]))
 
 
+def real_manager(limits: dict):
+    """T1C5: the Manager is Claude, read-only (design §2): plan mode, reading tools only."""
+    from core.agents import ClaudeAgent
+    return ClaudeAgent(limits.get("agent_timeout_s", 1800), permission_mode="plan", allowed_tools=["Read", "Glob", "Grep"])
+
+
 LOCK_NAME = "conductor.lock"
 
 
@@ -2241,6 +2554,7 @@ def main(argv: list[str]) -> int:
         return 0
     c = Conductor(forge, Path(a.work), state, real_team(limits), limits, owner_email=a.owner,
                   mailer=gmail_mailer(a.owner), inbox=gmail_inbox(a.owner, state), gh=gh_cli(forge),
+                  manager=real_manager(limits),
                   judge_cmds=["python drills/run_drills.py", "python -m unittest discover -s tests/core"])
     if a.cmd == "init":
         c.init_queue(a.layer, json.loads(Path(a.tasks).read_text(encoding="utf-8")))
