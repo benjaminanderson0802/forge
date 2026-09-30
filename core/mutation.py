@@ -3,12 +3,22 @@
 changed_lines() reads `git diff -U0` output; find_mutants() builds one Mutant per operator or
 constant token that sits on a changed line. A site is chosen by the line of the token itself,
 never by the line where the enclosing expression starts. Standard library only, no side effects.
+
+run_mutation() (part 2) runs those mutants against a test command under one hard time budget,
+restores every file afterwards, and returns structured survivor evidence.
 """
 import ast
 import io
+import os
 import re
+import shutil
+import subprocess
+import tempfile
+import time
 import tokenize
 from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -248,3 +258,121 @@ def find_mutants(path: str, source: str, lines: set[int]) -> list[Mutant]:
         unique.append(replace(mutant, id=new_id) if new_id != mutant.id else mutant)
     assert len({m.id for m in unique}) == len(unique)
     return unique
+
+
+@dataclass
+class MutationResult:
+    total: int
+    killed: int
+    survivors: list[Mutant]
+    not_run: list[str]
+    complete: bool
+    score: float
+    passed: bool
+    reason: str
+
+    def survivor_ids(self) -> list[str]:
+        return [m.id for m in self.survivors]
+
+    def as_dict(self) -> dict:
+        """JSON-safe evidence; mutant source text is left out."""
+        return {"total": self.total, "killed": self.killed, "score": self.score,
+                "complete": self.complete, "passed": self.passed, "reason": self.reason,
+                "not_run": list(self.not_run),
+                "survivors": [{"id": m.id, "file": m.file, "line": m.line,
+                               "original": m.original, "replacement": m.replacement}
+                              for m in self.survivors]}
+
+
+def _default_run(argv: list[str], cwd: Path, timeout: float, env: dict) -> tuple[int, bool]:
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        done = subprocess.run(argv, cwd=cwd, capture_output=True, stdin=subprocess.DEVNULL,
+                              timeout=timeout, env=env, creationflags=flags)
+    except subprocess.TimeoutExpired:
+        return 124, True
+    return done.returncode, False
+
+
+def run_mutation(root: Path, changed: dict[str, set[int]], test_argv: list[str], *,
+                 mutation_min: float, budget_s: float, per_mutant_timeout_s: float,
+                 clock: Callable[[], float] = time.monotonic,
+                 run: Callable[[list[str], Path, float, dict], tuple[int, bool]] | None = None
+                 ) -> MutationResult:
+    """Run each mutant against test_argv inside one hard total time budget.
+
+    A mutant only gets a verdict if its run finished before the deadline; anything cut short
+    by the budget is reported in not_run, so an out-of-time run is never complete.
+    """
+    deadline = clock() + budget_s
+    run = run or _default_run
+    root = Path(root)
+    originals: dict[str, bytes] = {}
+    mutants: list[Mutant] = []
+    for path in sorted(changed):
+        try:
+            data = (root / path).read_bytes()
+        except FileNotFoundError:
+            continue
+        found = find_mutants(path, data.decode("utf-8"), changed[path])
+        if found:
+            originals[path] = data
+            mutants.extend(found)
+
+    killed, survivors, not_run = 0, [], []
+    out_of_time = False
+    for mutant in mutants:
+        if out_of_time or deadline - clock() <= 0:
+            out_of_time = True
+            not_run.append(mutant.id)
+            continue
+        target = root / mutant.file
+        cache = None
+        try:
+            with open(target, "w", encoding="utf-8", newline="") as handle:
+                handle.write(mutant.source)
+            cache = tempfile.mkdtemp(prefix="forge-mutant-pyc-")
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPYCACHEPREFIX=cache)
+            remaining = deadline - clock()
+            if remaining <= 0:
+                out_of_time = True
+                not_run.append(mutant.id)
+                continue
+            timeout = min(per_mutant_timeout_s, remaining)
+            exit_code, timed_out = run(test_argv, root, timeout, env)
+            if clock() >= deadline or (timed_out and timeout < per_mutant_timeout_s):
+                out_of_time = True
+                not_run.append(mutant.id)
+            elif timed_out or exit_code != 0:
+                killed += 1
+            else:
+                survivors.append(mutant)
+        finally:
+            target.write_bytes(originals[mutant.file])
+            if cache is not None:
+                shutil.rmtree(cache, ignore_errors=True)
+
+    for path, data in originals.items():
+        try:
+            current = (root / path).read_bytes()
+        except OSError:
+            current = None
+        if current != data:
+            raise RuntimeError(f"mutation restore failed: {path}")
+
+    judged = killed + len(survivors)
+    score = killed / judged if judged else 1.0
+    complete = not not_run
+    passed = complete and score >= mutation_min
+    if not mutants:
+        reason = "no mutation sites on changed lines"
+    elif not complete:
+        reason = (f"incomplete: budget ran out, {len(not_run)} of {len(mutants)} "
+                  "mutants not run")
+    else:
+        sign = ">=" if passed else "<"
+        reason = f"killed {killed} of {judged} ({score:.2f} {sign} {mutation_min:.2f})"
+        if survivors:
+            reason += f"; {len(survivors)} survivors"
+    return MutationResult(len(mutants), killed, survivors, not_run, complete, score,
+                          passed, reason)
