@@ -27,6 +27,7 @@ from typing import Callable
 from core.ledger import Ledger, Rejected
 from core.roles import role_text
 from core.usage import Meter
+from core.worktrees import Worktrees
 
 ROLES = {"ci": "ci", "forge-manager": "manager", "forge-executor": "executor",
          "forge-auditor": "auditor", "forge-core": "core", "benjamin": "human"}
@@ -217,6 +218,10 @@ class Conductor:
     def wt(self) -> Path:
         return self.work / self._queue()["layer"]
 
+    @property
+    def trees(self) -> Worktrees:
+        return Worktrees(self.repo, self.work)
+
     # ------------------------------------------------------------------ setup
     def init_queue(self, layer: str, tasks: list[dict]) -> None:
         for t in tasks:
@@ -259,9 +264,9 @@ class Conductor:
         _git(self.wt, "reset", "-q", "--hard")
         _git(self.wt, "clean", "-q", "-fd")
 
-    def _changed(self) -> list[str]:
+    def _changed(self, cwd: Path | None = None) -> list[str]:
         """Every added, modified, deleted or untracked path in the worktree (NUL-separated: no trimming bugs)."""
-        p = subprocess.run(["git", "status", "--porcelain", "-z", "-uall"], cwd=str(self.wt), capture_output=True,
+        p = subprocess.run(["git", "status", "--porcelain", "-z", "-uall"], cwd=str(cwd or self.wt), capture_output=True,
                            stdin=subprocess.DEVNULL, **NOWIN)
         if p.returncode != 0:
             raise RuntimeError("git error: status failed: " + p.stderr.decode("utf-8", "replace").strip()[:300])
@@ -276,13 +281,14 @@ class Conductor:
             i += 1
         return sorted(set(files))
 
-    def _commit(self, paths: list[str], msg: str) -> str:
+    def _commit(self, paths: list[str], msg: str, cwd: Path | None = None) -> str:
+        wt = Path(cwd) if cwd else self.wt
         if paths:
-            _git(self.wt, "add", "-A", "--", *paths)
-        if not _git(self.wt, "diff", "--cached", "--name-only"):
+            _git(wt, "add", "-A", "--", *paths)
+        if not _git(wt, "diff", "--cached", "--name-only"):
             return ""
-        _git(self.wt, "commit", "-q", "-m", msg)
-        return _git(self.wt, "rev-parse", "HEAD")
+        _git(wt, "-c", "user.name=Forge", "-c", "user.email=forge@localhost", "commit", "-q", "-m", msg)
+        return _git(wt, "rev-parse", "HEAD")
 
     def _push(self) -> None:
         if self.push:
@@ -651,22 +657,22 @@ class Conductor:
                   "\n\nReply to this email with guidance and the task will be retried with it. "
                   "Otherwise Forge continues with other work.", task=tid)
 
-    def _run_tests(self, t: dict) -> tuple[int, str, bool]:
+    def _run_tests(self, t: dict, cwd: Path | None = None) -> tuple[int, str, bool]:
         """R1: run a task's unittest command without a shell. Returns (exit, output, timed_out)."""
         paths = parse_test_cmd(t["test_cmd"], t["test_files"])
         if paths is None:
             return 2, "unsafe test_cmd", False
         try:
-            p = subprocess.run([sys.executable, "-m", "unittest", *paths], cwd=str(self.wt), capture_output=True,
+            p = subprocess.run([sys.executable, "-m", "unittest", *paths], cwd=str(cwd or self.wt), capture_output=True,
                                text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
                                timeout=int(self.limits.get("test_timeout_s", 600)), **NOWIN)
             return p.returncode, (p.stdout or "") + (p.stderr or ""), False
         except subprocess.TimeoutExpired:
             return 124, "test command timed out", True
 
-    def _run_cmd(self, cmd: str) -> tuple[int, str]:
+    def _run_cmd(self, cmd: str, cwd: Path | None = None) -> tuple[int, str]:
         try:
-            p = subprocess.run(cmd, shell=True, cwd=str(self.wt), capture_output=True, text=True, encoding="utf-8",
+            p = subprocess.run(cmd, shell=True, cwd=str(cwd or self.wt), capture_output=True, text=True, encoding="utf-8",
                                errors="replace", stdin=subprocess.DEVNULL,
                                timeout=int(self.limits.get("test_timeout_s", 600)), **NOWIN)
             return p.returncode, (p.stdout or "") + (p.stderr or "")
@@ -748,6 +754,8 @@ class Conductor:
                 "title": t["title"], "spec_ref": cid, "acceptance": t["test_cmd"],
                 "files_in_scope": list(t["files_in_scope"]), "max_attempts": 6, "token_budget": 10 ** 9})
         c = self._ledger().contracts().get(cid, {})
+        if c.get("status") in ("claimed", "submitted"):  # a crash left the last attempt open
+            c = self._recover_interrupted(tid, cid, c)
         if c.get("status") == "parked":
             self._block(tid, "ledger parked the contract (attempt or budget limit)")
             return
@@ -755,7 +763,8 @@ class Conductor:
         self._apply(f"{tag}-claim", "claim", cid, "forge-executor")
 
         self._reset_wt()
-        tests_commit = t["tests_commit"]
+        base = _git(self.wt, "rev-parse", "HEAD")
+        twt = self.trees.prepare_task(tid, base)  # the builder works in the task's own worktree
 
         prompt = role_text(self.repo, "builder") + "\n\nMake the tests pass by changing only the files you may change.\n\n" + \
                  self._task_prompt(t)
@@ -770,25 +779,23 @@ class Conductor:
                    "A blocked answer must also include \"tried\" (at least 2 different routes you actually tried) "
                    "and \"error\" (the real error output); without them it is rejected as an easy way out.")
         try:
-            r = self._call("builder", prompt, S_BUILD)
+            r = self._call("builder", prompt, S_BUILD, cwd=twt)
         except Capped:  # R37: release the claim and undo, no failure recorded
             self._apply(f"{tag}-release", "release", cid, "forge-core")
-            _git(self.wt, "reset", "-q", "--hard", tests_commit)
-            _git(self.wt, "clean", "-q", "-fd")
+            self._reset_to(twt, base)
             raise
 
         tests = [_norm(x) for x in t["test_files"]]
-        changed = self._changed()
+        changed = self._changed(cwd=twt)
         violations = [f for f in changed if f in tests]
         if violations:
-            _git(self.wt, "checkout", "-q", "HEAD", "--", *violations)
-            _git(self.wt, "clean", "-q", "-f", "--", *violations)
+            _git(twt, "checkout", "-q", "HEAD", "--", *violations)
+            _git(twt, "clean", "-q", "-f", "--", *violations)
         changed = [f for f in changed if f not in tests]
         out_of_scope = [f for f in changed if not any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])]
 
         def fail(reason: str, sig: str, output: str = "", submitted: bool = False) -> None:
-            _git(self.wt, "reset", "-q", "--hard", tests_commit)
-            _git(self.wt, "clean", "-q", "-fd")
+            self._reset_to(twt, base)
             if submitted:
                 self._apply(f"{tag}-fail", "fail", cid, "forge-auditor")
             else:
@@ -814,13 +821,18 @@ class Conductor:
         if out_of_scope:
             return fail("out of scope: " + ", ".join(out_of_scope), "out of scope: " + ",".join(out_of_scope))
 
-        sha = self._commit(changed, f"{cid}: {t['title']}") or _git(self.wt, "rev-parse", "HEAD")
+        sha = self._commit(changed, f"{cid}: {t['title']}", cwd=twt) or _git(twt, "rev-parse", "HEAD")
         self._apply(f"{tag}-report", "run_report", cid, "forge-core", {
             "run_id": tag, "claim": (r.data or {}).get("status"), "commit": sha, "changed": changed,
             "violations": violations, "out_of_scope": []})
         self._apply(f"{tag}-submit", "submit", cid, "forge-executor", {"commit": sha})
 
-        results = [("task tests", *self._run_tests(t)[:2])] + [(cmd, *self._run_cmd(cmd)) for cmd in self.judge_cmds]
+        with self.trees.throwaway(sha) as jw:  # judges run at exactly this commit, never in a shared checkout
+            results = [("task tests", *self._run_tests(t, cwd=jw)[:2])]
+            for cmd in self.judge_cmds:
+                if results[-1][1] != 0:
+                    break
+                results.append((cmd, *self._run_cmd(cmd, cwd=jw)))
         for cmd, code, output in results:
             if code != 0:
                 self._apply(f"{tag}-ci", "test_run", cid, "ci", {"run_id": f"{tag}-ci", "commit": sha, "passed": False})
@@ -830,18 +842,18 @@ class Conductor:
                 return fail(f"judge failed: {cmd}", sig, tail, submitted=True)
         self._apply(f"{tag}-ci", "test_run", cid, "ci", {"run_id": f"{tag}-ci", "commit": sha, "passed": True})
 
-        diff = _git(self.wt, "diff", f"{tests_commit}..{sha}")
+        diff = _git(twt, "diff", f"{base}..{sha}")
         try:
             rv = self._call("reviewer", role_text(self.repo, "reviewer") + "\n\nCheck this change against the task. "
                                         "Reject shortcuts, bare-minimum work, drift from the task, and anything that "
                                         "weakens tests.\n\n" + self._task_prompt(t) + "\nDIFF:\n" + diff[:60000] +
-                            "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW)
+                            "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW,
+                            cwd=twt)  # the task worktree is at exactly S
         except Capped:  # R37: undo the submitted run like a failed judge, but record no failure
             self._apply(f"{tag}-capped", "fail", cid, "forge-auditor")
             if self._ledger().contracts().get(cid, {}).get("status") == "failed":
                 self._apply(f"{tag}-reopen", "reopen", cid, "forge-manager")
-            _git(self.wt, "reset", "-q", "--hard", tests_commit)
-            _git(self.wt, "clean", "-q", "-fd")
+            self._reset_to(twt, base)
             raise
         if not rv.ok:
             return fail(f"reviewer output unusable: {rv.error}", f"reviewer-error:{rv.error}", submitted=True)
@@ -850,6 +862,10 @@ class Conductor:
             self._update(tid, review_feedback=reasons)
             return fail("review failed: " + "; ".join(reasons), "review:" + "|".join(reasons), submitted=True)
 
+        self._reset_wt()  # interim merge: fast-forward only; a layer that moved fails the attempt
+        if subprocess.run(["git", "merge", "-q", "--ff-only", sha], cwd=str(self.wt), capture_output=True,
+                          stdin=subprocess.DEVNULL, **NOWIN).returncode != 0:
+            return fail("layer moved during the attempt", "layer-moved", submitted=True)
         if not self._apply(f"{tag}-pass", "pass", cid, "forge-auditor", {"run_id": f"{tag}-ci"}):
             return fail("ledger refused the pass (evidence incomplete)", "ledger-refused-pass", submitted=True)
         self._update(tid, status="done", done_commit=sha)
@@ -857,6 +873,25 @@ class Conductor:
         q = self._queue()
         q["drift_due"] = True  # the drift keeper runs as the next step, so it can be stopped like any agent
         self._save_queue(q)
+        self.trees.remove_task(tid)
+
+    def _reset_to(self, wt: Path, sha: str) -> None:
+        _git(wt, "reset", "-q", "--hard", sha)
+        _git(wt, "clean", "-q", "-fd")
+
+    def _recover_interrupted(self, tid: str, cid: str, c: dict) -> dict:
+        """A contract left claimed or submitted by a crash is released, or failed and reopened, before the next
+        attempt. No failure signature: the lost attempt still counts in the ledger's attempts."""
+        n = c.get("attempts", 0)
+        if c.get("status") == "claimed":
+            self._apply(f"{cid}-recover-{n}-release", "release", cid, "forge-core")
+        else:
+            self._apply(f"{cid}-recover-{n}-fail", "fail", cid, "forge-auditor")
+            if self._ledger().contracts().get(cid, {}).get("status") == "failed":
+                self._apply(f"{cid}-recover-{n}-reopen", "reopen", cid, "forge-manager")
+        cur = self._task(tid)
+        self._update(tid, notes=cur["notes"] + ["interrupted attempt recovered"])
+        return self._ledger().contracts().get(cid, {})
 
     def _is_ancestor(self, sha: str) -> bool:
         return subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], cwd=str(self.wt),
@@ -890,7 +925,8 @@ class Conductor:
                   "\nRECENT FAILURES:\n" + "\n".join(t["notes"][-6:]) +
                   "\n\nLAST JUDGE OUTPUT:\n" + output[-4000:] +
                   "\nAnswer with JSON: {\"kind\": \"fix\" | \"dead_end\", \"notes\": \"...\", \"alternative\": \"...\"}")
-        r = self._call("troubleshooter", prompt, S_TROUBLE)
+        with self.trees.throwaway(_git(self.wt, "rev-parse", "HEAD")) as tw:  # scratch: its edits are discarded
+            r = self._call("troubleshooter", prompt, S_TROUBLE, cwd=tw)
         self._reset_wt()
         notes = t.get("trouble_notes", [])
         if r.ok:

@@ -1223,8 +1223,8 @@ class R37PerLaunchCapTests(Harness):
         # Simulate concurrent provider usage without changing guarded state
         # during an agent call: retain the real Meter in a sibling temp directory.
         c.meter = Meter(self.state.parent / "shared-usage", c.clock)
-        runner = patch.object(c, "_run_tests", side_effect=lambda task: (
-            (0, "Ran 1 test\nOK", False) if (c.wt / "feat.py").exists()
+        runner = patch.object(c, "_run_tests", side_effect=lambda task, cwd=None: (
+            (0, "Ran 1 test\nOK", False) if ((cwd or c.wt) / "feat.py").exists()
             else (1, "Ran 1 test\nFAILED (errors=1)", False)
         ))
         runner.start()
@@ -1423,8 +1423,8 @@ class R38DeferredTroubleshootingTests(Harness):
             "test_writer": self.write_tests, "builder": builder,
             "troubleshooter": troubleshoot,
         })
-        runner = patch.object(c, "_run_tests", side_effect=lambda task: (
-            (0, "Ran 1 test\nOK", False) if (c.wt / "feat.py").exists()
+        runner = patch.object(c, "_run_tests", side_effect=lambda task, cwd=None: (
+            (0, "Ran 1 test\nOK", False) if ((cwd or c.wt) / "feat.py").exists()
             else (1, self.failure_output, False)
         ))
         runner.start()
