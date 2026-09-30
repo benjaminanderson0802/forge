@@ -374,3 +374,16 @@ The first run with real agents and real email hit four faults no fake-based test
 - **R45 Plans get three attempts, and the planner checks itself against the rules first.** Under R44, plan reviews converged to a single blocking reason per attempt. Each attempt fixed the last reason, but a new contradiction with an existing rule surfaced each time. With only two attempts, plan tasks still blocked. Now:
   - **`PLAN_ATTEMPTS = 3`:** a plan task is blocked after its third rejection, not its second. Test-writer rejections are unchanged (2).
   - **The planner is told** to check every task against the numbered rules in `docs/specs/bootstrap-conductor.md` and the decisions in `docs/DECISIONS.md` before answering. The prompt says that any contradiction with them will be rejected as blocking.
+
+## Live-use amendment (2026-09-30, metering failed runs)
+
+- **R46 A Claude run that times out, is killed, or returns unreadable output is still metered.** Before this rule, such runs reported 0 tokens. Their real use never reached the caps. On 2026-09-30 about 30% of the day's Claude use came from timed-out or killed runs. Now:
+  - **Session id:** `ClaudeAgent.run` starts every run with `--session-id <uuid4>`, and keeps that id.
+  - **Metering from the log:** if the run times out, or its output can't be parsed (`parse_claude` returns 0 tokens with `ok` false), tokens are read from Claude Code's session log instead. The log is `<projects_dir>/*/<session-id>.jsonl`, where `projects_dir` defaults to `~/.claude/projects`.
+  - **How the log is counted:** every line whose `message` has an `id` and a `usage`, each message id counted once. The R43 formula applies:
+
+    `input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens // 10`
+
+    Unreadable lines are skipped. A missing log counts as 0.
+  - **The result:** the returned `AgentResult` keeps its failure (`ok` false, the same error) but carries those tokens, so `_call` meters them as usual (R6).
+  - **Codex** reports usage only on a completed turn and keeps no session log under `--ephemeral`. A timed-out Codex run stays unmetered: a known gap, noted in STATUS.
