@@ -35,6 +35,7 @@ NOTE_CAP, NOTES_KEEP, BODY_CAP = 2000, 30, 20000  # R19
 MIN_SECTION_CHARS = 600  # R41: a task's section is its builder's only instructions
 PLAN_REVIEW_MAX = 200_000  # R44: the plan reviewer sees the whole plan, up to this size
 PLAN_ATTEMPTS = 3  # R45: a plan task is blocked after this many rejections
+PLAN_MEMORY_NOTES, PLAN_MEMORY_CHARS = 10, 12000  # R47
 SUBJECT_CAP, CLOSED_KEEP, SENT_IDS_KEEP = 300, 50, 500  # R26, R28
 
 
@@ -1011,7 +1012,10 @@ class Conductor:
         self._reset_wt()
         plan_file = _norm(t["plan_file"])
         try:
-            prior = [n for n in t.get("notes", []) if "plan" in n.lower()][-3:]
+            prior = [str(n) for n in t.get("notes", [])
+                     if str(n).startswith(("plan rejected", "plan review failed"))][-PLAN_MEMORY_NOTES:]  # R47
+            while prior and sum(len(n) for n in prior) > PLAN_MEMORY_CHARS:
+                prior = prior[1:]
             r = self._call("planner", "You are the PLANNER. Write the implementation plan to " + plan_file +
                            " (and no other file), then return its tasks.\n\n" + self._task_prompt(t) +
                            "\nEach task needs: id, title, section, files_in_scope, test_files, test_cmd.\n"
@@ -1024,7 +1028,8 @@ class Conductor:
                            "Before answering (R45), check every task against the numbered rules in "
                            "docs/specs/bootstrap-conductor.md and the decisions in docs/DECISIONS.md: any contradiction "
                            "with them will be rejected as blocking.\n" +
-                           ("\nYOUR EARLIER ATTEMPTS WERE REJECTED FOR:\n" + "\n".join(prior) + "\n" if prior else "") +
+                           ("\nYOUR EARLIER ATTEMPTS WERE REJECTED FOR (fix ALL of these; none may come back):\n" +
+                            "\n".join(prior) + "\n" if prior else "") +
                            "Answer with JSON: {\"tasks\": [...]}", S_PLAN)
         except Capped:
             self._reset_wt()

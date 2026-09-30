@@ -2315,3 +2315,80 @@ class R45PlanAttemptsTests(Harness):
         self.assertEqual(questions[0]["kind"], "blocked")
         self.assertEqual(questions[0]["task"], "T1")
         self.assertEqual(questions[0]["status"], "open")
+
+
+class R47PlannerMemoryTests(Harness):
+    heading = "YOUR EARLIER ATTEMPTS WERE REJECTED FOR (fix ALL of these; none may come back):"
+
+    def planner_prompt(self, notes):
+        child = self.task(section="x" * 600)
+
+        def planner(prompt, cwd):
+            (cwd / "plan.md").write_text("# Plan\n" + child["section"], encoding="utf-8")
+            return json.dumps({"tasks": [child]}), 1
+
+        c = self.init(
+            {"id": "P1", "kind": "plan", "title": "Plan", "section": "Plan",
+             "plan_file": "plan.md", "status": "todo"},
+            agents={"planner": planner},
+        )
+        c._update("P1", notes=notes)
+        self.assertEqual(c._task("P1")["notes"], notes)
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(c.team.planner.prompts), 1)
+        return c.team.planner.prompts[0]
+
+    def assert_memory(self, prompt, kept, omitted=()):
+        self.assertEqual(prompt.count(self.heading), 1)
+        position = prompt.index(self.heading) + len(self.heading)
+        for note in kept:
+            with self.subTest(kept=note[:80]):
+                self.assertIn(note, prompt[position:])
+                position = prompt.index(note, position) + len(note)
+        for note in omitted:
+            with self.subTest(omitted=note[:80]):
+                self.assertNotIn(note, prompt)
+
+    def test_R47_memory_limits(self):
+        for name, expected in (("PLAN_MEMORY_NOTES", 10), ("PLAN_MEMORY_CHARS", 12000)):
+            with self.subTest(constant=name):
+                self.assertEqual(getattr(bootstrap, name, None), expected)
+
+    def test_R47_all_rejections_are_shown_oldest_first_without_other_notes(self):
+        rejections = ["plan rejected: task A lacks interfaces.",
+                      "plan review failed: task B contradicts a decision.",
+                      "plan rejected: task C has a thin section.",
+                      "plan review failed: task D depends on a later task."]
+        other = ["reopened plan task after discussion",
+                 "Ben: the plan rejected yesterday needs another attempt",
+                 "git error: unable to commit plan.md"]
+        notes = [rejections[0], other[0], rejections[1], rejections[2],
+                 other[1], rejections[3], other[2]]
+        self.assert_memory(self.planner_prompt(notes), rejections, other)
+
+    def test_R47_only_last_ten_of_twelve_rejections_are_shown(self):
+        notes = [f"plan rejected: unique issue [{i:02d}]." for i in range(12)]
+        self.assert_memory(self.planner_prompt(notes), notes[-10:], notes[:-10])
+
+    def test_R47_character_limit_drops_oldest_whole_notes_and_keeps_newest(self):
+        notes = [f"plan review failed: issue [{i:02d}] ".ljust(1900, chr(65 + i))
+                 for i in range(8)]
+        self.assertGreater(sum(map(len, notes[-7:])), 12000)
+        self.assertLess(sum(map(len, notes[-6:])), 12000)
+        self.assert_memory(self.planner_prompt(notes), notes[-6:], notes[:-6])
+
+    def test_R47_single_newest_rejection_is_kept_in_full(self):
+        note = "plan rejected: newest issue ".ljust(2000, "x")
+        self.assert_memory(self.planner_prompt([note]), [note])
+
+    def test_R47_other_notes_alone_do_not_add_memory_heading(self):
+        notes = ["reopened plan task for another attempt", "Ben: please revise the plan",
+                 "git error: plan.md could not be committed"]
+        prompt = self.planner_prompt(notes)
+        self.assertNotIn("YOUR EARLIER ATTEMPTS WERE REJECTED FOR", prompt)
+        for note in notes:
+            self.assertNotIn(note, prompt)
+
+    def test_R47_empty_notes_do_not_add_memory_heading(self):
+        prompt = self.planner_prompt([])
+        self.assertNotIn("YOUR EARLIER ATTEMPTS WERE REJECTED FOR", prompt)
