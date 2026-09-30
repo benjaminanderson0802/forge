@@ -669,8 +669,10 @@ class ReviewSmokeTests(Harness):
         self.assertNotEqual((self.state / "meter.json").read_bytes(), before)
         self.assertEqual(c.meter.used_today("codex"), 3 + 14)
         self.assertEqual(c.meter.used_today("claude"), 28)
-        self.assertEqual(len(list((self.state / "runs").glob("*/prompt.md"))), 6)
-        self.assertEqual(len(list((self.state / "runs").glob("*/output.json"))), 6)
+        # T1B2c: the launch gate may probe claude/codex first; those guarded probe runs are recorded too.
+        role_runs = [d for d in (self.state / "runs").iterdir() if "-probe-" not in d.name]
+        self.assertEqual(len([d for d in role_runs if (d / "prompt.md").exists()]), 6)
+        self.assertEqual(len([d for d in role_runs if (d / "output.json").exists()]), 6)
         self.assertTrue((self.state / "smoke_ok.json").exists())
 
     def test_R29_guarded_smoke_refuses_reached_token_cap(self):
@@ -1495,6 +1497,8 @@ class R39SmokeCleanupTests(Harness):
         team, calls = self.smoke_team()
         c = self.make_conductor() if guarded else None
         if c is not None:
+            for role in vars(team):  # T1B2c: the launch gate needs a real provider name to find evidence for
+                getattr(team, role).provider = "codex" if role in ("test_writer", "reviewer") else "claude"
             c.team = team
         remove = shutil.rmtree
         attempts = []

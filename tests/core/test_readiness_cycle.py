@@ -402,6 +402,12 @@ class PromptBlocks(ReadinessHarness):
     def broken_docker(self):
         return self.counting_checks({"docker": (False, "docker not installed or not on PATH")})
 
+    def ungated(self, c):
+        """Direct _call tests of the prompt blocks: skip the T1B2c launch gate so a hand-written map
+        is shown as written (the gate would otherwise refresh it)."""
+        c._launch_gate = lambda *a, **k: None
+        return c
+
     def assert_map_block(self, prompt, role):
         self.assertIn("CAPABILITY MAP (plain-code readiness check; blocker claims that contradict it are rejected):",
                       prompt, role)
@@ -484,7 +490,7 @@ class PromptBlocks(ReadinessHarness):
                 self.assertNotIn("KNOWN DEAD ENDS:", p, role)
 
     def test_empty_map_reads_no_evidence_yet(self):
-        c = self.conductor()
+        c = self.ungated(self.conductor())
         c._call("reviewer", "PROMPT", None, cwd=self.work)
         p = c.team.reviewer.prompts[0]
         self.assertTrue(p.startswith("PROMPT"))
@@ -492,7 +498,7 @@ class PromptBlocks(ReadinessHarness):
         self.assertIn("(no readiness evidence yet)", p)
 
     def test_map_lines_sorted_and_malformed_shown_broken(self):
-        c = self.conductor()
+        c = self.ungated(self.conductor())
         rd.write_map(self.state / "capabilities.json", {
             "zeta": {"ok": True, "detail": "fine", "checked_at": T0.isoformat()},
             "alpha": {"ok": "true", "detail": "fake", "checked_at": T0.isoformat()},
@@ -507,7 +513,7 @@ class PromptBlocks(ReadinessHarness):
         self.assertIn("- zeta: OK - fine", p)
 
     def test_map_block_capped_at_4000_chars(self):
-        c = self.conductor()
+        c = self.ungated(self.conductor())
         rd.write_map(self.state / "capabilities.json", {
             f"cap{i:03d}": {"ok": False, "detail": "x" * 250, "checked_at": T0.isoformat()} for i in range(100)})
         c._call("reviewer", "PROMPT", None, cwd=self.work)
@@ -519,7 +525,7 @@ class PromptBlocks(ReadinessHarness):
     def test_dead_ends_last_50_lines_capped_at_20000(self):
         lines = [json.dumps({"task": "T", "notes": f"dead end number {i:03d} " + "y" * 100}) for i in range(60)]
         (self.state / "dead_ends.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        c = self.conductor()
+        c = self.ungated(self.conductor())
         c._call("builder", "PROMPT", None, cwd=self.work)
         p = c.team.builder.prompts[0]
         self.assertIn("dead end number 059", p)
@@ -536,7 +542,7 @@ class PromptBlocks(ReadinessHarness):
         self.assertIn("big 49", block)
 
     def test_no_dead_ends_block_without_entries(self):
-        c = self.conductor()
+        c = self.ungated(self.conductor())
         c._call("builder", "PROMPT", None, cwd=self.work)
         self.assertNotIn("KNOWN DEAD ENDS:", c.team.builder.prompts[0])
 
