@@ -1768,3 +1768,193 @@ class R41CompletePlanTests(Harness):
         self.assertEqual(len(c.team.reviewer.prompts), 1)
         self.assertEqual(c._task("P1")["status"], "done")
         self.assertEqual(c._task("RETRY_CHILD")["status"], "todo")
+
+
+class R42StopDuringRunTests(Harness):
+    def assert_no_stop_alert(self, c):
+        self.assertEqual(c._read("questions.json", {}), {})
+        self.assertEqual(self.mails, [])
+        self.assertNotIn("halt", c._read("notices.json", {}))
+
+    def assert_call_stopped(self, flags):
+        def stop(prompt, cwd):
+            for flag in flags:
+                (self.state / flag).write_text("owner requested stop\n", encoding="utf-8")
+            return '{"files":[]}', 17
+
+        c = self.make_conductor(agents={"test_writer": stop})
+        c.meter.add("codex", 3)
+        caught = None
+        try:
+            c._call("test_writer", "Stop during this run", bootstrap.S_TESTS, cwd=self.work)
+        except Exception as exc:
+            caught = exc
+        self.assertEqual(len(c.team.test_writer.prompts), 1)
+        with self.subTest(check="Stopped exception and Capped inheritance"):
+            stopped = getattr(bootstrap, "Stopped", None)
+            self.assertIsNotNone(stopped, "core.bootstrap must expose Stopped")
+            self.assertTrue(issubclass(stopped, bootstrap.Capped))
+            self.assertIsInstance(caught, stopped)
+        with self.subTest(check="tokens still metered"):
+            self.assertEqual(c.meter.used_today("codex"), 20)
+        with self.subTest(check="no tamper or halt alert"):
+            self.assert_no_stop_alert(c)
+        with self.subTest(check="stop logged with role and run id"):
+            runs = list((self.state / "runs").iterdir())
+            self.assertEqual(len(runs), 1)
+            self.assertIn(f"stop requested during test_writer run {runs[0].name}",
+                          (self.state / "errors.log").read_text(encoding="utf-8"))
+        for flag in flags:
+            with self.subTest(flag=flag):
+                self.assertEqual((self.state / flag).read_text(encoding="utf-8"),
+                                 "owner requested stop\n")
+
+    def test_R42_call_kill_appearing_is_metered_stop(self):
+        """R42: Stop Forge during an agent run is metered and raises Stopped without mail."""
+        self.assert_call_stopped(("KILL",))
+
+    def test_R42_call_paused_appearing_is_metered_stop(self):
+        """R42: a new PAUSED alone has the same stop semantics as KILL."""
+        self.assert_call_stopped(("PAUSED",))
+
+    def test_R42_call_both_stop_flags_appearing_is_stop(self):
+        """R42: both flags may appear together without being mistaken for tampering."""
+        self.assert_call_stopped(("KILL", "PAUSED"))
+
+    def assert_writer_stop(self, flags, expected):
+        def writer(prompt, cwd):
+            answer = self.write_tests(prompt, cwd)
+            (cwd / "README.md").write_text("unfinished edit\n", encoding="utf-8")
+            for flag in flags:
+                (self.state / flag).touch()
+            return answer
+
+        c = self.init(agents={"test_writer": writer})
+        before = c._task("T1")
+        result = c.step()
+        self.assertEqual(len(c.team.test_writer.prompts), 1)
+        with self.subTest(check="step result"):
+            self.assertEqual(result, expected)
+        with self.subTest(check="todo task unchanged, no failure notes or signatures"):
+            self.assertEqual(c._task("T1"), before)
+            self.assertEqual(c._task("T1")["status"], "todo")
+        with self.subTest(check="worktree reset"):
+            self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+            self.assertFalse((c.wt / "tests/core/test_feat.py").exists())
+            self.assertEqual((c.wt / "README.md").read_text(encoding="utf-8"), "initial\n")
+        with self.subTest(check="no alert"):
+            self.assert_no_stop_alert(c)
+        self.assertEqual(c.team.builder.prompts, [])
+
+    def test_R42_step_writer_killed_resets_without_failure(self):
+        """R42: a stopped test writer leaves a clean worktree and the original todo task."""
+        self.assert_writer_stop(("KILL",), "killed")
+
+    def test_R42_step_writer_paused_resets_without_failure(self):
+        """R42: a paused test writer returns paused and discards its edits."""
+        self.assert_writer_stop(("PAUSED",), "paused")
+
+    def test_R42_step_kill_takes_precedence_over_pause(self):
+        """R42: simultaneous stop flags return killed rather than paused or capped."""
+        self.assert_writer_stop(("KILL", "PAUSED"), "killed")
+
+    def test_R42_step_builder_killed_releases_claim_without_failure(self):
+        """R42: a stopped builder releases its claim and restores the acceptance-tests commit."""
+        def builder(prompt, cwd):
+            self.assertEqual(c._ledger().contracts()["T1"]["status"], "claimed")
+            answer = self.build_feature(prompt, cwd)
+            (cwd / "README.md").write_text("unfinished edit\n", encoding="utf-8")
+            (self.state / "KILL").touch()
+            return answer
+
+        c = self.init(agents={"test_writer": self.write_tests, "builder": builder})
+        self.assertEqual(c.step(), "worked")
+        before = c._task("T1")
+        tests_commit = before["tests_commit"]
+        result = c.step()
+        self.assertEqual(len(c.team.builder.prompts), 1)
+        with self.subTest(check="killed result"):
+            self.assertEqual(result, "killed")
+        with self.subTest(check="claim released, not failed"):
+            self.assertEqual(c._ledger().contracts()["T1"]["status"], "open")
+        with self.subTest(check="no failure note, signature, or counter change"):
+            self.assertEqual(c._task("T1"), before)
+            self.assertEqual(c._task("T1")["status"], "tests_ok")
+        with self.subTest(check="tests commit restored"):
+            self.assertEqual(bootstrap._git(c.wt, "rev-parse", "HEAD"), tests_commit)
+            self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+            self.assertTrue((c.wt / "tests/core/test_feat.py").is_file())
+            self.assertFalse((c.wt / "feat.py").exists())
+        with self.subTest(check="no alert"):
+            self.assert_no_stop_alert(c)
+        self.assertEqual(c.team.reviewer.prompts, [])
+        self.assertEqual(c.team.troubleshooter.prompts, [])
+
+    def test_R42_kill_plus_other_state_change_is_tampering(self):
+        """R42: a new KILL cannot hide a simultaneous change to another state file."""
+        def tamper(prompt, cwd):
+            (self.state / "KILL").touch()
+            (self.state / "queue.json").write_text('{}', encoding="utf-8")
+            return '{"files":[]}', 1
+
+        c = self.init(agents={"test_writer": tamper})
+        with self.assertRaises(bootstrap.Tampered):
+            c._call("test_writer", "Tamper while stopping", bootstrap.S_TESTS, cwd=self.work)
+        self.assertTrue((self.state / "KILL").exists())
+        questions = c._read("questions.json", {})
+        self.assertTrue(any(q["kind"] == "tamper" and q.get("halt") for q in questions.values()))
+
+    def assert_existing_flag_tampered(self, flag, remove):
+        path = self.state / flag
+
+        def tamper(prompt, cwd):
+            if remove:
+                path.unlink()
+            else:
+                path.write_text("changed stop reason\n", encoding="utf-8")
+            return '{"files":[]}', 1
+
+        c = self.make_conductor(agents={"test_writer": tamper})
+        path.write_text("original stop reason\n", encoding="utf-8")
+        # Call directly: step() must never launch an agent with an existing stop flag.
+        with self.assertRaises(bootstrap.Tampered):
+            c._call("test_writer", "Cannot un-stop Forge", bootstrap.S_TESTS, cwd=self.work)
+        self.assertEqual(len(c.team.test_writer.prompts), 1)
+        self.assertTrue((self.state / "KILL").exists())
+
+    def test_R42_existing_paused_removed_is_tampering(self):
+        self.assert_existing_flag_tampered("PAUSED", remove=True)
+
+    def test_R42_existing_kill_removed_is_tampering(self):
+        self.assert_existing_flag_tampered("KILL", remove=True)
+
+    def test_R42_existing_paused_content_changed_is_tampering(self):
+        self.assert_existing_flag_tampered("PAUSED", remove=False)
+
+    def test_R42_existing_kill_content_changed_is_tampering(self):
+        self.assert_existing_flag_tampered("KILL", remove=False)
+
+    def test_R42_guarded_smoke_reports_stop_without_success_stamp(self):
+        """R42: stopping a smoke agent reports a stop, never a token cap or success."""
+        c = self.make_conductor()
+        team, calls = SmokeTests.smoke_team(self)
+        writer = team.test_writer.script
+
+        def stop(prompt, cwd):
+            answer = writer(prompt, cwd)
+            (self.state / "KILL").touch()
+            return answer
+
+        team.test_writer = FakeAgent(stop, provider="codex")
+        c.team = team
+        c._write("smoke_ok.json", {"at": c.clock().isoformat()})
+        problems = bootstrap._guarded_smoke(c, self.work, force=True)
+        with self.subTest(check="stop problem"):
+            self.assertTrue(any("stopped during the smoke test" in p.lower() for p in problems), problems)
+            self.assertFalse(any("token cap reached" in p.lower() for p in problems), problems)
+        with self.subTest(check="no success stamp"):
+            self.assertFalse((self.state / "smoke_ok.json").exists())
+        with self.subTest(check="no later smoke roles"):
+            self.assertEqual([role for role, cwd in calls], ["test_writer"])
+        with self.subTest(check="no alert"):
+            self.assert_no_stop_alert(c)
