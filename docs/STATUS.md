@@ -27,6 +27,9 @@
 
 ## Open items for Ben
 
+- **ChatGPT Dots evaluated (2026-09-30):** not adopted for now. Email stays Forge's channel. A Dot round-trip trial is part of 1E, and the criteria are in `docs/specs/layer-1-design.md`. Ben's included Dot can do research outside the trusted core.
+
+
 - **T1A3 task definition was unsatisfiable** (fixed 2026-09-29, in this pull request). The task text included plan steps 5–7: the CI workflow (a protected file outside the builder's scope), the live gate on Ben's PC, and the layer PR. The reviewer rightly failed the builder for missing them, twice. The task is now Steps 1–4, and reviewers are told the judges already ran on the PC. Lesson: every task in a queue must be fully doable within its own `files_in_scope`.
 - **CI does not run the core unit tests.** `.github/workflows/core-checks.yml` has no unit-test step (T1A3 plan, Step 5). It is a protected file, so it needs a pull request and Ben's approval.
 - **Bug: Stop Forge during an agent run trips the tamper alarm.** The shortcut writes `state/bootstrap/KILL`, and `state/` is fingerprinted around every agent run. Forge still stops, but its email says "tampered". The fix (core, so it needs Ben) is for KILL and PAUSED appearing during a run to count as a stop, not as tampering. Until then, stop Forge between runs, or disable the task and end its process.
