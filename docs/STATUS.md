@@ -2,20 +2,25 @@
 
 > Forge updates this file after every cycle once Layer 1 runs. Until then, whoever finishes a piece of work updates it. Keep it short: where things stand now, not history (history is in git and the ledger).
 
-**Updated:** 2026-09-30 (07:50 UTC)
+**Updated:** 2026-09-30 (10:30 UTC)
 
 ## Now
 
-- **Building 24/7 (D-037, PR #14).** Ben's approval to build is standing: builders label and merge their own tested, Codex-reviewed changes. The hourly "Forge supervisor" scheduled task keeps building from `docs/SUPERVISOR.md`, whether or not a chat is open. Its log is `C:\Users\benja\Forge-work\supervisor-log.md`.
-- **Merged today:**
-  - **PR #12, R41:** plans carry complete tasks.
-  - **PR #15, R42:** Stop Forge during a run is a stop, not tampering.
-  - **PR #17, R43:** token caps count cached input at one tenth, the real cost. Before this, one plan run registered as about 4.6M tokens.
-  - **PR #16:** the 1B plan is split into P1B1 (judges), P1B2 (readiness) and P1B3 (role files, worktrees, merge). The whole-1B plan timed out at 30 minutes, and its review found 10 real gaps. Each part carries its share of those findings.
-- **Conductor:** restarted 07:43 UTC on the merged code, with the queue split applied.
-  - Queue: P1B1, P1B2, P1B3, P1C, P1D and P1E to plan.
-  - 1A readiness is done (T1A3R). T1A3 is kept as a blocked record.
-  - P1C's first plan was rejected by review with fair findings, which its next attempt carries.
+- **Building 24/7 (D-037).** Builders label and merge their own tested, Codex-reviewed changes. The hourly supervisor's brief is `docs/SUPERVISOR.md`; its log is `C:\Users\benja\Forge-work\supervisor-log.md`.
+- **Conductor fixes merged today, each with tests written first by Codex, a Codex review, and CI:**
+  - **R42 (#15):** a stop during a run is a stop, not tampering.
+  - **R43 (#17):** cached input counts at one tenth.
+  - **R44 (#20):** the plan reviewer blocks only for blocking problems; its notes travel with the tasks; it sees the whole plan (it had been cut at 20,000 characters).
+  - **R45 (#22):** plans get 3 attempts, and the planner checks itself against the rules.
+  - **R46 (#23):** killed or timed-out Claude runs are metered from their session logs.
+  - **R47 (#24):** the planner sees every earlier rejection.
+  - **Also:** D-038, the mutation gate is a rate (#21); CI runs the core unit tests (#19).
+- **Layer 1 queue:**
+  - **Plans passed:** P1B1 (judges; T1B1a-e queued) and P1B3 (role files, worktrees, safe merge; T1B3a-e queued).
+  - **P1B2 (readiness):** re-planning with the full rejection history after 3 attempts, each finding one real gap.
+  - **Still to plan:** P1C, P1D, P1E.
+  - **Then** the 10 queued build tasks run.
+- **Token caps:** today's Claude meter was recounted from session logs with R43 weighting (the cap is unchanged). Planning uses about 1.7M weighted tokens an hour, so the 10M daily cap is reached around midday UTC. Raising it is Ben's call.
 
 ## Known risks
 
@@ -31,11 +36,13 @@
 
 ## Needs Ben (not build approvals; building continues around these)
 
+- Decide whether to raise `claude_daily_token_cap` (10M a day, weighted) to 20M. It shares his Claude plan allowance.
+
 - Turn on **"Require this computer"** for the "Forge supervisor (hourly builder)" scheduled task in the Claude desktop app, so it can reach the PC.
 - Keep the PC awake. In PowerShell as admin: `powercfg /change standby-timeout-ac 0`
 
 ## Open items
 
 - **ChatGPT Dots evaluated (2026-09-30):** not adopted for now. Email stays Forge's channel. A Dot round-trip trial is part of 1E, and the criteria are in `docs/specs/layer-1-design.md`.
-- **CI does not run the core unit tests.** `.github/workflows/core-checks.yml` has no unit-test step. Add one (supervisor, under D-037).
+- **Codex runs that time out are not metered.** Codex keeps no session log under `--ephemeral` and reports usage only on a completed turn (see R46).
 - **Plan size:** a planner call has 30 minutes. If a part still times out, split it further rather than raising the timeout.
