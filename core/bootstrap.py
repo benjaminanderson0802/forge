@@ -26,6 +26,7 @@ from typing import Callable
 
 from core.ledger import Ledger, Rejected
 from core.usage import Meter
+from core.weaktest import empty_implementation, real_failing_run, stub_targets
 
 ROLES = {"ci": "ci", "forge-manager": "manager", "forge-executor": "executor",
          "forge-auditor": "auditor", "forge-core": "core", "benjamin": "human"}
@@ -652,16 +653,86 @@ class Conductor:
 
     def _run_tests(self, t: dict) -> tuple[int, str, bool]:
         """R1: run a task's unittest command without a shell. Returns (exit, output, timed_out)."""
+        return self._exec_tests(t)
+
+    def _exec_tests(self, t: dict) -> tuple[int, str, bool]:
+        """The real test run behind _run_tests. Bytecode goes to a fresh private cache that is deleted afterwards,
+        so no run reads a stale .pyc (e.g. of a same-size stub) or leaves one in the worktree."""
         paths = parse_test_cmd(t["test_cmd"], t["test_files"])
         if paths is None:
             return 2, "unsafe test_cmd", False
+        import shutil
+        import tempfile
+        cache = tempfile.mkdtemp(prefix="forge-pyc-")
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPYCACHEPREFIX=cache)
         try:
             p = subprocess.run([sys.executable, "-m", "unittest", *paths], cwd=str(self.wt), capture_output=True,
                                text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
-                               timeout=int(self.limits.get("test_timeout_s", 600)), **NOWIN)
+                               timeout=int(self.limits.get("test_timeout_s", 600)), env=env, **NOWIN)
             return p.returncode, (p.stdout or "") + (p.stderr or ""), False
         except subprocess.TimeoutExpired:
             return 124, "test command timed out", True
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+
+    def _run_tests_on_stub(self, t: dict) -> tuple[int, str, bool]:
+        """The empty-implementation run of Stage A (always the real runner, isolated bytecode cache)."""
+        return self._exec_tests(t)
+
+    def _empty_impl_check(self, t: dict, changed: list[str]) -> str | None:
+        """R4 on an empty implementation: stub the in-scope modules, run the tests, restore. Returns a rejection
+        note or None. Raises RuntimeError if the worktree is not exactly back to the writer's test files."""
+        tracked = [_norm(x) for x in _git(self.wt, "ls-files").splitlines() if x.strip()]
+        to_stub, to_create = stub_targets(list(t["files_in_scope"]), tracked, list(t["test_files"]))
+        created_files: list[Path] = []
+        created_dirs: list[Path] = []
+        preexisting: dict[Path, bytes] = {}
+        stubbed: list[str] = []
+        try:
+            for rel in to_stub:
+                f = self.wt / rel
+                stubbed.append(rel)
+                try:
+                    text = empty_implementation(f.read_bytes().decode("utf-8"))
+                except (SyntaxError, ValueError):  # unparsable (or undecodable): the empty module is an empty file
+                    text = ""
+                f.write_bytes(text.encode("utf-8"))
+            for rel in to_create:
+                f = self.wt / rel
+                missing = []
+                d = f.parent
+                while d != self.wt and not d.exists():
+                    missing.append(d)
+                    d = d.parent
+                for d in reversed(missing):
+                    d.mkdir()
+                    created_dirs.append(d)
+                if f.exists():
+                    preexisting[f] = f.read_bytes()
+                else:
+                    created_files.append(f)
+                f.write_bytes(b"")
+            code, out, timed_out = self._run_tests_on_stub(t)
+        finally:
+            if stubbed:
+                _git(self.wt, "checkout", "-q", "HEAD", "--", *stubbed)
+            for f in created_files:
+                f.unlink(missing_ok=True)
+            for f, raw in preexisting.items():
+                f.write_bytes(raw)
+            for d in sorted(created_dirs, key=lambda x: len(x.parts), reverse=True):
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
+        if self._changed() != sorted(changed):
+            raise RuntimeError("empty implementation restore failed")
+        why = real_failing_run(code, out, timed_out)
+        if why == "passed":
+            return "tests rejected: weak (they pass on an empty implementation)"
+        if why:
+            return f"tests rejected: no real failing run on the empty implementation ({why})"
+        return None
 
     def _run_cmd(self, cmd: str) -> tuple[int, str]:
         try:
@@ -701,11 +772,13 @@ class Conductor:
                 f for f in changed if f not in [_norm(x) for x in t["test_files"]])
         else:
             code, out, timed_out = self._run_tests(t)
-            ran = re.search(r"Ran ([1-9]\d*) tests?", out)
-            if timed_out or not ran:
-                reason = "tests rejected: no real failing run (timed out or no tests ran)"
-            elif code == 0:
+            why = real_failing_run(code, out, timed_out)
+            if why == "passed":
                 reason = "tests rejected: weak (they pass before the feature exists)"
+            elif why:
+                reason = "tests rejected: no real failing run (timed out or no tests ran)"
+            else:  # R4 again on an empty implementation (layer-1 design 3.1)
+                reason = self._empty_impl_check(t, changed)
         if reason:
             self._reset_wt()
             rejects = t.get("test_rejects", 0) + 1
