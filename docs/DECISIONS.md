@@ -177,3 +177,5 @@ This comes from the email-flood incident (`docs/incidents/2026-09-29-email-flood
 
   These go in his queue while building continues on everything else.
 - **A builder is always on.** An hourly "Forge supervisor" scheduled task works from `docs/SUPERVISOR.md`, so building continues whether or not a chat is open.
+
+**D-038 (2026-09-30) The mutation gate is a rate, not "every mutant".** The design said both that "each mutant must be caught" and that "the rate must be at least `mutation_min`". The 1B plan reviewer rightly flagged the contradiction. Some mutants are equivalent (they don't change behaviour) and can never be caught, so a 100% rule is unworkable. The gate is: the kill rate on changed lines is at least `mutation_min` (0.8 in `charter/limits.json`), and every surviving mutant is reported to the Builder and Reviewer as evidence. Decided by the builder under D-037.
