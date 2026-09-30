@@ -348,7 +348,8 @@ class Ledger:
 
     @staticmethod
     def _check_merge_evidence(cid: str, c: dict, payload: dict, runs: dict) -> None:
-        """Optional merge evidence on a pass. Absent (or null) fields are not checked."""
+        """Optional merge evidence on a pass. Absent keys are not checked; a key
+        that is present must hold a valid value (null is invalid, not absent)."""
         def bad(why: str):
             raise Rejected(f"pass merge evidence incomplete: {why}")
 
@@ -358,18 +359,19 @@ class Ledger:
         def strs(v) -> bool:
             return isinstance(v, list) and all(isinstance(x, str) for x in v)
 
-        task_commit = payload.get("task_commit")
-        if task_commit is not None and (not isinstance(task_commit, str) or task_commit != c["commit"]):
-            bad("task_commit is not the submitted commit")
-        final_sha = payload.get("final_sha")
-        if final_sha is not None and not sha40(final_sha):
+        if "task_commit" in payload:
+            task_commit = payload["task_commit"]
+            if not isinstance(task_commit, str) or task_commit != c["commit"]:
+                bad("task_commit is not the submitted commit")
+        has_final = "final_sha" in payload
+        if has_final and not sha40(payload["final_sha"]):
             bad("final_sha must be a 40-character lowercase hex sha")
-        merges = payload.get("merges")
-        if merges is None:
+        if "merges" not in payload:
             return
+        merges = payload["merges"]
         if not isinstance(merges, list):
             bad("merges must be a list")
-        if merges and final_sha is None:
+        if merges and not has_final:
             bad("merges need final_sha")
         for i, m in enumerate(merges):
             if not isinstance(m, dict):

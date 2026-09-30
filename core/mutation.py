@@ -9,6 +9,7 @@ import io
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -241,16 +242,58 @@ class MutationResult:
         }
 
 
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the test process and everything it started (same approach as agents.launch)."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def _default_run(argv: list[str], root: Path, timeout: float,
                  env: dict) -> tuple[int, bool]:
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    """Run the tests once; on timeout kill the whole process tree.
+
+    Output is discarded to DEVNULL rather than captured through pipes: a
+    grandchild that inherited a pipe would keep it open after the test process
+    dies, and waiting to drain it (what subprocess.run does on Windows after a
+    timeout) would hang for as long as that orphan lives. Only the test
+    process itself is waited on.
+    """
+    kw: dict = {}
+    if os.name == "nt":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kw["start_new_session"] = True
+    proc = subprocess.Popen(list(argv), cwd=root, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            env=env, **kw)
     try:
-        proc = subprocess.run(list(argv), cwd=root, capture_output=True,
-                              stdin=subprocess.DEVNULL, timeout=timeout, env=env,
-                              creationflags=flags)
+        code = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
         return 124, True
-    return proc.returncode, False
+    if os.name != "nt":
+        # a finished test run must not leave helpers behind to touch the tree
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return code, False
 
 
 def run_mutation(root: Path, changed: dict[str, set[int]], test_argv: list[str], *,
@@ -290,19 +333,27 @@ def run_mutation(root: Path, changed: dict[str, set[int]], test_argv: list[str],
         if remaining <= 0:
             not_run.extend(m.id for m in mutants[index:])
             break
-        timeout = min(per_mutant_timeout_s, remaining)
         target = root / mutant.file
         cache = tempfile.mkdtemp(prefix="forge-mut-pyc-")
         env = dict(os.environ)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONPYCACHEPREFIX"] = cache
+        launched = False
         try:
             with open(target, "w", encoding="utf-8", newline="") as handle:
                 handle.write(mutant.source)
-            code, timed_out = runner(list(test_argv), root, timeout, env)
+            # setup takes time too: recompute right before launching
+            remaining = deadline - clock()
+            if remaining > 0:
+                timeout = min(per_mutant_timeout_s, remaining)
+                launched = True
+                code, timed_out = runner(list(test_argv), root, timeout, env)
         finally:
             target.write_bytes(originals[mutant.file])
             shutil.rmtree(cache, ignore_errors=True)
+        if not launched:
+            not_run.extend(m.id for m in mutants[index:])
+            break
         overran = clock() >= deadline
         if overran or (timed_out and timeout < per_mutant_timeout_s):
             not_run.append(mutant.id)

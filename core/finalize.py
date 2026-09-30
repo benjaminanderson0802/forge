@@ -9,7 +9,7 @@ Assumptions about collaborators (injected, so this module does not depend on the
 - `trees` is a core.worktrees.Worktrees (T1B3b): `throwaway(sha)` context manager yielding a worktree
   path at exactly `sha`, and an idempotent `remove_task(tid)`.
 - The ledger (T1B3c) is reached only through the `Hooks.ledger_pass` / `Hooks.ledger_completed` callables.
-- `Hooks.get_task(tid)` (optional) reads the durable queue entry, so the queue completion is not repeated
+- `Hooks.get_task(tid)` (required) reads the durable queue entry, so the queue completion is not repeated
   after a crash between `set_task` and the journal save. `Hooks.find_question(kind, subject, tid)`
   (optional) finds a still-open question asked earlier for this record, so a crash between `ask` and the
   blocked-status save never asks twice.
@@ -221,9 +221,15 @@ class Hooks:
     ledger_pass: Callable[[dict], None]
     ledger_completed: Callable[[str], bool]
     set_task: Callable[[str, dict], None]
+    # Required: reads the durable queue entry so a crash between set_task and the journal save
+    # (after:queue) never completes the task twice.
+    get_task: Callable[[str], Optional[dict]]
     crash: Callable[[str], None] = _noop
-    get_task: Optional[Callable[[str], Optional[dict]]] = None
     find_question: Optional[Callable[[str, str, str], Optional[str]]] = None
+
+    def __post_init__(self) -> None:
+        if not callable(self.get_task):
+            raise TypeError("Hooks.get_task is required: exactly-once queue completion depends on it")
 
 
 class _Stop(Exception):
@@ -271,15 +277,40 @@ class Finalizer:
                 "merge_candidates": [c["sha"] for c in rec.get("candidates") or [] if c.get("state") == "approved"]}
 
     # ---------------------------------------------------------------- blocking
-    def _block(self, rec: dict, reason: str, detail: str, other: Optional[str] = None) -> None:
+    def _set_blocking(self, rec: dict, reason: str, detail: str, other: Optional[str] = None) -> None:
+        """Record the blocking intent in `rec` (not saved yet)."""
         tid = rec["tid"]
         subject = f"Forge merge blocked: task {tid}: {reason}"
         body = (f"Task {tid} (commit {rec['task_sha']}) could not be finalized into {self.layer}.\n"
                 f"Reason: {reason}\n\n{detail}\n\n"
                 "Nothing was pushed for this task. Other work continues meanwhile; this task waits for your answer.")
         rec["blocking"] = {"reason": reason, "other": other, "subject": subject, "body": body}
+
+    def _block(self, rec: dict, reason: str, detail: str, other: Optional[str] = None) -> None:
+        self._set_blocking(rec, reason, detail, other)
         self._save(rec)  # the question/record association survives a crash right after `ask`
         self._finish_block(rec, resumed=False)
+
+    def _reject(self, rec: dict, cand: dict) -> None:
+        """Block on a rejected candidate. The rejected state and the blocking intent go to disk in ONE
+        save, so no crash can leave an active record with a rejected candidate and no question.
+        Also the recovery path for such a record written by older code (rejected, but no `blocking`)."""
+        cand["state"] = "rejected"
+        if cand.get("conflicts"):
+            self._set_blocking(rec, "merge_conflict",
+                               f"Merging {cand['other']} into {cand['base']} conflicts in:\n"
+                               + "\n".join(f"- {f}" for f in cand["conflicts"]), other=cand["other"])
+        elif cand.get("passed") is False:
+            self._set_blocking(rec, "judge failed",
+                               f"The merge commit {cand.get('sha')} failed its checks (run {cand.get('run_id')}):\n"
+                               f"{cand.get('judge_output') or ''}", other=cand["other"])
+        else:
+            reasons = cand.get("reasons") or ["no reasons given"]
+            self._set_blocking(rec, "review failed",
+                               f"The reviewer did not pass merge commit {cand.get('sha')}:\n"
+                               + "\n".join(f"- {r}" for r in reasons), other=cand["other"])
+        self._save(rec)
+        self._finish_block(rec, resumed=True)  # resumed: a question may already exist for this record
 
     def _finish_block(self, rec: dict, resumed: bool) -> None:
         b = rec["blocking"]
@@ -416,10 +447,8 @@ class Finalizer:
                 _git(tw, "update-ref", ref, "HEAD")
                 sha = _git(tw, "rev-parse", "HEAD")
         if conflicts is not None:
-            cand.update(state="rejected", conflicts=conflicts)
-            self._block(rec, "merge_conflict",
-                        f"Merging {other} into {base} conflicts in:\n" + "\n".join(f"- {f}" for f in conflicts),
-                        other=other)
+            cand["conflicts"] = conflicts
+            self._reject(rec, cand)
         self._crash("after:candidate-merge")
         parents = _git(self.wt, "rev-list", "--parents", "-n", "1", sha).split()[1:]
         cand.update(sha=sha, parents=parents, state="created")
@@ -427,6 +456,8 @@ class Finalizer:
 
     def _candidate(self, rec: dict) -> None:
         cand = rec["candidates"][-1]
+        if cand["state"] == "rejected":
+            self._reject(rec, cand)  # crash after the rejection was saved: resume into blocking
         if cand["state"] == "creating":
             self._create(rec, cand)
         if cand["state"] == "created":
@@ -435,24 +466,20 @@ class Finalizer:
             self._crash("after:judge")
             cand.update(run_id=res.get("run_id"), passed=bool(res.get("passed")),
                         judge_output=str(res.get("output") or "")[-OUTPUT_CAP:])
-            cand["state"] = "judged" if cand["passed"] else "rejected"
-            self._save(rec)
             if not cand["passed"]:
-                self._block(rec, "judge failed",
-                            f"The merge commit {cand['sha']} failed its checks (run {cand['run_id']}):\n"
-                            f"{cand['judge_output']}", other=cand["other"])
+                self._reject(rec, cand)
+            cand["state"] = "judged"
+            self._save(rec)
         if cand["state"] == "judged":
             self._crash("before:review")
             res = self.hooks.review(rec, cand)
             self._crash("after:review")
             reasons = [str(x) for x in (res or {}).get("reasons") or []]
             cand.update(verdict=(res or {}).get("verdict"), reasons=reasons)
-            cand["state"] = "reviewed" if cand["verdict"] == "pass" else "rejected"
+            if cand["verdict"] != "pass":
+                self._reject(rec, cand)
+            cand["state"] = "reviewed"
             self._save(rec)
-            if cand["state"] == "rejected":
-                self._block(rec, "review failed",
-                            f"The reviewer did not pass merge commit {cand['sha']}:\n"
-                            + "\n".join(f"- {r}" for r in reasons or ["no reasons given"]), other=cand["other"])
         if cand["state"] == "reviewed":
             self._crash("before:approve")
             self.approved.add(cand["sha"], {"tid": rec["tid"], "kind": cand["kind"], "base": cand["base"],
@@ -549,8 +576,6 @@ class Finalizer:
 
     # 8. queue ------------------------------------------------------------
     def _already_done(self, tid: str, payload: dict) -> bool:
-        if self.hooks.get_task is None:
-            return False
         t = self.hooks.get_task(tid) or {}
         return all(t.get(k) == v for k, v in payload.items())
 
