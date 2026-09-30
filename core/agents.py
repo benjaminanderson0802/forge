@@ -258,7 +258,7 @@ def claude_log_tokens(session_id: str, projects_dir: Path) -> int:
             if not isinstance(m, dict):
                 continue
             mid, u = m.get("id"), m.get("usage")
-            if not mid or not isinstance(u, dict) or mid in seen:
+            if not isinstance(mid, str) or not mid or not isinstance(u, dict) or mid in seen:
                 continue
             seen.add(mid)
             total += sum(_n(u.get(k)) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens")) \
