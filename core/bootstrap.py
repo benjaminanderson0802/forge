@@ -912,8 +912,10 @@ class Conductor:
                   "\nAnswer with JSON: {\"kind\": \"fix\" | \"dead_end\", \"notes\": \"...\", \"alternative\": \"...\"}")
         try:
             r = self._call("troubleshooter", prompt, S_TROUBLE)
-        finally:  # R42: a stopped or capped run leaves no edits behind
+        except Capped:  # R42: a stopped run leaves no edits behind (never on Tampered: state can't be trusted)
             self._reset_wt()
+            raise
+        self._reset_wt()
         notes = t.get("trouble_notes", [])
         if r.ok:
             d = r.data or {}
@@ -933,10 +935,15 @@ class Conductor:
         design = self.wt / "docs" / "specs" / "layer-1-design.md"
         text = design.read_text(encoding="utf-8") if design.exists() else "(no design file)"
         listing = "\n".join(f"- {t['id']} [{t['status']}] {t['title']}" for t in q["tasks"])
-        r = self._call("drift_keeper", "You are the DRIFT KEEPER (read-only). Is this work still on course for "
-                                       "the design? Say replan only if it is drifting.\n\nTASKS:\n" + listing +
-                       "\n\nDESIGN:\n" + text[:40000] +
-                       "\nAnswer with JSON: {\"status\": \"ok\" | \"replan\", \"reasons\": [...]}", S_DRIFT)
+        try:
+            r = self._call("drift_keeper", "You are the DRIFT KEEPER (read-only). Is this work still on course for "
+                                           "the design? Say replan only if it is drifting.\n\nTASKS:\n" + listing +
+                           "\n\nDESIGN:\n" + text[:40000] +
+                           "\nAnswer with JSON: {\"status\": \"ok\" | \"replan\", \"reasons\": [...]}", S_DRIFT)
+        except Capped:  # R42: a stopped run leaves no edits behind
+            if self.wt.exists():
+                self._reset_wt()
+            raise
         status = (r.data or {}).get("status") if r.ok else None
         q = self._queue()
         if status not in ("ok", "replan"):  # R6: unusable result, retry; escalate after 3
