@@ -186,6 +186,24 @@ def _finish(provider: str, text: str, tokens: int, schema: dict | None) -> Agent
     return AgentResult(text, tokens, True, None, data, provider)
 
 
+def _n(v) -> int:
+    """R43: a usage field as a count. Anything that can't be read as a finite non-negative number (numbers and
+    numeric strings can) counts as 0, so a bad, negative or infinite field can never cancel out real usage."""
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, int):  # exact, any size
+        return v if v > 0 else 0
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if f != f or f in (float("inf"), float("-inf")) or f <= 0:
+        return 0
+    return int(f)
+
+
 def parse_claude(out: str, schema: dict | None) -> AgentResult:
     try:
         data = json.loads(out.strip().splitlines()[-1]) if out.strip() else None
@@ -194,8 +212,8 @@ def parse_claude(out: str, schema: dict | None) -> AgentResult:
     if not isinstance(data, dict):
         return AgentResult(out[-500:], 0, False, "unreadable output from Claude Code", None, "claude")
     u = data.get("usage") or {}
-    tokens = sum(int(u.get(k) or 0) for k in
-                 ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    tokens = sum(_n(u.get(k)) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens")) \
+        + _n(u.get("cache_read_input_tokens")) // 10  # R43: cache reads cost about a tenth
     text = str(data.get("result") or "")
     if data.get("is_error"):
         return AgentResult(text, tokens, False, text or "Claude Code reported an error", None, "claude")
@@ -211,7 +229,9 @@ def parse_codex(code: int, events_out: str, last_message: str, schema: dict | No
             continue
         if ev.get("type") == "turn.completed":
             u = ev.get("usage") or {}
-            tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "output_tokens", "reasoning_output_tokens"))
+            inp = _n(u.get("input_tokens"))
+            cached = min(_n(u.get("cached_input_tokens")), inp)  # R43: clamped to 0..input
+            tokens = (inp - cached) + cached // 10 + _n(u.get("output_tokens")) + _n(u.get("reasoning_output_tokens"))
             done = True
     if code != 0 or not done or not last_message.strip():
         why = _codex_error(events_out)

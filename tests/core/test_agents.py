@@ -32,7 +32,7 @@ class ClaudeParseTests(unittest.TestCase):
         out = json.dumps({"is_error": False, "result": "ok", "usage": {"input_tokens": 10, "output_tokens": 5,
                           "cache_creation_input_tokens": 2, "cache_read_input_tokens": 3}})
         r = parse_claude(out, None)
-        self.assertEqual((r.ok, r.text, r.tokens, r.provider), (True, "ok", 20, "claude"))
+        self.assertEqual((r.ok, r.text, r.tokens, r.provider), (True, "ok", 17, "claude"))
 
     def test_not_logged_in(self):
         r = parse_claude(json.dumps({"is_error": True, "result": "Not logged in · Please run /login"}), None)
@@ -60,7 +60,7 @@ class CodexParseTests(unittest.TestCase):
                           {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 80,
                                                                "output_tokens": 5, "reasoning_output_tokens": 7}})
         r = parse_codex(0, out, "ok", None)
-        self.assertEqual((r.ok, r.text, r.tokens, r.provider), (True, "ok", 112, "codex"))
+        self.assertEqual((r.ok, r.text, r.tokens, r.provider), (True, "ok", 40, "codex"))
 
     def test_codex_no_turn_completed(self):
         r = parse_codex(1, self.events({"type": "thread.started"}), "", None)
@@ -70,6 +70,218 @@ class CodexParseTests(unittest.TestCase):
         out = self.events({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}})
         r = parse_codex(0, out, '{"verdict": "fail", "reasons": ["x"]}', {"type": "object", "required": ["verdict"]})
         self.assertTrue(r.ok); self.assertEqual(r.data["verdict"], "fail")
+
+class R43TokenWeightTests(unittest.TestCase):
+    def test_codex_nonfinite_fields_preserve_valid_usage(self):
+        for field, expected in (("cached_input_tokens", 1057), ("input_tokens", 57)):
+            for value in (float("inf"), float("-inf"), float("nan")):
+                with self.subTest(field=field, value=value):
+                    usage = {"input_tokens": 1000, "cached_input_tokens": 400,
+                             "output_tokens": 50, "reasoning_output_tokens": 7}
+                    usage[field] = value
+                    out = json.dumps({"type": "turn.completed", "usage": usage})
+                    result = parse_codex(0, out, "ok", None)
+                    self.assertTrue(result.ok, result.error)
+                    self.assertEqual(result.tokens, expected)
+
+    def test_claude_nonfinite_fields_preserve_valid_usage(self):
+        for field, expected in (("cache_read_input_tokens", 1057), ("input_tokens", 97)):
+            for value in (float("inf"), float("-inf"), float("nan")):
+                with self.subTest(field=field, value=value):
+                    usage = {"input_tokens": 1000, "output_tokens": 50,
+                             "cache_creation_input_tokens": 7, "cache_read_input_tokens": 400}
+                    usage[field] = value
+                    out = json.dumps({"is_error": False, "result": "ok", "usage": usage})
+                    result = parse_claude(out, None)
+                    self.assertTrue(result.ok, result.error)
+                    self.assertEqual(result.tokens, expected)
+
+    def test_codex_boolean_fields_count_as_zero(self):
+        for field, expected in (("input_tokens", 57), ("cached_input_tokens", 1057),
+                                ("output_tokens", 647), ("reasoning_output_tokens", 690)):
+            for value in (True, False):
+                with self.subTest(field=field, value=value):
+                    usage = {"input_tokens": 1000, "cached_input_tokens": 400,
+                             "output_tokens": 50, "reasoning_output_tokens": 7}
+                    usage[field] = value
+                    out = json.dumps({"type": "turn.completed", "usage": usage})
+                    result = parse_codex(0, out, "ok", None)
+                    self.assertTrue(result.ok, result.error)
+                    self.assertEqual(result.tokens, expected)
+
+    def test_claude_boolean_fields_count_as_zero(self):
+        for field, expected in (("input_tokens", 97), ("output_tokens", 1047),
+                                ("cache_creation_input_tokens", 1090), ("cache_read_input_tokens", 1057)):
+            for value in (True, False):
+                with self.subTest(field=field, value=value):
+                    usage = {"input_tokens": 1000, "output_tokens": 50,
+                             "cache_creation_input_tokens": 7, "cache_read_input_tokens": 400}
+                    usage[field] = value
+                    out = json.dumps({"is_error": False, "result": "ok", "usage": usage})
+                    result = parse_claude(out, None)
+                    self.assertTrue(result.ok, result.error)
+                    self.assertEqual(result.tokens, expected)
+
+    def test_codex_json_negative_overflow_preserves_valid_usage(self):
+        cases = (
+            ('{"input_tokens": 1000, "cached_input_tokens": -1e400, '
+             '"output_tokens": 50, "reasoning_output_tokens": 7}', 1057),
+            ('{"input_tokens": -1e400, "cached_input_tokens": 400, '
+             '"output_tokens": 50, "reasoning_output_tokens": 7}', 57),
+        )
+        for usage_json, expected in cases:
+            with self.subTest(usage=usage_json):
+                out = '{"type": "turn.completed", "usage": ' + usage_json + '}'
+                result = parse_codex(0, out, "ok", None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+
+    def test_claude_json_negative_overflow_preserves_valid_usage(self):
+        cases = (
+            ('{"input_tokens": 1000, "cache_read_input_tokens": -1e400, '
+             '"output_tokens": 50, "cache_creation_input_tokens": 7}', 1057),
+            ('{"input_tokens": -1e400, "cache_read_input_tokens": 400, '
+             '"output_tokens": 50, "cache_creation_input_tokens": 7}', 97),
+        )
+        for usage_json, expected in cases:
+            with self.subTest(usage=usage_json):
+                out = '{"is_error": false, "result": "ok", "usage": ' + usage_json + '}'
+                result = parse_claude(out, None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+
+    def test_codex_bad_cached_input_counts_all_input_as_fresh(self):
+        for cached in ("unknown", -10500):
+            with self.subTest(cached_input_tokens=cached):
+                out = json.dumps({"type": "turn.completed", "usage": {
+                    "input_tokens": 1000, "output_tokens": 50,
+                    "cached_input_tokens": cached}})
+                result = parse_codex(0, out, "ok", None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, 1050)
+
+    def test_claude_bad_cache_read_cannot_cancel_real_usage(self):
+        for cached in ("unknown", -10500):
+            with self.subTest(cache_read_input_tokens=cached):
+                out = json.dumps({"is_error": False, "result": "ok", "usage": {
+                    "input_tokens": 1000, "output_tokens": 50,
+                    "cache_read_input_tokens": cached}})
+                result = parse_claude(out, None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, 1050)
+
+    def test_codex_bad_other_fields_preserve_valid_usage(self):
+        for field, expected in (("input_tokens", 57), ("output_tokens", 647),
+                                ("reasoning_output_tokens", 690)):
+            for value in ("unknown", -10500):
+                with self.subTest(field=field, value=value):
+                    usage = {"input_tokens": 1000, "cached_input_tokens": 400,
+                             "output_tokens": 50, "reasoning_output_tokens": 7}
+                    usage[field] = value
+                    out = json.dumps({"type": "turn.completed", "usage": usage})
+                    result = parse_codex(0, out, "ok", None)
+                    self.assertTrue(result.ok, result.error)
+                    self.assertEqual(result.tokens, expected)
+
+    def test_claude_bad_other_fields_preserve_valid_usage(self):
+        for field, expected in (("input_tokens", 97), ("output_tokens", 1047),
+                                ("cache_creation_input_tokens", 1090)):
+            for value in ("unknown", -10500):
+                with self.subTest(field=field, value=value):
+                    usage = {"input_tokens": 1000, "output_tokens": 50,
+                             "cache_creation_input_tokens": 7, "cache_read_input_tokens": 400}
+                    usage[field] = value
+                    out = json.dumps({"is_error": False, "result": "ok", "usage": usage})
+                    result = parse_claude(out, None)
+                    self.assertTrue(result.ok, result.error)
+                    self.assertEqual(result.tokens, expected)
+
+    def test_codex_numeric_strings_count_as_numbers(self):
+        for field, expected in (("input_tokens", 67), ("cached_input_tokens", 967),
+                                ("output_tokens", 747), ("reasoning_output_tokens", 790)):
+            with self.subTest(field=field):
+                usage = {"input_tokens": 1000, "cached_input_tokens": 400,
+                         "output_tokens": 50, "reasoning_output_tokens": 7}
+                usage[field] = "100"
+                out = json.dumps({"type": "turn.completed", "usage": usage})
+                result = parse_codex(0, out, "ok", None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+
+    def test_claude_numeric_strings_count_as_numbers(self):
+        for field, expected in (("input_tokens", 197), ("output_tokens", 1147),
+                                ("cache_creation_input_tokens", 1190), ("cache_read_input_tokens", 1067)):
+            with self.subTest(field=field):
+                usage = {"input_tokens": 1000, "output_tokens": 50,
+                         "cache_creation_input_tokens": 7, "cache_read_input_tokens": 400}
+                usage[field] = "100"
+                out = json.dumps({"is_error": False, "result": "ok", "usage": usage})
+                result = parse_claude(out, None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+
+    def test_claude_large_cache_read_uses_floor_division(self):
+        for cached in (1_000_000, 1_000_009):
+            with self.subTest(cache_read_input_tokens=cached):
+                out = json.dumps({"is_error": False, "result": "ok", "usage": {
+                    "input_tokens": 23, "output_tokens": 7,
+                    "cache_creation_input_tokens": 19, "cache_read_input_tokens": cached}})
+                result = parse_claude(out, None)
+                self.assertTrue(result.ok, result.error)
+                # Fresh input, output and cache creation retain their full weight.
+                self.assertEqual(result.tokens, 100_049)
+
+    def test_codex_splits_fresh_and_cached_input(self):
+        out = json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 103, "cached_input_tokens": 89,
+            "output_tokens": 5, "reasoning_output_tokens": 7}})
+        result = parse_codex(0, out, "ok", None)
+        self.assertTrue(result.ok, result.error)
+        # 14 fresh + 8 weighted cached + 5 output + 7 reasoning.
+        self.assertEqual(result.tokens, 34)
+
+    def test_codex_cached_greater_than_input_is_clamped(self):
+        out = json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 103, "cached_input_tokens": 999,
+            "output_tokens": 5, "reasoning_output_tokens": 7}})
+        result = parse_codex(0, out, "ok", None)
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.tokens, 22)
+
+    def test_codex_negative_cached_counts_as_zero(self):
+        out = json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 103, "cached_input_tokens": -89,
+            "output_tokens": 5, "reasoning_output_tokens": 7}})
+        result = parse_codex(0, out, "ok", None)
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.tokens, 115)
+
+    def test_codex_missing_fields_count_as_zero(self):
+        cases = [
+            ({}, 0),
+            ({"input_tokens": 103}, 103),
+            ({"cached_input_tokens": 89}, 0),
+            ({"output_tokens": 5}, 5),
+            ({"reasoning_output_tokens": 7}, 7),
+            ({"input_tokens": 103, "cached_input_tokens": 89}, 22),
+        ]
+        for usage, expected in cases:
+            with self.subTest(usage=usage):
+                out = json.dumps({"type": "turn.completed", "usage": usage})
+                result = parse_codex(0, out, "ok", None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+
+    def test_no_cache_fields_preserves_plain_totals(self):
+        usage = {"input_tokens": 103, "output_tokens": 5}
+        claude = parse_claude(json.dumps({"is_error": False, "result": "ok", "usage": usage}), None)
+        codex = parse_codex(0, json.dumps({"type": "turn.completed", "usage": {
+            **usage, "reasoning_output_tokens": 7}}), "ok", None)
+        for provider, result, expected in (("claude", claude, 108), ("codex", codex, 115)):
+            with self.subTest(provider=provider):
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+
 
 class AdapterTests(unittest.TestCase):
     def test_missing_cli_is_failed_result(self):
