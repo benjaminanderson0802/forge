@@ -2152,6 +2152,75 @@ class R44PlanReviewNotesTests(Harness):
         self.assertEqual([line[2:] for line in other.splitlines() if line.startswith("- ")],
                          [notes[-1]["note"]])
 
+    def test_R44_first_ten_applicable_notes_include_early_plan_wide_note(self):
+        """R44: select the first ten applicable notes before grouping them by scope."""
+        wide = "Keep this early plan-wide note."
+        local = [f"Check T1 case {i:02d}." for i in range(1, 12)]
+        notes = [{"task": "UNKNOWN", "note": wide}]
+        notes += [{"task": "T1", "note": note} for note in local]
+        c, children, _ = self.review_plan({"verdict": "pass", "reasons": [], "task_notes": notes})
+        suffix = c._task("T1")["section"][len(children[0]["section"]):]
+        actual = [line[2:] for line in suffix.splitlines() if line.startswith("- ")]
+        self.assertCountEqual(actual, [wide] + local[:9])
+        self.assertNotIn(local[9], suffix)
+        self.assertNotIn(local[10], suffix)
+        other = c._task("T2")["section"][len(children[1]["section"]):]
+        self.assertEqual([line[2:] for line in other.splitlines() if line.startswith("- ")], [wide])
+
+    def test_R44_reviewer_sees_complete_plan_and_tasks_json(self):
+        """R44: neither the plan file nor tasks JSON may be silently truncated."""
+        children = [self.task(id="T1", section="x" * 70000),
+                    self.task(id="LAST_TASK", section="y" * 700 + "END_OF_LAST_SECTION")]
+        plan_text = "# Implementation plan\n" + "\n".join(t["section"] for t in children)
+        tasks_json = json.dumps(children)
+        self.assertGreater(len(plan_text), 60000)
+        self.assertGreater(len(tasks_json), 20000)
+        self.assertLess(len(plan_text) + len(tasks_json), 200000)
+        c, _, _ = self.review_plan({"verdict": "pass", "reasons": []}, children)
+        prompt = c.team.reviewer.prompts[0]
+        plan_prompt, tasks_prompt = prompt.split("\nPLAN:\n", 1)[1].split("\nTASKS JSON:\n", 1)
+        with self.subTest(check="complete plan file"):
+            self.assertTrue(plan_prompt == plan_text, "reviewer must receive the entire plan file")
+        with self.subTest(check="last task id"):
+            self.assertIn('"id": "LAST_TASK"', tasks_prompt[-2000:])
+        with self.subTest(check="end of last section"):
+            self.assertIn("END_OF_LAST_SECTION", tasks_prompt[-2000:])
+        with self.subTest(check="complete tasks JSON"):
+            self.assertTrue(tasks_prompt.startswith(tasks_json + "\n"),
+                            "reviewer must receive the entire tasks JSON")
+        self.assertEqual(c._task("P1")["status"], "done")
+
+    def test_R44_plan_review_max_is_200000(self):
+        self.assertEqual(getattr(bootstrap, "PLAN_REVIEW_MAX", None), 200000)
+
+    def test_R44_combined_oversize_plan_rejected_before_review(self):
+        """R44: individually smaller inputs exceeding the combined limit skip review."""
+        children = [self.task(section="x" * 110000)]
+        plan_text = "# Implementation plan\n" + children[0]["section"]
+        tasks_json = json.dumps(children)
+        self.assertLess(len(plan_text), 200000)
+        self.assertLess(len(tasks_json), 200000)
+        self.assertGreater(len(plan_text) + len(tasks_json), 200000)
+
+        def planner(prompt, cwd):
+            (cwd / "plan.md").write_text(plan_text, encoding="utf-8")
+            return json.dumps({"tasks": children}), 1
+
+        c = self.init(self.plan_task(), agents={"planner": planner})
+        with patch.object(c.team.reviewer, "run", wraps=c.team.reviewer.run) as review:
+            self.assertEqual(c.step(), "worked")
+        with self.subTest(check="no review"):
+            review.assert_not_called()
+        with self.subTest(check="rejection guidance"):
+            notes = c._task("P1")["notes"]
+            self.assertEqual(len(notes), 1)
+            self.assertTrue(notes[0].startswith("plan rejected: plan too large for review"), notes)
+            self.assertIn("split this plan task", notes[0])
+        with self.subTest(check="plan stays pending without children"):
+            self.assertEqual(c._task("P1")["status"], "todo")
+            self.assertEqual(c._task("P1")["plan_rejects"], 1)
+            self.assertEqual([t["id"] for t in c._queue()["tasks"]], ["P1"])
+
     def assert_no_task_notes(self, answer):
         c, children, _ = self.review_plan(answer)
         self.assertEqual(c._task("P1")["status"], "done")
