@@ -322,3 +322,12 @@ The first run with real agents and real email hit four faults no fake-based test
   - **The planner is told** that each task's `section` is the only instruction the test writer and builder will see. It must be complete and self-contained: what to build, exact interfaces, behaviour, edge cases, dependencies on earlier tasks, and the acceptance criteria the tests must check. Each task must also be fully doable by a builder that may change only its `files_in_scope`: no steps for Ben, the conductor, or files outside that scope.
   - **Thin tasks are rejected by plain code** before any review. The plan is rejected if a task's `section` is shorter than `MIN_SECTION_CHARS` (600), with a reason naming the task.
   - **A retry sees why the last attempt failed.** Each planner attempt after the first includes the rejection reasons from earlier attempts (the task's last 3 notes, capped).
+
+## Live-use amendment (2026-09-30)
+
+- **R42 Stopping Forge during an agent run is a stop, not tampering.** Ben's "Stop Forge" shortcut (or a STOP email handled by another start) writes `KILL` into `state/` while an agent may be running. Before this rule, the after-run fingerprint saw the new file and raised a false tamper alarm. Now:
+  - **A stop:** if the only differences between the before-run and after-run fingerprints are `KILL` and/or `PAUSED` **appearing** (absent before, present after), the run is a stop. `_call` meters the run's tokens, logs `stop requested during <role> run <run_id>`, and raises `Stopped`. No tamper alert is sent and no halt question is created.
+  - **`Stopped` is a subclass of `Capped`.** So every stage undoes the attempt exactly as it does for a cap (R37/R38): worktree reset, claim released, nothing counted as a failure, and the run's result is discarded.
+  - **`step()`**, on a `Capped` (including `Stopped`) from a stage or the drift check, returns `"killed"` if `KILL` exists, else `"paused"` if `PAUSED` exists, else `"capped"`.
+  - **The smoke test:** a `Stopped` gives the problem `stopped during the smoke test`, not "token cap reached".
+  - **Still tampering:** any other changed file, or `KILL`/`PAUSED` being **removed** or **changed** (present before the run), is still tampering (R9). An agent can never un-stop Forge.
