@@ -450,6 +450,42 @@ class R46FailedRunMeteringTests(unittest.TestCase):
                 self.assertEqual(result.provider, "claude")
                 self.assertEqual(result.tokens, 161)
 
+    def test_unicode_numeric_text_counts_as_zero(self):
+        from core.agents import _n
+        for value, expected in (("\u00b2", 0), ("\u216b", 0), ("\u00bd", 0), ("12", 12)):
+            with self.subTest(value=value):
+                self.assertEqual(_n(value), expected)
+
+    def test_timeout_with_unicode_usage_preserves_valid_tokens(self):
+        for value in ("\u00b2", "\u216b", "\u00bd"):
+            with self.subTest(value=value):
+                def timeout(args, cwd, stdin_text, timeout_s):
+                    rows = self.usage_rows()
+                    rows.insert(1, {"type": "assistant", "message": {
+                        "id": "unicode-usage", "usage": {
+                            "input_tokens": value, "output_tokens": 4}}})
+                    self.write_log(self.session_id(args), rows)
+                    raise TimeoutError("agent timed out after 17s")
+
+                self.launch_mock.side_effect = timeout
+                result = ClaudeAgent(projects_dir=self.projects_dir).run("hello", self.cwd)
+                self.assertIsInstance(result, AgentResult)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.error, "agent timed out after 17s")
+                self.assertEqual(result.provider, "claude")
+                # Both valid messages (161), plus valid output in the bad-usage record.
+                self.assertEqual(result.tokens, 165)
+
+    def test_parse_claude_with_unicode_usage_preserves_valid_tokens(self):
+        for value in ("\u00b2", "\u216b", "\u00bd"):
+            with self.subTest(value=value):
+                out = json.dumps({"is_error": False, "result": "ok", "usage": {
+                    "input_tokens": value, "output_tokens": 7,
+                    "cache_creation_input_tokens": 19, "cache_read_input_tokens": 1009}})
+                result = parse_claude(out, None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual((result.text, result.provider, result.tokens), ("ok", "claude", 126))
+
     def test_log_reader_unknown_session_returns_zero(self):
         from core import agents
         from uuid import uuid4
