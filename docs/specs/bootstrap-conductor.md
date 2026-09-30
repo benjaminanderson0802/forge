@@ -315,3 +315,16 @@ The first run with real agents and real email hit four faults no fake-based test
   - **If PAUSED is set:** the conductor only waits. It reads the inbox every minute (answers can clear the pause), writes its heartbeat, and runs no smoke test and no agents.
   - **When the pause clears:** it goes on to the smoke test (if stale) and then the loop.
   - **If KILL appears** while waiting, it exits.
+
+## Layer 1E amendments: Ben's channel (2026-09-30)
+
+Plan: `docs/superpowers/plans/2026-09-30-layer-1e.md`. Code: `core/channel.py`, `core/status_page.py`, and additive hooks in `core/bootstrap.py`. R17-R40 all still hold; every email still goes through `_send`.
+
+- **E1 Owner check is exact.** A message counts as Ben's only when its `From` holds exactly one address and that address is `owner_email`. Ben's address in a display name (`"ben@..." <someone@else>`) or beside another address is someone else.
+- **E2 Queue view.** Every write of `questions.json` also rewrites `state/queue.jsonl`: one line per open question with `id, kind, question, default, deadline, status, via, code`. `questions.json` stays the source of truth.
+- **E3 Answer drop folder.** `<state>/../channel/in/*.json` (`{qid, code, answer, source}`) is read at the end of `_handle_inbox`, never while KILL is set. Each answer is checked exactly like an email reply (open question, matching code). A STOP creates KILL and the remaining answers are kept. The folder is outside `state/`, so the status page can write to it during an agent run without tripping the tamper check. This is also the interface point for a future Dot bridge.
+- **E4 Digest and quiet hours (only when `limits` has `digest_hour`).**
+  - `_ask`: kinds outside `channel.INSTANT_KINDS` (D-023) are held for the digest; every question body ends with "If you don't answer: <default>".
+  - Quiet hours (`quiet_start` to `quiet_end`, default 23 to 7, local time): `_send` refuses everything except a halt alert, without counting it; `_notice_once` waits without recording its throttle.
+  - `_channel_tick()` (each step, after the inbox): at most one digest per local day at or after `digest_hour`, only when a question is open or task statuses changed; plus an early digest, at most every 12 hours, when no task can run and a held question hasn't been in a digest yet. Each attempt is recorded in `digest.json` before sending and retried at most hourly.
+- **E5 Status page** (`python -m core.status_page`): binds 127.0.0.1 only, refuses a foreign `Host` and cross-site POSTs. Stop writes `state/KILL`; answers go to the drop folder.
