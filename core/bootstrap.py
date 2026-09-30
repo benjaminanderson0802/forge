@@ -33,6 +33,7 @@ NOWIN = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {
 TASK_FIELDS = ("id", "title", "section", "files_in_scope", "test_files", "test_cmd")
 NOTE_CAP, NOTES_KEEP, BODY_CAP = 2000, 30, 20000  # R19
 MIN_SECTION_CHARS = 600  # R41: a task's section is its builder's only instructions
+PLAN_REVIEW_MAX = 200_000  # R44: the plan reviewer sees the whole plan, up to this size
 SUBJECT_CAP, CLOSED_KEEP, SENT_IDS_KEEP = 300, 50, 500  # R26, R28
 
 
@@ -909,31 +910,30 @@ class Conductor:
         if not isinstance(notes, list):
             return tasks
         ids = {str(x.get("id")) for x in tasks}
-        per: dict[str, list[str]] = {}
-        wide: list[str] = []
+        clean: list[tuple[str, str]] = []  # (task id or "" for plan-wide, note), in the reviewer's order
         for n in notes:
             if not isinstance(n, dict):
                 continue
             text = str(n.get("note") or "").strip()[:NOTE_CAP]
-            if not text:
-                continue
-            task = str(n.get("task") or "")
-            (per.setdefault(task, []) if task in ids else wide).append(text)
-        if not per and not wide:
+            if text:
+                task = str(n.get("task") or "")
+                clean.append((task if task in ids else "", text))
+        if not clean:
             return tasks
         out = []
         for x in tasks:
             x = dict(x)
-            mine = per.get(str(x.get("id")), [])[:10]
+            mine_or_wide = [(k, m) for k, m in clean if k in ("", str(x.get("id")))][:10]  # the first 10, in order
+            mine = [m for k, m in mine_or_wide if k]
+            wide = [m for k, m in mine_or_wide if not k]
             if mine:
                 x["section"] = str(x["section"]) + "\n\nREVIEWER NOTES (handle and test these):\n" + \
                     "\n".join(f"- {m}" for m in mine)
-            room = wide[:10 - len(mine)]  # at most 10 notes per task in all
-            if room:
+            if wide:
                 x["section"] = str(x["section"]) + "\n\nPLAN-WIDE REVIEWER NOTES:\n" + \
-                    "\n".join(f"- {m}" for m in room)
+                    "\n".join(f"- {m}" for m in wide)
             out.append(x)
-        lines = [f"- {k}: {m}" for k in per for m in per[k][:10]] + [f"- (plan-wide): {m}" for m in wide[:10]]
+        lines = [f"- {k or '(plan-wide)'}: {m}" for k, m in clean]
         f = self.wt / plan_file
         f.write_text(f.read_text(encoding="utf-8").rstrip("\n") + "\n\n## Reviewer notes\n\n" + "\n".join(lines) +
                      "\n", encoding="utf-8")
@@ -1050,6 +1050,10 @@ class Conductor:
                 reason = "plan rejected: task ids clash with existing tasks"
         if not reason:
             plan_text = (self.wt / plan_file).read_text(encoding="utf-8")
+            size = len(plan_text) + len(json.dumps(tasks))
+            if size > PLAN_REVIEW_MAX:  # R44: the reviewer must see the whole plan
+                reason = f"plan rejected: plan too large for review ({size} characters); split this plan task"
+        if not reason:
             try:
                 rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this plan against the task and "
                                             "design: complete, testable, no placeholders, no drift.\n"
@@ -1060,8 +1064,8 @@ class Conductor:
                                             "Edge cases, extra tests and implementation details are NOT reasons to "
                                             "fail: put each in task_notes against the task id it affects, and they "
                                             "will be added to that task's instructions.\n\n" +
-                                self._task_prompt(t) + "\nPLAN:\n" + plan_text[:60000] + "\nTASKS JSON:\n" +
-                                json.dumps(tasks)[:20000] +
+                                self._task_prompt(t) + "\nPLAN:\n" + plan_text + "\nTASKS JSON:\n" +
+                                json.dumps(tasks) +
                                 "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...], "
                                 "\"task_notes\": [{\"task\": \"<task id>\", \"note\": \"...\"}]}",
                                 S_PLAN_REVIEW)

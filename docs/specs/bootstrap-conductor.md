@@ -366,4 +366,5 @@ The first run with real agents and real email hit four faults no fake-based test
     - Empty notes are dropped. Each note is capped at `NOTE_CAP` characters, and each task gets at most 10 notes (the first 10).
     - The notes are also appended to the plan file under `## Reviewer notes` in the same plan commit.
   - **On a fail:** unchanged (the reasons become the rejection note, R41).
+  - **The reviewer sees the whole plan.** In the first cycle the tasks JSON was cut at 20,000 characters, so the reviewer rightly rejected a "truncated" plan. Now the plan file and the tasks JSON are passed in full. If their combined length exceeds `PLAN_REVIEW_MAX` (200,000 characters), code rejects the plan before any review, with `plan rejected: plan too large for review (<n> characters); split this plan task`.
   - **Build reviews** (`S_REVIEW` after a build) are unchanged.
