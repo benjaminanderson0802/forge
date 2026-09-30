@@ -33,6 +33,7 @@ NOWIN = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {
 TASK_FIELDS = ("id", "title", "section", "files_in_scope", "test_files", "test_cmd")
 NOTE_CAP, NOTES_KEEP, BODY_CAP = 2000, 30, 20000  # R19
 MIN_SECTION_CHARS = 600  # R41: a task's section is its builder's only instructions
+PLAN_REVIEW_MAX = 200_000  # R44: the plan reviewer sees the whole plan, up to this size
 SUBJECT_CAP, CLOSED_KEEP, SENT_IDS_KEEP = 300, 50, 500  # R26, R28
 
 
@@ -86,6 +87,9 @@ S_TESTS = _obj({"files": _STRS, "summary": _STR}, ["files"])
 S_BUILD = _obj({"status": {"type": "string", "enum": ["done", "blocked"]}, "summary": _STR, "tried": _STRS,
                 "error": _STR}, ["status"])
 S_REVIEW = _obj({"verdict": {"type": "string", "enum": ["pass", "fail"]}, "reasons": _STRS}, ["verdict", "reasons"])
+S_PLAN_REVIEW = _obj({"verdict": {"type": "string", "enum": ["pass", "fail"]}, "reasons": _STRS,
+                      "task_notes": {"type": "array", "items": _obj({"task": _STR, "note": _STR}, ["task", "note"])}},
+                     ["verdict", "reasons"])  # R44
 S_TROUBLE = _obj({"kind": {"type": "string", "enum": ["fix", "dead_end", "suggestion"]}, "notes": _STR,
                   "alternative": _STR}, ["kind", "notes"])
 S_DRIFT = _obj({"status": {"type": "string", "enum": ["ok", "replan"]}, "reasons": _STRS}, ["status"])
@@ -901,6 +905,40 @@ class Conductor:
                                                         "output": str(output)[-4000:]})
                 raise
 
+    def _attach_review_notes(self, tasks: list, notes, plan_file: str) -> list:
+        """R44: the plan reviewer's non-blocking notes are appended to the tasks they affect (and the plan file)."""
+        if not isinstance(notes, list):
+            return tasks
+        ids = {str(x.get("id")) for x in tasks}
+        clean: list[tuple[str, str]] = []  # (task id or "" for plan-wide, note), in the reviewer's order
+        for n in notes:
+            if not isinstance(n, dict):
+                continue
+            text = str(n.get("note") or "").strip()[:NOTE_CAP]
+            if text:
+                task = str(n.get("task") or "")
+                clean.append((task if task in ids else "", text))
+        if not clean:
+            return tasks
+        out = []
+        for x in tasks:
+            x = dict(x)
+            mine_or_wide = [(k, m) for k, m in clean if k in ("", str(x.get("id")))][:10]  # the first 10, in order
+            mine = [m for k, m in mine_or_wide if k]
+            wide = [m for k, m in mine_or_wide if not k]
+            if mine:
+                x["section"] = str(x["section"]) + "\n\nREVIEWER NOTES (handle and test these):\n" + \
+                    "\n".join(f"- {m}" for m in mine)
+            if wide:
+                x["section"] = str(x["section"]) + "\n\nPLAN-WIDE REVIEWER NOTES:\n" + \
+                    "\n".join(f"- {m}" for m in wide)
+            out.append(x)
+        lines = [f"- {k or '(plan-wide)'}: {m}" for k, m in clean]
+        f = self.wt / plan_file
+        f.write_text(f.read_text(encoding="utf-8").rstrip("\n") + "\n\n## Reviewer notes\n\n" + "\n".join(lines) +
+                     "\n", encoding="utf-8")
+        return out
+
     def _troubleshoot(self, tid: str, reason: str, output: str) -> None:
         t = self._task(tid)
         self._reset_wt()
@@ -1012,13 +1050,25 @@ class Conductor:
                 reason = "plan rejected: task ids clash with existing tasks"
         if not reason:
             plan_text = (self.wt / plan_file).read_text(encoding="utf-8")
+            size = len(plan_text) + len(json.dumps(tasks))
+            if size > PLAN_REVIEW_MAX:  # R44: the reviewer must see the whole plan
+                reason = f"plan rejected: plan too large for review ({size} characters); split this plan task"
+        if not reason:
             try:
                 rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this plan against the task and "
-                                            "design: complete, testable, no placeholders, no drift.\n\n" +
-                                self._task_prompt(t) + "\nPLAN:\n" + plan_text[:60000] + "\nTASKS JSON:\n" +
-                                json.dumps(tasks)[:20000] +
-                                "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}",
-                                S_REVIEW)
+                                            "design: complete, testable, no placeholders, no drift.\n"
+                                            "Fail ONLY for blocking problems (R44): a requirement of this plan task "
+                                            "that no task covers; a task that contradicts docs/DECISIONS.md or the "
+                                            "design; a task that can't be done within its files_in_scope; wrong "
+                                            "ordering or dependencies between tasks; placeholders or thin sections. "
+                                            "Edge cases, extra tests and implementation details are NOT reasons to "
+                                            "fail: put each in task_notes against the task id it affects, and they "
+                                            "will be added to that task's instructions.\n\n" +
+                                self._task_prompt(t) + "\nPLAN:\n" + plan_text + "\nTASKS JSON:\n" +
+                                json.dumps(tasks) +
+                                "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...], "
+                                "\"task_notes\": [{\"task\": \"<task id>\", \"note\": \"...\"}]}",
+                                S_PLAN_REVIEW)
             except Capped:
                 self._reset_wt()
                 raise
@@ -1031,6 +1081,7 @@ class Conductor:
             if rejects >= 2:
                 self._block(tid, reason)
             return
+        tasks = self._attach_review_notes(tasks, (rv.data or {}).get("task_notes"), plan_file)  # R44
         self._commit([plan_file], f"{tid}: plan")
         q = self._queue()
         for x in q["tasks"]:
