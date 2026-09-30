@@ -131,6 +131,60 @@ def _git(cwd: Path, *args: str, check: bool = True) -> str:
     return p.stdout.strip()
 
 
+def run_tree(args, cwd: Path, timeout_s: float, *, env: dict | None = None,
+             should_stop: Callable[[], bool] | None = None, poll_s: float = 2.0) -> tuple[int, str, str]:
+    """Live-run P1: run a test or judge command the way core.agents.launch runs an agent: its own process group
+    (POSIX) or tree (Windows), killed as a whole on timeout or stop, and output to a temp file rather than a pipe, so
+    a grandchild that keeps stdout open can never make us wait. should_stop is polled every poll_s seconds.
+    Returns (exit code, output, why) with why "" (finished), "timeout" or "stopped"."""
+    import tempfile
+    from core import agents
+    kw: dict = dict(NOWIN) if os.name == "nt" else {"start_new_session": True}
+    with tempfile.TemporaryFile() as out:
+        p = subprocess.Popen(args, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                             env=env, **kw)
+        with agents._LIVE_LOCK:  # a stall exit (core.service) kills it with the agents
+            agents._LIVE.add(p)
+        why = ""
+        try:
+            deadline = time.monotonic() + float(timeout_s)
+            while True:
+                left = deadline - time.monotonic()
+                try:
+                    p.wait(timeout=max(0.01, min(left, poll_s)))
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        why = "timeout"
+                    elif should_stop is not None and should_stop():
+                        why = "stopped"
+                    if why:
+                        agents._kill_tree(p)
+                        try:
+                            p.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        break
+            if os.name != "nt":  # the command is done: nothing it started may outlive it
+                try:
+                    os.killpg(p.pid, 9)
+                except OSError:
+                    pass
+        finally:
+            with agents._LIVE_LOCK:
+                agents._LIVE.discard(p)
+        out.seek(0)
+        text = out.read().decode("utf-8", "replace")
+    return (p.returncode if p.returncode is not None else -9), text, why
+
+
+def _cmd_args(cmd: str):
+    """A judge command string without a shell: POSIX splits it like a shell would (quotes only); Windows hands the
+    command line to CreateProcess as written."""
+    import shlex
+    return cmd if os.name == "nt" else shlex.split(cmd)
+
+
 class Tampered(Exception):
     """An agent run changed the conductor's own state files (R9)."""
 
@@ -154,6 +208,7 @@ class Stopped(Capped):
 
 
 STOP_FILES = ("KILL", "PAUSED")
+DROP_PREFIX = "channel/in/"  # fingerprint keys of the answer drop folder (never a state/ path: state has no channel/)
 STOP_MARK = "agent stopped:"  # R49: core.agents.Stopped's message; an agent killed by a stop flag reports it
 
 
@@ -236,6 +291,7 @@ class Conductor:
         self.diagnose_which = None
         self.manager = manager  # T1C5: the read-only Manager; None keeps the pause-and-ask re-plan
         self.last_run_s = 0.0  # T1C4: duration of the last guarded agent run, on the conductor clock
+        self.last_agent_commit: list[str] | None = None  # Live-run P1: files of an agent commit that was undone
 
     # ------------------------------------------------------------------ files
     def _read(self, name: str, default):
@@ -370,7 +426,7 @@ class Conductor:
 
     # ------------------------------------------------------------------ agents
     def _call(self, role: str, prompt: str, schema: dict | None, cwd: Path | None = None, needs=None,
-              timeout_s: float | None = None):
+              timeout_s: float | None = None, scratch: bool = False):
         self._raise_if_stopped()  # R42/R49: before anything else, including readiness refreshes
         agent = self._agent(role)
         provider = getattr(agent, "provider", None)
@@ -378,7 +434,7 @@ class Conductor:
             raise Capped(provider)
         self._launch_gate(provider, needs)
         prompt = prompt + self._prompt_blocks(role)
-        return self._guarded_run(role, agent, prompt, cwd, schema, timeout_s=timeout_s)
+        return self._guarded_run(role, agent, prompt, cwd, schema, timeout_s=timeout_s, scratch=scratch)
 
     def _agent(self, role: str):
         """T1C5: the Manager is a separate, optional member (Team keeps its fixed six roles)."""
@@ -401,7 +457,7 @@ class Conductor:
             return 0.0
 
     def _guarded_run(self, label: str, agent, prompt: str, cwd: Path | None, schema: dict | None,
-                     timeout_s: float | None = None):
+                     timeout_s: float | None = None, scratch: bool = False):
         """R14/R15 guarded agent run: run record, fingerprint before and after, KILL on tamper, metering."""
         role = label
         provider = getattr(agent, "provider", None)
@@ -424,6 +480,13 @@ class Conductor:
         extra = {"timeout_s": timeout_s} if timeout_s is not None and self._takes_timeout(agent) else {}
         if hasattr(agent, "should_stop"):  # R42/R49: a real agent's process tree is killed when a stop flag appears
             agent.should_stop = self._stop_requested
+        # Live-run P1: agents may never commit. The layer worktree and the run's own worktree are checked; a
+        # scratch worktree (the troubleshooter's throwaway, whose edits are discarded anyway) is only put back.
+        layer_wt = self._layer_wt()
+        run_wt = Path(cwd) if cwd else layer_wt
+        heads = self._heads(*([layer_wt] if layer_wt else []), *([run_wt] if run_wt and not scratch else []))
+        scratch_heads = self._heads(run_wt) if scratch and run_wt and run_wt != layer_wt else {}
+        self.last_agent_commit = None
         t0 = self.clock()
         try:
             r = agent.run(prompt, Path(cwd) if cwd else self.wt, schema, **extra)
@@ -431,11 +494,20 @@ class Conductor:
             from core.agents import AgentResult
             r = AgentResult("", 0, False, repr(e), None, getattr(agent, "provider", "unknown"))
         self.last_run_s = self._since(t0)
+        committed = self._undo_agent_commits(heads)  # before anything can raise: no stage ever adopts that HEAD
+        self._undo_agent_commits(scratch_heads)
+        if committed is not None:
+            from core.agents import AgentResult
+            self.last_agent_commit = committed
+            r = AgentResult(r.text, r.tokens, False, "agent commit rejected (agents may not commit; reset to base): "
+                            + (", ".join(committed) or "no files"), None, r.provider)
         try:
             after = self._fingerprint()
             changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
         except Exception as e:  # noqa: BLE001 - R15: a check that can't complete counts as tampering
             changed = [f"state could not be fingerprinted after the run: {type(e).__name__}: {e}"]
+        if committed is not None:  # logged only after the after-run fingerprint (the log is a state file)
+            self._log(f"{role} run {run_id} made a commit; reset to base. Files: {', '.join(committed)}"[:500])
         if changed and all(k in STOP_FILES and k not in before for k in changed):  # R42: a stop, not tampering
             if r.tokens:
                 self.meter.add(r.provider or "unknown", r.tokens)
@@ -470,6 +542,53 @@ class Conductor:
             self._activity().add(self.last_run_s)
         return r
 
+    def _layer_wt(self) -> Path | None:
+        try:
+            return self.wt
+        except (KeyError, OSError, ValueError, TypeError):  # no queue yet (e.g. a readiness probe or smoke test)
+            return None
+
+    @staticmethod
+    def _heads(*wts: Path) -> dict:
+        """Live-run P1: each git worktree's checked-out ref and HEAD before an agent run."""
+        out = {}
+        for w in wts:
+            w = Path(w)
+            if w in out or not (w / ".git").exists():
+                continue
+            try:
+                out[w] = (_git(w, "symbolic-ref", "-q", "HEAD", check=False), _git(w, "rev-parse", "HEAD"))
+            except RuntimeError:
+                continue
+        return out
+
+    def _undo_agent_commits(self, heads: dict) -> list[str] | None:
+        """Live-run P1: the scope and protected-file checks look at dirty paths, so an agent that commits (e.g. by
+        running git itself) would slip past them. A commit is a violation: every worktree whose ref or HEAD moved is
+        put back on its ref and reset hard to its base. Returns what the commits changed (base..HEAD plus the dirty
+        paths), or None when nothing moved."""
+        moved, files = False, set()
+        for w, (ref, base) in heads.items():
+            now_ref = _git(w, "symbolic-ref", "-q", "HEAD", check=False)
+            head = _git(w, "rev-parse", "HEAD", check=False)
+            if head == base and now_ref == ref:
+                continue
+            moved = True
+            if head:
+                files.update(_norm(f) for f in _git(w, "diff", "--name-only", "-z", "--no-renames", base, head,
+                                                    check=False).split("\0") if f.strip())
+            try:
+                files.update(self._changed(cwd=w))
+            except RuntimeError:
+                pass
+            if now_ref != ref:
+                if ref:
+                    _git(w, "checkout", "-q", "-f", ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref)
+                else:
+                    _git(w, "checkout", "-q", "-f", "--detach", base)
+            self._reset_to(w, base)
+        return sorted(files) if moved else None
+
     def _stop_flags(self) -> list[str]:
         return [f for f in STOP_FILES if (self.state / f).exists()]
 
@@ -496,6 +615,16 @@ class Conductor:
                 f = Path(root) / name
                 rel = f.relative_to(self.state).as_posix()
                 fp[rel] = self._signature(f, rel)
+        # Live-run P1: the answer drop folder lives outside state/ (the status page writes there any time), but an
+        # agent can read question codes and forge an owner's answer there. Anything that appears in it, or
+        # changes, while an agent runs is tampering. A missing folder is simply empty.
+        drop = self.channel_in
+        if drop.is_dir():
+            for root, _dirs, files in os.walk(drop, onerror=fail):
+                for name in files:
+                    f = Path(root) / name
+                    rel = DROP_PREFIX + f.relative_to(drop).as_posix()
+                    fp[rel] = self._signature(f, rel)
         return fp
 
     @staticmethod
@@ -1203,6 +1332,11 @@ class Conductor:
                     for rest in answers[i + 1:]:
                         channel.drop_answer(self.channel_in, rest["qid"], rest["code"], rest["answer"], rest["source"])
                     return
+                kind = str((self._read("questions.json", {}).get(a["qid"]) or {}).get("kind", ""))
+                if kind in channel.EMAIL_ONLY_KINDS:  # Live-run P1: approvals only by the owner's own email
+                    self._log((f"refused a {kind} answer for Q-{a['qid']} from {a['source']}: "
+                               "approvals are accepted only by email from the owner")[:500])
+                    continue
                 self._answer(a["qid"], text, a["code"])
             except Exception as e:  # noqa: BLE001 - one bad answer never blocks the rest
                 self._log(f"channel answer failed: {e!r}"[:500])
@@ -1499,12 +1633,14 @@ class Conductor:
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPYCACHEPREFIX=cache)
         t0 = self.clock()
         try:
-            p = subprocess.run([sys.executable, "-m", "unittest", *paths], cwd=str(cwd or self.wt), capture_output=True,
-                               text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
-                               timeout=int(self.limits.get("test_timeout_s", 600)), env=env, **NOWIN)
-            return p.returncode, (p.stdout or "") + (p.stderr or ""), False
-        except subprocess.TimeoutExpired:
-            return 124, "test command timed out", True
+            code, out, why = run_tree([sys.executable, "-m", "unittest", *paths], cwd or self.wt,
+                                      int(self.limits.get("test_timeout_s", 600)), env=env,
+                                      should_stop=self._stop_requested)
+            if why == "stopped":  # R42/R49: a stop is never a failed run
+                raise Stopped(", ".join(self._stop_flags()) or "stop")
+            if why == "timeout":
+                return 124, "test command timed out", True
+            return code, out, False
         finally:
             shutil.rmtree(cache, ignore_errors=True)
             self._activity().add(self._since(t0))  # T1C4: judges are active work
@@ -1580,12 +1716,15 @@ class Conductor:
 
     def _run_cmd_timed(self, cmd: str, cwd: Path | None = None) -> tuple[int, str]:
         try:
-            p = subprocess.run(cmd, shell=True, cwd=str(cwd or self.wt), capture_output=True, text=True, encoding="utf-8",
-                               errors="replace", stdin=subprocess.DEVNULL,
-                               timeout=int(self.limits.get("test_timeout_s", 600)), **NOWIN)
-            return p.returncode, (p.stdout or "") + (p.stderr or "")
-        except subprocess.TimeoutExpired:
+            code, out, why = run_tree(_cmd_args(cmd), cwd or self.wt, int(self.limits.get("test_timeout_s", 600)),
+                                      should_stop=self._stop_requested)
+        except (OSError, ValueError) as e:  # not runnable (missing program, bad quoting): a failed judge
+            return 127, f"command could not start: {cmd}: {e!r}"
+        if why == "stopped":  # R42/R49: a stop is never a failed judge
+            raise Stopped(", ".join(self._stop_flags()) or "stop")
+        if why == "timeout":
             return 124, f"command timed out: {cmd}"
+        return code, out
 
     def _task_prompt(self, t: dict) -> str:
         return (f"TASK {t['id']}: {t['title']}\n\n{t.get('section', '')}\n\n"
@@ -1702,6 +1841,7 @@ class Conductor:
             self._reset_to(twt, base)
             raise
         spent = self.last_run_s  # D-026 focus time: builder run time only, never waits or probes
+        committed = getattr(self, "last_agent_commit", None)
         self._update(tid, focus_s=used + spent)
 
         tests = [_norm(x) for x in t["test_files"]]
@@ -1724,6 +1864,12 @@ class Conductor:
                 self._apply(f"{tag}-reopen", "reopen", cid, "forge-manager")
             self._after_failure(tid, reason, sig, output, handoff=handoff, focus=focus)
 
+        if committed is not None:  # Live-run P1: the commit was already undone; the attempt is out of scope
+            hit = [f for f in committed if f in tests]
+            why = "out of scope: agent commit rejected (reset to base): " + (", ".join(committed) or "no files")
+            if hit:
+                why += "; touched test files: " + ", ".join(hit)
+            return fail(why, "out of scope: agent commit: " + ",".join(committed))
         exceeded = spent >= remaining
         if exceeded and not (r.ok and (r.data or {}).get("status") == "blocked"):
             # D-026: 20 minutes of builder time without passing: the Troubleshooter takes it. A blocker claim is
@@ -1764,12 +1910,17 @@ class Conductor:
 
         with self.trees.throwaway(sha) as jw:  # judges run at exactly this commit, never in a shared checkout
             started = time.monotonic()
-            results = [("task tests", *self._run_tests(t, cwd=jw)[:2])]
-            baseline = time.monotonic() - started
-            for cmd in self.judge_cmds:
-                if results[-1][1] != 0:
-                    break
-                results.append((cmd, *self._run_cmd(cmd, cwd=jw)))
+            try:
+                results = [("task tests", *self._run_tests(t, cwd=jw)[:2])]
+                baseline = time.monotonic() - started
+                for cmd in self.judge_cmds:
+                    if results[-1][1] != 0:
+                        break
+                    results.append((cmd, *self._run_cmd(cmd, cwd=jw)))
+            except Stopped:  # R42/R49: KILL during a judge: undone exactly like a stopped reviewer, never a failure
+                self._apply(f"{tag}-withdraw", "withdraw", cid, "forge-core")
+                self._reset_to(twt, base)
+                raise
             for cmd, code, output in results:
                 if code != 0:
                     self._apply(f"{tag}-ci", "test_run", cid, "ci",
@@ -2153,7 +2304,7 @@ class Conductor:
                   "\n\nLAST JUDGE OUTPUT:\n" + output[-4000:] +
                   "\nAnswer with JSON: {\"kind\": \"fix\" | \"dead_end\", \"notes\": \"...\", \"alternative\": \"...\"}")
         with self.trees.throwaway(_git(self.wt, "rev-parse", "HEAD")) as tw:  # scratch: its edits are discarded
-            r = self._call("troubleshooter", prompt, S_TROUBLE, cwd=tw)
+            r = self._call("troubleshooter", prompt, S_TROUBLE, cwd=tw, scratch=True)
         self._reset_wt()
         notes = t.get("trouble_notes", [])
         if r.ok:
@@ -2535,6 +2686,9 @@ class Conductor:
 
 
 # ---------------------------------------------------------------------- real I/O
+MAIL_TIMEOUT_S = 60  # Live-run P1: every IMAP/SMTP socket operation gives up after this; a hang is never silent
+
+
 def gmail_mailer(owner: str) -> Callable[..., None]:
     def send(subject: str, body: str, message_id: str | None = None) -> None:
         import keyring
@@ -2547,7 +2701,7 @@ def gmail_mailer(owner: str) -> Callable[..., None]:
         if message_id:
             msg["Message-ID"] = message_id  # R26: recorded, so Forge also knows its own mail by id
         msg.set_content(body)
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=MAIL_TIMEOUT_S) as s:
             s.login(owner, pw)
             s.send_message(msg)
     return send
@@ -2574,7 +2728,7 @@ def gmail_inbox(owner: str, state: Path, imap_factory: Callable | None = None,
         if imap_factory is None:
             import keyring
             pw = keyring.get_password("forge-gmail", owner)
-            m = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+            m = imaplib.IMAP4_SSL("imap.gmail.com", 993, timeout=MAIL_TIMEOUT_S)  # P1: never block forever
         else:
             pw = ""
             m = imap_factory()
@@ -2868,26 +3022,8 @@ def main(argv: list[str]) -> int:
     try:
         if a.cmd == "run":
             health = service.Health(forge / "state" / "service", limits).start()  # T1D2: heartbeat and stall exit
-            if (c.state / "KILL").exists():  # R32: while stopped, only retry a pending halt alert
-                c._retry_halts()
+            if not _start_session(c, health):
                 return 0
-            c._handle_inbox()  # R31: a STOP is honoured before anything is launched
-            if (c.state / "KILL").exists():
-                return 0
-            while (c.state / "PAUSED").exists():  # R40: while paused, only wait for Ben's answer
-                (c.state / "conductor.heartbeat").write_text(f"{os.getpid()} {time.time()}")
-                time.sleep(60)
-                if (c.state / "KILL").exists():
-                    return 0
-                c._handle_inbox()
-                if (c.state / "KILL").exists():
-                    return 0
-            try:
-                c.session_start()  # D-030: readiness before every session, before the smoke test
-            except Tampered:
-                return 0
-            except (RuntimeError, OSError) as e:
-                c._log(f"session readiness error: {e!r}"[:500])
         if a.cmd == "smoke" or _smoke_stale(c.state, c.clock()):
             problems = _guarded_smoke(c, Path(a.work), force=a.cmd == "smoke")
             if a.cmd == "smoke":
@@ -2909,6 +3045,36 @@ def main(argv: list[str]) -> int:
             health.stop()
         lock.close()
     return 0
+
+
+def _start_session(c: Conductor, health, pause_s: float = 60) -> bool:
+    """The run command's startup, under stall detection (Live-run P1): every piece of work (the inbox read,
+    readiness, and the smoke test that follows) runs in the "step" phase, so a hang is caught like a hung step;
+    only the paused wait is exempt. Returns False when the service must not start (KILL, a stop, tampering)."""
+    health.set_phase("step")
+    if (c.state / "KILL").exists():  # R32: while stopped, only retry a pending halt alert
+        c._retry_halts()
+        return False
+    c._handle_inbox()  # R31: a STOP is honoured before anything is launched
+    if (c.state / "KILL").exists():
+        return False
+    while (c.state / "PAUSED").exists():  # R40: while paused, only wait for Ben's answer
+        (c.state / "conductor.heartbeat").write_text(f"{os.getpid()} {time.time()}")
+        health.set_phase("paused")
+        time.sleep(pause_s)
+        health.set_phase("step")
+        if (c.state / "KILL").exists():
+            return False
+        c._handle_inbox()
+        if (c.state / "KILL").exists():
+            return False
+    try:
+        c.session_start()  # D-030: readiness before every session, before the smoke test
+    except Tampered:
+        return False
+    except (RuntimeError, OSError) as e:
+        c._log(f"session readiness error: {e!r}"[:500])
+    return True
 
 
 def _smoke_stale(state: Path, now: datetime) -> bool:

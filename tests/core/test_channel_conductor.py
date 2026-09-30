@@ -259,20 +259,26 @@ class Answers(ChannelHarness):
         self.assertTrue((self.state / "KILL").exists())
 
     def test_a_dropped_answer_is_checked_like_an_email_reply(self):
+        """Live-run P1: a gate can no longer be approved from the drop folder (email only), so the accepted answer
+        here is a blocked task's; the code and question checks are unchanged."""
         c = self.conductor()
-        c._ask("gate", "layer-1 is ready", "report", pr="7")
-        code = self.qs()["gate-1"]["code"]
+        c._save_queue({"layer": "layer-1", "tasks": [{"id": "T1", "title": "t", "status": "blocked", "notes": [],
+                                                      "trouble_notes": [], "fail_signatures": []}]})
+        c._ask("blocked", "Task T1 is blocked", "details", task="T1")
+        code = self.qs()["blocked-1"]["code"]
         folder = c.channel_in
-        channel.drop_answer(folder, "gate-1", "wrongcod", "y", "page")
-        channel.drop_answer(folder, "nosuch-9", code, "y", "page")
+        channel.drop_answer(folder, "blocked-1", "wrongcod", "use the other lib", "page")
+        channel.drop_answer(folder, "nosuch-9", code, "use the other lib", "page")
         c._handle_inbox()
-        self.assertEqual(self.qs()["gate-1"]["status"], "open")
-        self.assertEqual(self.gh_calls, [])
-        channel.drop_answer(folder, "gate-1", code, "y", "page")
+        self.assertEqual(self.qs()["blocked-1"]["status"], "open")
+        self.assertEqual(c._task("T1")["status"], "blocked")
+        channel.drop_answer(folder, "blocked-1", code, "use the other lib", "page")
         c._handle_inbox()
-        self.assertEqual(self.qs()["gate-1"]["status"], "answered")
-        self.assertEqual([a[:2] for a in self.gh_calls], [["pr", "edit"], ["pr", "merge"]])
+        self.assertEqual(self.qs()["blocked-1"]["status"], "answered")
+        self.assertEqual(c._task("T1")["status"], "todo")
+        self.assertIn("Ben: use the other lib", c._task("T1")["trouble_notes"])
         self.assertEqual(list(folder.iterdir()), [])
+        self.assertEqual(self.gh_calls, [])
 
     def test_a_dropped_stop_halts_and_keeps_the_rest(self):
         c = self.conductor()

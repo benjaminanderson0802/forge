@@ -25,6 +25,10 @@ TAKE_LIMIT = 50
 # run), a spend or subscription needs approval, a safety stop fires, or a customer call needs him.
 INSTANT_KINDS = frozenset({"gate", "replan", "capability", "spend", "customer", "tamper"})
 
+# Live-run P1: answers that approve something (a merge to main via human-approved, a blocked merge, a spend) are
+# accepted only by email from the owner, never from the drop folder, which anything on this PC can write to.
+EMAIL_ONLY_KINDS = frozenset({"gate", "merge", "spend"})
+
 # D-023: every question comes with the default Forge uses while Ben hasn't answered.
 DEFAULTS = {
     "gate": "Nothing is merged into main. The layer waits for your approval.",

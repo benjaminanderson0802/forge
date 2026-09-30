@@ -110,17 +110,17 @@ class ActiveTimeTests(FocusHarness):
         self.assertEqual(self.active(), 0.0)
 
     def test_test_runs_add_active_time(self):
-        import subprocess
         import sys
         c = self.setup_build()
         base = self.active()
-        real = subprocess.run
+        from core import bootstrap
+        real = bootstrap.run_tree  # Live-run P1: test commands run through run_tree (tree-kill), not subprocess.run
 
         def slow_unittest(args, *a, **kw):
             if isinstance(args, list) and args[:3] == [sys.executable, "-m", "unittest"]:
                 self.now += timedelta(minutes=3)
             return real(args, *a, **kw)
-        with patch("core.bootstrap.subprocess.run", slow_unittest):
+        with patch("core.bootstrap.run_tree", slow_unittest):
             c.step()
         self.assertGreaterEqual(self.active() - base, 3 * 60 + 60)  # the task tests + the builder's minute
 
