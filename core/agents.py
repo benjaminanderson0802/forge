@@ -187,13 +187,17 @@ def _finish(provider: str, text: str, tokens: int, schema: dict | None) -> Agent
 
 
 def _n(v) -> int:
-    """R43: a usage field as a count. Anything that isn't a non-negative number counts as 0, so a bad or
-    negative field can never cancel out real usage."""
-    try:
-        n = int(v or 0)
-    except (TypeError, ValueError):
+    """R43: a usage field as a count. Anything that can't be read as a finite non-negative number (numbers and
+    numeric strings can) counts as 0, so a bad, negative or infinite field can never cancel out real usage."""
+    if isinstance(v, bool):
         return 0
-    return n if n > 0 else 0
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if f != f or f in (float("inf"), float("-inf")) or f <= 0:
+        return 0
+    return int(f)
 
 
 def parse_claude(out: str, schema: dict | None) -> AgentResult:
