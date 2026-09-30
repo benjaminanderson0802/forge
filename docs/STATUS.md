@@ -58,3 +58,27 @@ One branch now holds all of Layer 1: `python -m unittest discover -s tests/core`
 - **1E Ben's channel:** `queue.jsonl`, instant vs digest, quiet hours, status page, drop-folder answers (spec E1–E5). Drills 17–21.
 - **Integration fixes (R54–R56):** a reviewer outage never costs an attempt (ledger `withdraw`), and builders wait for the reviewer; a finalization awaiting review no longer blocks other work or the capability email; line endings (CRLF role files, byte-exact restore). A Stop pressed during an agent run is a clean stop everywhere.
 - **Open:** a builder that is itself capped or stopped still uses the ledger's `release`, which counts an attempt (unchanged by design; only reviewer outages use `withdraw`). The Windows fixes were reproduced and checked on Linux with `core.autocrlf=true`; the suite still has to be run on Ben's PC.
+
+## Layer 1 contents (integrated 2026-09-30)
+
+- **1A readiness:** a capability map, checked every cycle. No launch without evidence. Failed checks are routed to the Troubleshooter or to Ben's queue.
+- **1B pipeline:**
+  - **Tests:** written by Codex, and rejected if they pass on the current code or on an empty implementation.
+  - **Build:** the builder works in a per-task worktree.
+  - **Judges:** at the exact commit, in a throwaway worktree: the task tests, the drills, and mutation testing (kill rate ≥ `mutation_min`).
+  - **Review:** by Codex; verdicts are recorded in the ledger. Blocker claims must show evidence.
+  - **Finish:** a crash-safe finalizer (merge journal, approved-merge registry, safe push). The ledger recovers from crashes.
+- **1C planning and drift:**
+  - The Manager plans from the spec and ledger only.
+  - A coverage map must rise: 3 merges with no gain, or 2 active hours with no merge, triggers a re-plan.
+  - The 20-minute builder focus rule applies.
+- **1D always-on:**
+  - A service loop with a heartbeat thread and a watchdog task.
+  - Active vs idle modes.
+  - A mid-cycle stop (R42/R49).
+  - Limit-window holds (R48/R50) and a runs-per-day cap (R51).
+- **1E Ben's channel:**
+  - queue.jsonl;
+  - instant email for urgent kinds, a daily digest for the rest (off until `digest_hour` is set, per D-035);
+  - quiet hours;
+  - a local status page (127.0.0.1:8765) with Stop and Answer.
