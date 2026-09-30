@@ -1890,6 +1890,41 @@ class R42StopDuringRunTests(Harness):
         self.assertEqual(c.team.reviewer.prompts, [])
         self.assertEqual(c.team.troubleshooter.prompts, [])
 
+    def test_R42_step_troubleshooter_killed_resets_and_keeps_pending(self):
+        """R42/R38: a stopped troubleshooter discards edits and keeps diagnosis pending."""
+        def troubleshoot(prompt, cwd):
+            (cwd / "troubleshooter-stray.txt").write_text("unfinished edit\n", encoding="utf-8")
+            (self.state / "KILL").write_text("owner requested stop\n", encoding="utf-8")
+            return '{"kind":"fix","notes":"discard this stopped result"}', 1
+
+        c = self.init(agents={
+            "test_writer": self.write_tests,
+            "builder": lambda prompt, cwd: ('{"status":"done"}', 1),
+            "troubleshooter": troubleshoot,
+        })
+        failure_output = "Ran 1 test\nFAILED: feat.VALUE is missing"
+        with patch.object(c, "_run_tests", return_value=(1, failure_output, False)):
+            self.assertEqual(c.step(), "worked")  # Acceptance tests.
+            self.assertEqual(c._task("T1")["status"], "tests_ok")
+            self.assertEqual(c.step(), "worked")  # First builder failure.
+            self.assertEqual(c._task("T1")["fails_since"], 1)
+            result = c.step()  # Second failure launches the troubleshooter.
+
+        self.assertEqual(len(c.team.builder.prompts), 2)
+        self.assertEqual(len(c.team.troubleshooter.prompts), 1)
+        with self.subTest(check="killed result"):
+            self.assertEqual(result, "killed")
+        with self.subTest(check="stray file removed"):
+            self.assertFalse((c.wt / "troubleshooter-stray.txt").exists())
+        with self.subTest(check="worktree clean"):
+            self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+        with self.subTest(check="troubleshooting still pending"):
+            self.assertEqual(c._task("T1").get("troubleshoot_pending"), {
+                "reason": "judge failed: task tests", "output": failure_output,
+            })
+        with self.subTest(check="no tamper question or alert"):
+            self.assert_no_stop_alert(c)
+
     def test_R42_kill_plus_other_state_change_is_tampering(self):
         """R42: a new KILL cannot hide a simultaneous change to another state file."""
         def tamper(prompt, cwd):
