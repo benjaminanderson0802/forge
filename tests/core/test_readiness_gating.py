@@ -34,7 +34,7 @@ class GateHarness(Harness):
         self.calls = Counter()
         self.results = {}
 
-    def checks(self, **overrides):
+    def fake_checks(self, **overrides):
         self.results.update(overrides)
 
         def make(name):
@@ -46,7 +46,7 @@ class GateHarness(Harness):
 
     def gated(self, *tasks, agents=None, limits=None, checks=None, probes=None):
         c = self.init(*tasks, agents=agents, limits=limits,
-                      checks=self.checks() if checks is None else checks, probes=probes)
+                      checks=self.fake_checks() if checks is None else checks, probes=probes)
         c.clock = lambda: self.now
         c.meter.clock = c.clock
         return c
@@ -79,7 +79,7 @@ class DeclaredNeeds(GateHarness):
                 self.assertEqual(validate_task(self.task(needs=bad)), "bad needs")
 
     def test_init_queue_rejects_bad_needs(self):
-        c = self.make_conductor(checks=self.checks())
+        c = self.make_conductor(checks=self.fake_checks())
         with self.assertRaises(ValueError):
             c.init_queue(self.layer, [self.task(needs=["Bad Name!"])])
 
@@ -178,7 +178,7 @@ class BuilderGate(GateHarness):
     def test_docker_needed_and_failing_blocks_builder_only(self):
         c = self.gated(self.task(needs=["docker"]), agents={"test_writer": self.write_tests,
                                                             "builder": self.build_feature},
-                       checks=self.checks(docker=DOCKER_MISSING))
+                       checks=self.fake_checks(docker=DOCKER_MISSING))
         self.assertEqual(c.step(), "worked")
         self.assertEqual(len(c.team.test_writer.prompts), 1)
         self.assertEqual(c._task("T1")["status"], "tests_ok")
@@ -213,7 +213,7 @@ class BuilderGate(GateHarness):
                        test_files=["tests/core/test_other.py"], test_cmd=py_test("tests/core/test_other.py"))
         c = self.gated(self.task(needs=["docker"]), t2,
                        agents={"test_writer": self.writer_for_any, "builder": self.builder_for_any},
-                       checks=self.checks(docker=DOCKER_MISSING))
+                       checks=self.fake_checks(docker=DOCKER_MISSING))
         for _ in range(6):
             c.step()
         self.assertEqual(c._task("T1")["status"], "tests_ok")
@@ -225,7 +225,7 @@ class BuilderGate(GateHarness):
     def test_pending_troubleshooting_runs_even_when_task_need_is_broken(self):
         c = self.gated(self.task(needs=["docker"]), agents={"test_writer": self.write_tests,
                                                             "builder": self.build_feature},
-                       checks=self.checks(docker=DOCKER_MISSING))
+                       checks=self.fake_checks(docker=DOCKER_MISSING))
         c.step()
         c._update("T1", troubleshoot_pending={"reason": "judge failed", "output": "boom"})
         self.assertEqual(c.step(), "worked")
@@ -248,7 +248,7 @@ class BuilderGate(GateHarness):
 
     def test_git_failing_launches_nothing(self):
         c = self.gated(self.task(), agents={"test_writer": self.write_tests},
-                       checks=self.checks(git=GIT_MISSING))
+                       checks=self.fake_checks(git=GIT_MISSING))
         for _ in range(3):
             self.assertEqual(c.step(), "not_ready")
         self.assertFalse(any(getattr(c.team, r).prompts for r in Team.__dataclass_fields__))
@@ -256,7 +256,7 @@ class BuilderGate(GateHarness):
 
     def test_git_failing_blocks_plan_and_drift(self):
         task = {"id": "P1", "kind": "plan", "title": "Plan", "section": "Plan it", "plan_file": "plan.md"}
-        c = self.gated(task, checks=self.checks(git=GIT_MISSING))
+        c = self.gated(task, checks=self.fake_checks(git=GIT_MISSING))
         q = c._queue()
         q["drift_due"] = True
         c._save_queue(q)
@@ -341,7 +341,7 @@ class StaleEvidenceMidStage(GateHarness):
 
 class CallGate(GateHarness):
     def test_call_raises_not_ready_without_run_record(self):
-        c = self.gated(checks=self.checks(git=GIT_MISSING))
+        c = self.gated(checks=self.fake_checks(git=GIT_MISSING))
         c._refresh_readiness()
         runs_before = set((self.state / "runs").rglob("*")) if (self.state / "runs").exists() else set()
         with self.assertRaises(NotReady) as cm:
@@ -385,7 +385,7 @@ class GateNeedsGithub(GateHarness):
 
 class RunLoop(GateHarness):
     def test_run_sleeps_on_not_ready(self):
-        c = self.gated(checks=self.checks(git=GIT_MISSING))
+        c = self.gated(checks=self.fake_checks(git=GIT_MISSING))
         sleeps = []
         c.run(max_steps=2, idle_sleep_s=17, sleep=sleeps.append)
         self.assertEqual(sleeps, [17, 17])
@@ -393,7 +393,7 @@ class RunLoop(GateHarness):
 
 class SmokeGate(GateHarness):
     def test_guarded_smoke_with_git_failing_launches_nothing(self):
-        c = self.gated(checks=self.checks(git=GIT_MISSING))
+        c = self.gated(checks=self.fake_checks(git=GIT_MISSING))
         problems = bootstrap._guarded_smoke(c, self.work)
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("not ready: git: failing"), problems)

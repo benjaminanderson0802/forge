@@ -204,6 +204,8 @@ class Conductor:
         # D-030: readiness always runs; None means the real checks and AI probes (there is no "off" mode).
         self.checks = dict(real_checks() if checks is None else checks)
         self.probes = dict(real_probes(limits) if probes is None else probes)
+        self.diagnose_probe = None  # None: readiness' own hidden probe (docker ps for n8n); tests inject fakes
+        self.diagnose_which = None
 
     # ------------------------------------------------------------------ files
     def _read(self, name: str, default):
@@ -432,6 +434,15 @@ class Conductor:
         now = self.clock()
         force = set(force or ())
         wanted = None if names is None else set(names)
+        pending = self._read("readiness_force.json", [])
+        pending = [n for n in pending if isinstance(n, str)] if isinstance(pending, list) else []
+        if pending:  # T1B2d: names Ben replied about are re-checked without any cache
+            force |= {n for n in pending if wanted is None or n in wanted}
+            left = [n for n in pending if not (wanted is None or n in wanted)]
+            if left:
+                self._write("readiness_force.json", left)
+            else:
+                (self.state / "readiness_force.json").unlink(missing_ok=True)
         new = dict(old)  # a targeted refresh keeps every other entry as it was
 
         todo = {}
@@ -471,7 +482,13 @@ class Conductor:
         """D-030: readiness before every build session. Launches nothing while stopped, paused or capped."""
         if (self.state / "KILL").exists() or (self.state / "PAUSED").exists() or self._capped():
             return {}
-        return self._refresh_readiness()
+        m = self._refresh_readiness()
+        try:
+            self._route_capabilities(m)
+        except Capped:
+            pass  # the job waits for the cap to reset; nothing was launched
+        self._capability_mail_check()
+        return self._cap_map()
 
     def _requirements(self, role: str, task: dict | None = None) -> set[str]:
         provider = getattr(getattr(self.team, role), "provider", None)
@@ -518,13 +535,7 @@ class Conductor:
         pending = [t for t in tasks if t["status"] == "tests_ok" and t.get("troubleshoot_pending")]
         rest = [t for t in tasks if t not in pending]
         for t in pending + rest:
-            if t in pending:
-                role = "troubleshooter"
-            elif t.get("kind") == "plan":
-                role = "planner"
-            else:
-                role = "test_writer" if t["status"] == "todo" else "builder"
-            unready = self.ready_for(role, t, cap_map)
+            unready = self.ready_for(self._stage_role(t), t, cap_map)
             waiting = sorted(unready)
             if waiting or t.get("waiting_on"):
                 if t.get("waiting_on") != waiting:
@@ -533,6 +544,215 @@ class Conductor:
                 self._waiting = True
                 continue
             yield t
+
+    @staticmethod
+    def _stage_role(t: dict) -> str:
+        """The role that runs a task's next stage."""
+        if t["status"] == "tests_ok" and t.get("troubleshoot_pending"):
+            return "troubleshooter"
+        if t.get("kind") == "plan":
+            return "planner"
+        return "test_writer" if t["status"] == "todo" else "builder"
+
+    # ------------------------------------------------------------------ capability routing (T1B2d, D-030)
+    def _role_providers(self) -> set[str]:
+        return {p for p in (getattr(getattr(self.team, f), "provider", None) for f in Team.__dataclass_fields__) if p}
+
+    def _open_cap_items(self) -> dict:
+        return {k: v for k, v in self._read("questions.json", {}).items()
+                if v.get("kind") == "capability" and v.get("status") == "open"}
+
+    def _diagnose(self, name: str, cap_map: dict) -> dict:
+        kw = {}
+        if self.diagnose_probe is not None:
+            kw["probe"] = self.diagnose_probe
+        if self.diagnose_which is not None:
+            kw["which"] = self.diagnose_which
+        return readiness.diagnose(name, cap_map.get(name), cap_map, **kw)
+
+    def _trouble_available(self, cap_map: dict) -> bool:
+        provider = getattr(self.team.troubleshooter, "provider", None)
+        return not self.ready_for("troubleshooter", cap_map=cap_map) and not (
+            provider and self.meter.over(provider, self.limits))
+
+    def _cap_candidates(self, cap_map: dict) -> tuple[list[str], dict, dict]:
+        """(ordered candidates, diagnoses, active tasks). Dependents of another candidate are left out."""
+        now = self.clock()
+        tasks = [t for t in self._queue().get("tasks", []) if t.get("status") not in ("done", "blocked")]
+        roles_need = {"git"} | self._role_providers()
+        required = set(roles_need)
+        for t in tasks:
+            required.update(n for n in (t.get("needs") or []) if isinstance(n, str))
+        cands = {n for n, e in cap_map.items() if readiness.broken(e, now, readiness.max_age_for(n, self.limits))}
+        cands |= {n for n in required if n not in cap_map}
+        diag = {n: self._diagnose(n, cap_map) for n in cands}
+        cands = {n for n in cands if diag[n].get("depends_on") not in cands}
+        waiting = set(roles_need)
+        for t in tasks:
+            waiting.update(t.get("waiting_on") or [])
+            waiting.update(t.get("needs") or [])
+        order = sorted(cands, key=lambda n: (n != "git", n not in waiting, n))
+        return order, diag, {t["id"]: t for t in tasks}
+
+    def _cap_item_text(self, name: str, entry, d: dict, task_ids: list[str], waiting_desc: str) -> tuple[str, str]:
+        condition = d.get("condition", "error")
+        subject = f"Forge needs {name} fixed ({condition})"
+        detail = entry.get("detail") if isinstance(entry, dict) else None
+        detail = str(detail) if detail else ("no readiness evidence yet" if entry is None else "no detail recorded")
+        fix = str(d.get("fix", ""))
+        if fix.startswith("PowerShell: "):
+            how = "Paste this into PowerShell:\n" + fix[len("PowerShell: "):]
+        elif fix.startswith("Win + R: "):
+            how = "Press Win + R and paste:\n" + fix[len("Win + R: "):]
+        else:
+            how = fix  # an instruction, not a command (for example: reply with "not needed")
+        parts = [f"Forge's readiness check says {name} is not usable.", f"Detail: {detail}", how]
+        if d.get("then"):
+            parts.append(f"Then: {d['then']}")
+        parts.append(f"Waiting on it: {waiting_desc}")
+        parts.append(f"If you don't answer, Forge keeps skipping work that needs {name} and re-checks it every cycle.")
+        if condition == "no_check":
+            parts.append(f"Forge has no automatic check for {name}. If the work doesn't really need it, reply to "
+                         "this email with the first line: not needed\nAny other reply is kept for the "
+                         "Troubleshooter; only a passing check closes this item.")
+        return subject, "\n\n".join(parts)
+
+    def _file_cap_item(self, name: str, cap_map: dict, d: dict, tasks: dict) -> None:
+        """Exactly one open capability item per name; updated in place when the condition changes."""
+        task_ids = sorted(tid for tid, t in tasks.items() if name in (t.get("needs") or []))
+        roles = sorted(r for r in Team.__dataclass_fields__ if name in self._requirements(r))
+        stage_waits = sorted(tid for tid, t in tasks.items()
+                             if name in self._requirements(self._stage_role(t), t))
+        waiting_desc = "; ".join(x for x in (
+            ("roles: " + ", ".join(roles)) if roles else "",
+            ("tasks: " + ", ".join(sorted(set(task_ids) | set(stage_waits)))) if (task_ids or stage_waits) else "",
+        ) if x) or "nothing right now"
+        subject, body = self._cap_item_text(name, cap_map.get(name), d, task_ids, waiting_desc)
+        for qid, q in self._open_cap_items().items():
+            if q.get("capability") == name:
+                if q.get("condition") != d.get("condition") or q.get("tasks") != task_ids:
+                    qs = self._read("questions.json", {})
+                    qs[qid].update(condition=d.get("condition"), tasks=task_ids,
+                                   subject=subject[:SUBJECT_CAP], body=body[:BODY_CAP])
+                    self._write("questions.json", qs)
+                return
+        self._ask("capability", subject, body, hold=True, capability=name, condition=d.get("condition"),
+                  tasks=task_ids)
+
+    def _route_capabilities(self, cap_map: dict) -> str | None:
+        """Route every broken or missing capability: at most one Troubleshooter job per step, everything else
+        to Ben's queue (held unless _capability_mail_check releases it). Returns "worked" after a job."""
+        now = self.clock()
+        routing = self._read("cap_routing.json", {})
+        routing = routing if isinstance(routing, dict) else {}
+        # 2. resolved: usable evidence closes the item and resets routing state
+        self._resolve_caps(cap_map, routing)
+        order, diag, tasks = self._cap_candidates(cap_map)
+        if not order:
+            return None
+        max_rounds = int(self.limits.get("cap_trouble_max", 3))
+        retry_s = float(self.limits.get("cap_retry_h", 1)) * 3600
+        available = self._trouble_available(cap_map)
+
+        def job_possible_now(n: str) -> bool:
+            st = routing.get(n) or {}
+            last = self._age_s({"checked_at": st.get("last_job")}, now) if st.get("last_job") else None
+            return available and bool(diag[n].get("troubleshoot")) and int(st.get("rounds", 0)) < max_rounds \
+                and (last is None or last >= retry_s)
+
+        job = next((n for n in order if job_possible_now(n)), None)
+        for n in order:  # everything that can't get a job, now or later, goes to Ben
+            st = routing.get(n) or {}
+            if not (available and diag[n].get("troubleshoot") and int(st.get("rounds", 0)) < max_rounds):
+                self._file_cap_item(n, cap_map, diag[n], tasks)
+        if job is None:
+            return None
+        self._cap_job(job, cap_map, diag[job], tasks, routing)
+        return "worked"
+
+    def _resolve_caps(self, cap_map: dict, routing: dict) -> None:
+        now = self.clock()
+        usable = {n for n, e in cap_map.items()
+                  if readiness.broken(e, now, readiness.max_age_for(n, self.limits)) is None}
+        qs = self._read("questions.json", {})
+        changed = False
+        for q in qs.values():
+            if q.get("kind") == "capability" and q.get("status") == "open" and q.get("capability") in usable:
+                q["status"], q["closed_at"] = "resolved", now.isoformat()
+                q["closed_seq"] = self._read("q_seq.json", {}).get("n", 0)
+                changed = True
+        if changed:
+            self._write("questions.json", _prune_questions(qs))
+        gone = [n for n in routing if n in usable]
+        if gone:
+            for n in gone:
+                del routing[n]
+            self._write("cap_routing.json", routing)
+
+    def _cap_job(self, name: str, cap_map: dict, d: dict, tasks: dict, routing: dict) -> None:
+        entry = cap_map.get(name)
+        detail = entry.get("detail") if isinstance(entry, dict) else None
+        waiting = sorted(tid for tid, t in tasks.items() if name in (t.get("needs") or []))
+        prompt = (f"You are the TROUBLESHOOTER. CAPABILITY FIX JOB: {name}\n\n"
+                  f"Forge's plain-code readiness check says the capability {name} is not usable, and work waits "
+                  "on it. Make it work, then say what you did.\n\n"
+                  f"Detail: {detail if detail else 'no readiness evidence yet'}\n"
+                  f"Diagnosed condition: {d.get('condition')}\n"
+                  f"Suggested fix line: {d.get('fix')}\n" +
+                  (f"Then: {d.get('then')}\n" if d.get("then") else "") +
+                  f"Tasks waiting on it: {', '.join(waiting) or 'none named'}\n\n"
+                  "RULES:\n"
+                  "- Free, vetted tools only (D-032): a known publisher, not on the do-not-install list, no account "
+                  "needed.\n"
+                  "- No paid services and no new accounts; anything like that is Ben's call.\n"
+                  "- Never read, print or log secrets (passwords, tokens, keys).\n"
+                  "- Nothing visible on Ben's screen: no windows, no taking over his mouse or keyboard.\n"
+                  "- Work in this folder; never touch Forge's state files.\n\n"
+                  "Answer with JSON: {\"kind\": \"fix\" | \"dead_end\" | \"suggestion\", \"notes\": \"...\", "
+                  "\"alternative\": \"...\"}")
+        folder = self.work / "_capfix"
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            r = self._call("troubleshooter", prompt, S_TROUBLE, cwd=folder)  # Capped and Tampered propagate
+        except NotReady:
+            r = None
+        st = dict(routing.get(name) or {})
+        st["rounds"] = int(st.get("rounds", 0)) + 1
+        st["last_job"] = self.clock().isoformat()
+        routing[name] = st
+        self._write("cap_routing.json", routing)
+        if r is not None and r.ok and (r.data or {}).get("kind") == "dead_end":
+            with (self.state / "dead_ends.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"capability": name, "notes": (r.data or {}).get("notes", ""),
+                                    "alternative": (r.data or {}).get("alternative", "")}) + "\n")
+        m = self._refresh_readiness(names={name}, force={name})
+        self._resolve_caps(m, self._read("cap_routing.json", {}))
+
+    def _capability_mail_check(self) -> None:
+        """D-023: an instant email only when Ben alone can unblock all progress; otherwise items stay held."""
+        items = self._open_cap_items()
+        if not items:
+            return
+        m = self._cap_map()
+        q = self._queue()
+        if q.get("drift_due") and not self.ready_for("drift_keeper", cap_map=m):
+            return
+        for t in q.get("tasks", []):
+            if t.get("status") in ("todo", "tests_ok") and not self.ready_for(self._stage_role(t), t, m):
+                return
+        order, diag, _ = self._cap_candidates(m)
+        routing = self._read("cap_routing.json", {})
+        if not self.ready_for("troubleshooter", cap_map=m):  # usable now, or once its provider's cap resets
+            max_rounds = int(self.limits.get("cap_trouble_max", 3))
+            if any(diag[n].get("troubleshoot") and int((routing.get(n) or {}).get("rounds", 0)) < max_rounds
+                   for n in order):
+                return  # a Troubleshooter job is still possible, now or later
+        for qid, it in items.items():
+            if it.get("hold") or it.get("delivered") is False:
+                qs = self._read("questions.json", {})
+                qs[qid]["hold"] = False
+                self._write("questions.json", qs)
+                self._deliver(qid)
 
     MAP_BLOCK_CAP, DEAD_BLOCK_CAP, DEAD_LINES = 4000, 20000, 50
 
@@ -572,7 +792,7 @@ class Conductor:
         return out
 
     # ------------------------------------------------------------------ email
-    def _ask(self, kind: str, subject: str, body: str, halt: bool = False, **extra) -> str:
+    def _ask(self, kind: str, subject: str, body: str, halt: bool = False, hold: bool = False, **extra) -> str:
         qs = self._read("questions.json", {})
         seq = self._read("q_seq.json", {"n": len(qs)})
         seq["n"] = int(seq.get("n", 0)) + 1
@@ -583,8 +803,11 @@ class Conductor:
                    "body": str(body)[:BODY_CAP], "delivered": False, **extra}  # R28
         if halt:
             qs[qid]["halt"] = True  # R32: retried on watchdog starts while KILL is set
+        if hold:
+            qs[qid]["hold"] = True  # T1B2d: stored, not sent (the digest or an instant-email check sends it)
         self._write("questions.json", _prune_questions(qs))
-        self._deliver(qid, halt=halt)
+        if not hold:
+            self._deliver(qid, halt=halt)
         return qid
 
     def _send(self, subject: str, body: str, halt: bool = False) -> bool:
@@ -672,7 +895,7 @@ class Conductor:
 
     def _handle_inbox(self) -> None:
         for qid, q in self._read("questions.json", {}).items():
-            if q.get("delivered") is False:
+            if q.get("delivered") is False and not q.get("hold"):
                 self._deliver(qid)
         try:
             messages = self.inbox() or []
@@ -735,6 +958,9 @@ class Conductor:
                     t["test_rejects"] = 0
                     t["plan_rejects"] = 0
             self._save_queue(qd)
+        elif q["kind"] == "capability":
+            if not self._answer_capability(qs, q, reply, body):
+                return
         elif q["kind"] == "replan":
             qd = self._queue()
             qd["notes"] = ([str(x)[:NOTE_CAP] for x in qd.get("notes", [])] + [f"Ben: {body.strip()}"[:NOTE_CAP]])[-NOTES_KEEP:]
@@ -745,6 +971,27 @@ class Conductor:
         q["closed_seq"] = self._read("q_seq.json", {}).get("n", 0)
         q["closed_at"] = self.clock().isoformat()
         self._write("questions.json", _prune_questions(qs))
+
+    def _answer_capability(self, qs: dict, q: dict, reply: str, body: str) -> bool:
+        """A reply never makes a capability ready. It is kept and forces a re-check; only a first line of
+        exactly "not needed" drops the need from the item's tasks and closes it. Returns True to close."""
+        name = str(q.get("capability", ""))
+        q["replies"] = ([str(x)[:NOTE_CAP] for x in q.get("replies", [])] + [body.strip()[:NOTE_CAP]])[-NOTES_KEEP:]
+        first = reply.strip().rstrip(".!?,;: ").strip().lower()
+        if first == "not needed" and name and name != "git" and name not in self._role_providers():
+            ids = set(q.get("tasks") or [])
+            qd = self._queue()
+            for t in qd["tasks"]:
+                if t["id"] in ids and name in (t.get("needs") or []):
+                    t["needs"] = [n for n in t["needs"] if n != name]
+            self._save_queue(qd)
+            return True
+        force = self._read("readiness_force.json", [])
+        force = [n for n in force if isinstance(n, str)] if isinstance(force, list) else []
+        if name and name not in force:
+            self._write("readiness_force.json", force + [name])
+        self._write("questions.json", _prune_questions(qs))
+        return False
 
     # ------------------------------------------------------------------ main step
     def step(self) -> str:
@@ -758,12 +1005,17 @@ class Conductor:
         if self._capped():
             return "capped"
         try:
-            self._refresh_readiness()  # D-030: before every cycle
+            routed = self._route_capabilities(self._refresh_readiness())  # D-030: before every cycle
         except Tampered:
             return "killed"
+        except Capped:
+            return "capped"
         except (RuntimeError, OSError) as e:  # R15 fail-closed preconditions: a stage-like error
             self._log(f"readiness refresh error: {e!r}"[:500])
             return "error"
+        if routed == "worked":
+            return "worked"
+        self._capability_mail_check()
         q = self._queue()
         cap_map = self._cap_map()
         self._waiting = False
@@ -1537,6 +1789,14 @@ def main(argv: list[str]) -> int:
         q = json.loads((state / "queue.json").read_text(encoding="utf-8")) if (state / "queue.json").exists() else {}
         for t in q.get("tasks", []):
             print(f"{t['status']:9} {t['id']:6} {t['title']}")
+        try:
+            qs = json.loads((state / "questions.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            qs = {}
+        for qid, v in (qs.items() if isinstance(qs, dict) else []):
+            if isinstance(v, dict) and v.get("kind") == "capability" and v.get("status") == "open":
+                sent = "held" if v.get("hold") else ("sent" if v.get("delivered") else "not sent yet")
+                print(f"capability {v.get('capability')}: {v.get('condition')} ({sent}) Q-{qid}")
         for f in ("KILL", "PAUSED"):
             if (state / f).exists():
                 print(f"{f} is set")
