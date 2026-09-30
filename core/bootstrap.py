@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -36,6 +36,9 @@ MIN_SECTION_CHARS = 600  # R41: a task's section is its builder's only instructi
 PLAN_REVIEW_MAX = 200_000  # R44: the plan reviewer sees the whole plan, up to this size
 PLAN_ATTEMPTS = 3  # R45: a plan task is blocked after this many rejections
 PLAN_MEMORY_NOTES, PLAN_MEMORY_CHARS = 10, 12000  # R47
+LIMIT_RE = re.compile(r"(session|usage|rate)[ _-]?limit|limit (reached|exceeded)|quota exceeded|too many requests",
+                      re.I)  # R48
+HOLD_MINUTES = 30  # R48
 SUBJECT_CAP, CLOSED_KEEP, SENT_IDS_KEEP = 300, 50, 500  # R26, R28
 
 
@@ -305,7 +308,7 @@ class Conductor:
     def _call(self, role: str, prompt: str, schema: dict | None, cwd: Path | None = None):
         agent = getattr(self.team, role)
         provider = getattr(agent, "provider", None)
-        if provider and self.meter.over(provider, self.limits):  # R37: checked before every launch
+        if provider and (self.meter.over(provider, self.limits) or self._on_hold(provider)):  # R37/R48: before every launch
             raise Capped(provider)
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + role + "-" + uuid.uuid4().hex[:6]
         d = self.state / "runs" / run_id
@@ -347,6 +350,14 @@ class Conductor:
             raise Tampered(", ".join(changed))
         if r.tokens:
             self.meter.add(r.provider or "unknown", r.tokens)
+        if not r.ok and provider and LIMIT_RE.search(str(r.error or "")):  # R48: a pause, not a failed attempt
+            until = (self.clock() + timedelta(minutes=HOLD_MINUTES)).isoformat()
+            holds = self._read("holds.json", {})
+            holds = holds if isinstance(holds, dict) else {}
+            holds[provider] = until
+            self._write("holds.json", holds)
+            self._log(f"limit hit for {provider}; holding until {until}")
+            raise Capped(provider)
         (d / "output.json").write_bytes(json.dumps({"ok": r.ok, "error": r.error, "text": r.text, "data": r.data,
                                                     "tokens": r.tokens, "provider": r.provider},
                                                    indent=2).encode("utf-8"))
@@ -386,7 +397,15 @@ class Conductor:
 
     def _capped(self) -> bool:
         providers = {getattr(getattr(self.team, f), "provider", None) for f in Team.__dataclass_fields__}
-        return any(p and self.meter.over(p, self.limits) for p in providers)
+        return any(p and (self.meter.over(p, self.limits) or self._on_hold(p)) for p in providers)
+
+    def _on_hold(self, provider: str) -> bool:
+        """R48: a provider is on hold after hitting its own usage limit, until the recorded time."""
+        try:
+            until = (self._read("holds.json", {}) or {}).get(provider)
+            return bool(until) and self.clock() < datetime.fromisoformat(str(until))
+        except (ValueError, TypeError, AttributeError):
+            return False
 
     # ------------------------------------------------------------------ email
     def _ask(self, kind: str, subject: str, body: str, halt: bool = False, **extra) -> str:
