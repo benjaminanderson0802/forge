@@ -16,7 +16,7 @@ import json
 import time
 import threading
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -43,6 +43,8 @@ vertical-align:top}textarea{width:100%;min-height:3em;font:inherit;background:va
 border:1px solid var(--line);border-radius:6px;padding:6px}button{font:inherit;padding:6px 12px;border-radius:6px;
 border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer;margin:4px 4px 0 0}
 button.danger{border-color:var(--bad);color:var(--bad);font-weight:600}.row{overflow-x:auto}
+.bar{height:14px;background:var(--line);border-radius:7px;overflow:hidden;margin:4px 0 2px}.fill{height:100%;background:var(--ok);border-radius:7px}.fill.warn{background:var(--warn)}.fill.bad{background:var(--bad)}
+.meter{margin:10px 0}.meter .lbl{display:flex;justify-content:space-between;gap:8px}
 """
 
 
@@ -70,13 +72,61 @@ def _mail_used(state: Path, now: datetime) -> tuple[int, int]:
     return hour, day
 
 
+def _bar(label: str, used: float, total: float, detail: str, usage: bool = False) -> str:
+    """One labelled bar. Progress bars are green; usage bars turn amber at 70% and red at 90%."""
+    frac = 0.0 if not total else max(0.0, min(1.0, used / total))
+    cls = "fill" + ((" bad" if frac >= 0.9 else " warn" if frac >= 0.7 else "") if usage else "")
+    return (f"<div class=meter><div class=lbl><span>{_e(label)}</span><span class=muted>{_e(detail)}</span></div>"
+            f"<div class=bar role=progressbar aria-label=\"{_e(label)}\" aria-valuenow=\"{round(frac * 100)}\" "
+            f"aria-valuemin=0 aria-valuemax=100><div class=\"{cls}\" style=\"width:{frac * 100:.1f}%\"></div></div></div>")
+
+
+def progress(forge_root: Path, tasks: list[dict]) -> dict:
+    """Roadmap progress: finished phases plus the fraction of the current phase's queue that is done."""
+    doc = _read(Path(forge_root) / "docs", "progress.json", {})
+    phases = [p for p in doc.get("phases", []) if isinstance(p, dict)] if isinstance(doc, dict) else []
+    done = sum(1 for p in phases if p.get("done"))
+    live = [t for t in tasks if t.get("status") not in ("superseded",)]
+    tdone = sum(1 for t in live if t.get("status") == "done")
+    frac = (tdone / len(live)) if live and done < len(phases) else 0.0
+    current = next((p.get("name", "") for p in phases if not p.get("done")), "")
+    return {"phases": len(phases), "done": done, "current": current, "tasks": len(live), "tasks_done": tdone,
+            "overall": ((done + frac) / len(phases)) if phases else 0.0}
+
+
 def render(state: Path, limits: dict, now: datetime | None = None, *, local_tz=None) -> str:
     """The whole page as HTML. Pure apart from reading state files; every value is escaped."""
     state = Path(state)
     now = now or datetime.now(timezone.utc)
     local = channel.to_local(now, local_tz)
     out = [f"<h1>Forge status</h1><p class=muted>{_e(local.strftime('%A %d %B %Y, %H:%M'))} "
-           "&middot; this page does not refresh itself: reload it to update</p>"]
+           "&middot; refreshes every 30 seconds</p>"]
+    tasks_all = [t for t in _read(state, "queue.json", {}).get("tasks", []) if isinstance(t, dict)]
+    pr = progress(state.parent.parent, tasks_all)
+    out.append("<h2>Progress</h2>")
+    if pr["phases"]:
+        out.append(_bar("Whole build (roadmap)", pr["overall"], 1.0,
+                        f"{pr['done']} of {pr['phases']} phases done; now: {pr['current'] or 'all done'}"))
+    out.append(_bar("Current phase's queue", pr["tasks_done"], pr["tasks"] or 1,
+                    f"{pr['tasks_done']} of {pr['tasks']} tasks done"))
+    meter0 = Meter(state, clock=lambda: now)
+    reset = channel.to_local(now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1), local_tz)
+    out.append("<h2>Usage today</h2>")
+    for p in PROVIDERS:
+        cap = limits.get(f"{p}_daily_token_cap")
+        used = meter0.used_today(p)
+        out.append(_bar(f"{p.capitalize()} tokens", used, cap or 1,
+                        f"{used / 1e6:.1f}M of {(cap or 0) / 1e6:.0f}M (resets {reset.strftime('%H:%M')})", usage=True))
+    rcap = limits.get("agent_runs_per_day")
+    if rcap:
+        try:
+            runs = meter0.runs_today()
+        except Exception:  # noqa: BLE001 - the page never breaks on a counter
+            runs = 0
+        out.append(_bar("Agent runs", runs, rcap, f"{runs} of {rcap}", usage=True))
+    mh0, md0 = _mail_used(state, now)
+    out.append(_bar("Email to you", md0, limits.get("mail_per_day", 30),
+                    f"{md0} of {limits.get('mail_per_day', 30)} today, {mh0} this hour", usage=True))
     if (state / "KILL").exists():
         out.append("<div class='banner stop'>Forge is stopped (KILL is set). It restarts only when you clear the "
                    "stop yourself.</div>")
@@ -153,7 +203,8 @@ def render(state: Path, limits: dict, now: datetime | None = None, *, local_tz=N
             rows.append(f"<tr><td>{_e(name)}</td><td>{st}</td><td>{_e(detail)}</td><td class=muted>{_e(at)}</td></tr>")
         out.append("<div class=row><table>" + "".join(rows) + "</table></div>")
     return ("<!doctype html><html lang=en><head><meta charset=utf-8>"
-            "<meta name=viewport content='width=device-width,initial-scale=1'><title>Forge status</title>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'><meta http-equiv=refresh content=30>"
+            "<title>Forge status</title>"
             f"<style>{_CSS}</style></head><body><main>" + "".join(out) + "</main></body></html>")
 
 
