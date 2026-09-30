@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from core import readiness
 from core.ledger import Ledger, Rejected
 from core.usage import Meter
 
@@ -175,7 +176,8 @@ class Conductor:
     def __init__(self, repo: Path, work: Path, state: Path, team: Team, limits: dict, *,
                  owner_email: str, mailer: Callable[[str, str], None], inbox: Callable[[], list[dict]],
                  gh: Callable[[list[str]], tuple[int, str]], clock: Callable[[], datetime] | None = None,
-                 judge_cmds: list[str] | None = None, push: bool = True):
+                 judge_cmds: list[str] | None = None, push: bool = True,
+                 checks: dict | None = None, probes: dict | None = None):
         self.repo, self.work, self.state = Path(repo), Path(work), Path(state)
         self.team, self.limits = team, limits
         self.owner = owner_email.strip().lower()
@@ -185,6 +187,9 @@ class Conductor:
         self.push = push
         self.meter = Meter(self.state, clock=self.clock)
         self.state.mkdir(parents=True, exist_ok=True)
+        # D-030: readiness always runs; None means the real checks and AI probes (there is no "off" mode).
+        self.checks = dict(real_checks() if checks is None else checks)
+        self.probes = dict(real_probes(limits) if probes is None else probes)
 
     # ------------------------------------------------------------------ files
     def _read(self, name: str, default):
@@ -293,6 +298,12 @@ class Conductor:
         provider = getattr(agent, "provider", None)
         if provider and self.meter.over(provider, self.limits):  # R37: checked before every launch
             raise Capped(provider)
+        prompt = prompt + self._prompt_blocks(role)
+        return self._guarded_run(role, agent, prompt, cwd, schema)
+
+    def _guarded_run(self, label: str, agent, prompt: str, cwd: Path | None, schema: dict | None):
+        """R14/R15 guarded agent run: run record, fingerprint before and after, KILL on tamper, metering."""
+        role = label
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + role + "-" + uuid.uuid4().hex[:6]
         d = self.state / "runs" / run_id
         d.mkdir(parents=True, exist_ok=True)
@@ -368,6 +379,120 @@ class Conductor:
     def _capped(self) -> bool:
         providers = {getattr(getattr(self.team, f), "provider", None) for f in Team.__dataclass_fields__}
         return any(p and self.meter.over(p, self.limits) for p in providers)
+
+    # ------------------------------------------------------------------ readiness (D-030)
+    @property
+    def _map_path(self) -> Path:
+        return self.state / "capabilities.json"
+
+    def _cap_map(self) -> dict:
+        return readiness.read_map(self._map_path)
+
+    @staticmethod
+    def _age_s(entry, now: datetime) -> float | None:
+        """Age of an entry's checked_at in seconds, or None when it is missing, invalid or naive."""
+        raw = entry.get("checked_at") if isinstance(entry, dict) else None
+        if not isinstance(raw, str):
+            return None
+        try:
+            at = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if at.tzinfo is None or at.utcoffset() is None:
+            return None
+        return (now - at).total_seconds()
+
+    def _reusable_ok(self, name: str, entry, now: datetime) -> bool:
+        ttl = readiness.ok_ttl_s(name, self.limits)
+        age = self._age_s(entry, now)
+        return ttl > 0 and readiness.broken(entry, now, ttl) is None and age is not None and 0 <= age < ttl
+
+    def _refresh_readiness(self, names=None, force=frozenset()) -> dict:
+        """Run the plain checks and (guarded, cap-aware) AI probes, write the capability map and return it.
+        names limits the refresh to those capabilities; force bypasses every cache for the names in it."""
+        if (self.state / "KILL").exists():
+            return self._cap_map()
+        old = self._cap_map()
+        now = self.clock()
+        force = set(force or ())
+        wanted = None if names is None else set(names)
+        new = dict(old)  # a targeted refresh keeps every other entry as it was
+
+        todo = {}
+        for name, fn in self.checks.items():
+            if wanted is not None and name not in wanted:
+                continue
+            if name not in force and self._reusable_ok(name, old.get(name), now):
+                continue  # gmail/browser: the permitted per-check cache
+            todo[name] = fn
+        if todo:
+            new.update(readiness.evaluate(todo, float(self.limits.get("check_timeout_s", 60)), now))
+
+        for name, agent in self.probes.items():
+            if wanted is not None and name not in wanted:
+                continue
+            prev = old.get(name)
+            if name not in force:
+                if self._reusable_ok(name, prev, now):
+                    continue
+                age = self._age_s(prev, now)
+                if isinstance(prev, dict) and prev.get("ok") is False and age is not None \
+                        and 0 <= age < readiness.fail_retry_s(name, self.limits):
+                    continue
+            if self.meter.over(getattr(agent, "provider", None) or name, self.limits):
+                continue  # R37: a capped provider is never probed; the old entry (if any) stays
+            probe_dir = self.work / "_probe"
+            probe_dir.mkdir(parents=True, exist_ok=True)
+            r = self._guarded_run(f"probe-{name}", agent, readiness.PROBE_PROMPT, probe_dir, None)
+            ok, detail = readiness.probe_ok(r)
+            new[name] = {"ok": bool(ok), "detail": str(detail)[:readiness.DETAIL_MAX], "checked_at": now.isoformat()}
+
+        result = {k: v for k, v in new.items() if k in self.checks or k in self.probes}
+        readiness.write_map(self._map_path, result)
+        return result
+
+    def session_start(self) -> dict:
+        """D-030: readiness before every build session. Launches nothing while stopped, paused or capped."""
+        if (self.state / "KILL").exists() or (self.state / "PAUSED").exists() or self._capped():
+            return {}
+        return self._refresh_readiness()
+
+    MAP_BLOCK_CAP, DEAD_BLOCK_CAP, DEAD_LINES = 4000, 20000, 50
+
+    def _map_block(self) -> str:
+        head = "CAPABILITY MAP (plain-code readiness check; blocker claims that contradict it are rejected):"
+        m, now = self._cap_map(), self.clock()
+        if not m:
+            return head + "\n(no readiness evidence yet)"
+        lines = []
+        for name in sorted(m):
+            e = m[name]
+            why = readiness.broken(e, now, readiness.max_age_for(name, self.limits))
+            detail = e.get("detail", "") if isinstance(e, dict) else ""
+            at = e.get("checked_at", "?") if isinstance(e, dict) else "?"
+            state = "OK" if why is None else f"BROKEN ({why})"
+            lines.append(f"- {name}: {state} - {detail} (checked {at})")
+        text = head + "\n" + "\n".join(lines)
+        if len(text) > self.MAP_BLOCK_CAP:
+            text = text[:self.MAP_BLOCK_CAP - 4].rstrip() + "\n..."
+        return text
+
+    def _dead_block(self) -> str:
+        lines = self._dead_ends()[-self.DEAD_LINES:]
+        while lines and len("\n".join(lines)) > self.DEAD_BLOCK_CAP:
+            lines = lines[1:]  # drop the oldest first
+        if not lines:
+            return ""
+        return "KNOWN DEAD ENDS:\n" + "\n".join(lines)[-self.DEAD_BLOCK_CAP:]
+
+    def _prompt_blocks(self, role: str) -> str:
+        """Appended to every prompt (never prepended): the capability map; dead ends for builder/troubleshooter."""
+        out = "\n\n" + self._map_block() + "\n"
+        if role in ("builder", "troubleshooter"):
+            dead = self._dead_block()
+            if dead:
+                out += "\n" + dead + "\n"
+        return out
 
     # ------------------------------------------------------------------ email
     def _ask(self, kind: str, subject: str, body: str, halt: bool = False, **extra) -> str:
@@ -555,6 +680,13 @@ class Conductor:
             return "paused"
         if self._capped():
             return "capped"
+        try:
+            self._refresh_readiness()  # D-030: before every cycle
+        except Tampered:
+            return "killed"
+        except (RuntimeError, OSError) as e:  # R15 fail-closed preconditions: a stage-like error
+            self._log(f"readiness refresh error: {e!r}"[:500])
+            return "error"
         q = self._queue()
         if q.get("drift_due"):
             try:
@@ -762,9 +894,6 @@ class Conductor:
             prompt += "\nREVIEW FEEDBACK:\n" + "\n".join(f"- {x}" for x in t["review_feedback"]) + "\n"
         if t.get("trouble_notes"):
             prompt += "\nTROUBLESHOOTER NOTES:\n" + "\n".join(t["trouble_notes"]) + "\n"
-        dead = self._dead_ends()
-        if dead:
-            prompt += "\nKNOWN DEAD ENDS:\n" + "\n".join(dead) + "\n"
         prompt += ("\nAnswer with JSON: {\"status\": \"done\" | \"blocked\", \"summary\": \"...\"}. "
                    "A blocked answer must also include \"tried\" (at least 2 different routes you actually tried) "
                    "and \"error\" (the real error output); without them it is rejected as an easy way out.")
@@ -1151,6 +1280,16 @@ def gh_cli(repo: Path) -> Callable[[list[str]], tuple[int, str]]:
     return run
 
 
+def real_checks() -> dict:
+    """The real plain-code readiness checks (D-030). AI probes are separate: see real_probes."""
+    return dict(readiness.PLAIN_CHECKS)
+
+
+def real_probes(limits: dict) -> dict:
+    """The real AI probe agents; constructing them launches nothing."""
+    return readiness.probe_agents(limits)
+
+
 def real_team(limits: dict) -> Team:
     from core.agents import ClaudeAgent, CodexAgent
     t = limits.get("agent_timeout_s", 1800)
@@ -1345,6 +1484,12 @@ def main(argv: list[str]) -> int:
                 c._handle_inbox()
                 if (c.state / "KILL").exists():
                     return 0
+            try:
+                c.session_start()  # D-030: readiness before every session, before the smoke test
+            except Tampered:
+                return 0
+            except (RuntimeError, OSError) as e:
+                c._log(f"session readiness error: {e!r}"[:500])
         if a.cmd == "smoke" or _smoke_stale(c.state, c.clock()):
             problems = _guarded_smoke(c, Path(a.work), force=a.cmd == "smoke")
             if a.cmd == "smoke":

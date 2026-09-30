@@ -12,9 +12,9 @@ from core.agents import FakeAgent
 from core.bootstrap import Conductor, Team
 
 try:
-    from tests.core.test_bootstrap import Harness
+    from tests.core.test_bootstrap import HEALTHY_CHECKS, Harness, healthy_probes
 except ImportError:
-    from test_bootstrap import Harness
+    from test_bootstrap import HEALTHY_CHECKS, Harness, healthy_probes
 
 
 class LiveRunTests(Harness):
@@ -43,7 +43,8 @@ class LiveRunTests(Harness):
         c = Conductor(self.repo, self.work, self.state, self.team,
                       {"claude_daily_token_cap": 10**9, "codex_daily_token_cap": 10**9, **limits},
                       owner_email="ben@example.com", mailer=lambda s, b: self.mails.append((s, b)),
-                      inbox=lambda: [], gh=self.gh, clock=lambda: self.now, judge_cmds=[], push=False)
+                      inbox=lambda: [], gh=self.gh, clock=lambda: self.now, judge_cmds=[], push=False,
+                      checks=dict(HEALTHY_CHECKS), probes=healthy_probes())
         self.c = c
         return c
 
@@ -739,6 +740,8 @@ class ReviewRoundTwoRunTests(Harness):
             "guarded_smoke": patch("core.bootstrap._guarded_smoke", return_value=[]),
             "smoke": patch("core.bootstrap.smoke", return_value=[]),
             "run": patch.object(Conductor, "run", return_value="idle"),
+            "checks": patch("core.bootstrap.real_checks", side_effect=lambda: dict(HEALTHY_CHECKS)),
+            "probes": patch("core.bootstrap.real_probes", side_effect=lambda limits: healthy_probes()),
         }
         self.cli = {}
         for name, patcher in patches.items():
@@ -1152,6 +1155,7 @@ class RealTeamTokenCapTests(Harness):
             self.repo, self.work, self.state, bootstrap.real_team(limits), limits,
             owner_email="ben@example.com", mailer=lambda s, b: self.mails.append((s, b)),
             inbox=lambda: [], gh=self.gh, clock=self.clock, judge_cmds=[], push=False,
+            checks=dict(HEALTHY_CHECKS), probes=healthy_probes(),
         )
         self.agent_runs = []
         for role in Team.__dataclass_fields__:
@@ -1580,6 +1584,8 @@ class R40PausedRunTests(Harness):
             "guarded_smoke": patch("core.bootstrap._guarded_smoke", return_value=[]),
             "smoke": patch("core.bootstrap.smoke", return_value=[]),
             "run": patch.object(Conductor, "run", return_value="idle"),
+            "checks": patch("core.bootstrap.real_checks", side_effect=lambda: dict(HEALTHY_CHECKS)),
+            "probes": patch("core.bootstrap.real_probes", side_effect=lambda limits: healthy_probes()),
         }
         self.cli = {}
         for name, patcher in patches.items():
