@@ -23,11 +23,15 @@ ENV = {**os.environ, "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "t@example.c
 
 
 def git(cwd, *args, check=True, env=None, input=None):
-    p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, encoding="utf-8",
-                       env=env or ENV, input=input)
+    # Binary pipes: in text mode Windows rewrites "\n" as "\r\n" on the way to git, so
+    # `hash-object --stdin` would store CRLF blobs that differ from the LF ones `git add` makes
+    # under core.autocrlf=true (finding 6).
+    p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, env=env or ENV,
+                       input=None if input is None else input.encode("utf-8"))
+    out = p.stdout.decode("utf-8", "replace")
     if check and p.returncode != 0:
-        raise AssertionError(f"git {' '.join(args)} failed: {p.stderr}")
-    return p.stdout.strip()
+        raise AssertionError(f"git {' '.join(args)} failed: {p.stderr.decode('utf-8', 'replace')}")
+    return out.strip()
 
 
 class Boom(BaseException):
@@ -178,7 +182,7 @@ class Env:
         self.origin, self.repo, self.work, self.state = root / "origin.git", root / "repo", root / "work", root / "state"
         git(root, "init", "-q", "--bare", "-b", "main", str(self.origin))
         git(root, "init", "-q", "-b", "main", str(self.repo))
-        (self.repo / "README.md").write_text("initial\n", encoding="utf-8")
+        (self.repo / "README.md").write_bytes(b"initial\n")  # LF bytes on every platform
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-q", "-m", "initial")
         self.T0 = git(self.repo, "rev-parse", "HEAD")
@@ -625,6 +629,80 @@ class FinalizerTests(unittest.TestCase):
         self.assertEqual(e.layer_head(), s)
         self.assertFalse(ApprovedMerges(e.state).has(rec["candidates"][0]["sha"]))
 
+    def _crash_once_rejection_is_durable(self, e, strip_blocking):
+        """Review finding 4: crash right after the first journal save that records a rejected candidate."""
+        real_save = Journal.save
+        state = {"done": False}
+
+        def save(journal, rec):
+            real_save(journal, rec)
+            if not state["done"] and any(c.get("state") == "rejected" for c in rec.get("candidates") or []):
+                state["done"] = True
+                raise Boom("after rejected save")
+
+        with patch.object(Journal, "save", save):
+            with self.assertRaises(Boom):
+                e.finalizer().run("T1")
+        self.assertEqual(e.world.count("ask"), 0)
+        if strip_blocking:  # a record left by the old code: rejected, active, no blocking intent
+            path = e.state / "merges" / "T1.json"
+            rec = json.loads(path.read_text(encoding="utf-8"))
+            rec.pop("blocking", None)
+            path.write_bytes(json.dumps(rec, indent=2, sort_keys=True).encode("utf-8"))
+        stuck = e.journal().load("T1")
+        self.assertEqual((stuck["status"], stuck["phase"]), ("active", "candidate"))
+        self.assertEqual(stuck["candidates"][-1]["state"], "rejected")
+
+    def _assert_rejection_recovered(self, e, r, s, reason, text):
+        calls = (e.world.count("judge"), e.world.count("review"))
+        self.assertEqual(e.finalizer().run("T1"), "blocked")
+        rec = e.journal().load("T1")
+        self.assertEqual(rec["status"], "blocked")
+        self.assertEqual(rec["blocked"]["reason"], reason)
+        self.assertEqual(e.world.count("ask"), 1)
+        self.assertIn(text, e.world.effects[-1][1][2])
+        self.assertEqual((e.world.count("judge"), e.world.count("review")), calls)  # not judged again
+        self.assertEqual(e.origin_head(), r)
+        self.assertEqual(e.layer_head(), s)
+        self.assertFalse(ApprovedMerges(e.state).has(rec["candidates"][0]["sha"]))
+        self.assertEqual(e.finalizer().run("T1"), "blocked")
+        self.assertEqual(e.world.count("ask"), 1)
+        # and it is answerable: unblock, fix the checks, finish
+        e.world.judge_fn = lambda sha: {"passed": True, "run_id": f"ci-{sha[:12]}", "output": "ok"}
+        e.world.review_fn = lambda rec, cand: {"verdict": "pass", "reasons": ["ok now"]}
+        e.world.questions[rec["blocked"]["qid"]]["open"] = False
+        self.assertEqual(e.journal().unblock(rec["blocked"]["qid"], "fixed"), ["T1"])
+        self.assertEqual(e.finalizer().run("T1"), "finished")
+        self.assert_finished_cleanly(e, "T1", s)
+
+    def test_crash_after_judge_rejection_saved_recovers_into_blocking(self):
+        for strip in (False, True):
+            with self.subTest(legacy_record=strip):
+                e, s, r = self.div_env()
+                e.world.judge_fn = lambda sha: {"passed": False, "run_id": "ci-x", "output": "3 tests failed"}
+                self._crash_once_rejection_is_durable(e, strip)
+                self._assert_rejection_recovered(e, r, s, "judge failed", "3 tests failed")
+
+    def test_crash_after_review_rejection_saved_recovers_into_blocking(self):
+        for strip in (False, True):
+            with self.subTest(legacy_record=strip):
+                e, s, r = self.div_env()
+                e.world.review_fn = lambda rec, cand: {"verdict": "fail", "reasons": ["drops the other change"]}
+                self._crash_once_rejection_is_durable(e, strip)
+                self._assert_rejection_recovered(e, r, s, "review failed", "drops the other change")
+
+    def test_crash_after_conflict_rejection_saved_recovers_into_blocking(self):
+        for strip in (False, True):
+            with self.subTest(legacy_record=strip):
+                e, s, r = self.conflict_env()
+                self._crash_once_rejection_is_durable(e, strip)
+                self.assertEqual(e.finalizer().run("T1"), "blocked")
+                rec = e.journal().load("T1")
+                self.assertEqual(rec["blocked"]["reason"], "merge_conflict")
+                self.assertEqual(e.world.count("ask"), 1)
+                self.assertIn("README.md", e.world.effects[-1][1][2])
+                self.assertEqual(e.origin_head(), r)
+
     def test_review_exception_propagates_and_resume_calls_only_review(self):
         e, s, r = self.div_env()
 
@@ -768,6 +846,26 @@ class FinalizerTests(unittest.TestCase):
         self.assertEqual(e.candidate_refs(), [])
         self.assertEqual(e.journal().load("T1")["candidates"][-1]["state"], "approved")
 
+    def test_conflict_scenario_under_windows_git_settings(self):
+        # Review finding 6: on Windows the scenario above ended 'blocked' after unblock. Emulate that PC:
+        # a global core.autocrlf=true, and text-mode subprocess pipes that turn "\n" into "\r\n" on the
+        # way to the child (what Windows does with text=True input). The harness must still create
+        # byte-exact blobs, so the "undo" commit really restores README.md and the retry merges cleanly.
+        cfg = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, cfg, True)
+        (cfg / "gitconfig").write_bytes(b"[core]\n\tautocrlf = true\n")
+        real_run = subprocess.run
+
+        def windows_pipes(*args, **kw):
+            if kw.get("text") and isinstance(kw.get("input"), str):
+                kw["input"] = kw["input"].replace("\n", "\r\n")
+            return real_run(*args, **kw)
+
+        glob = {"GIT_CONFIG_GLOBAL": str(cfg / "gitconfig")}
+        with patch.dict(os.environ, glob), patch.dict(ENV, glob), patch.object(subprocess, "run", windows_pipes):
+            self.assertEqual(git(Path(cfg), "config", "--global", "core.autocrlf"), "true")
+            self.test_conflict_blocks_once_reuses_question_and_finishes_after_unblock()
+
     def test_closed_question_is_not_reused(self):
         e, s_a, r = self.conflict_env()
         e.finalizer().run("T1")
@@ -832,6 +930,32 @@ class FinalizerTests(unittest.TestCase):
         self.assertEqual(e.journal().load("T1")["status"], "active")
         self.assertEqual(e.finalizer().run("T1"), "finished")
         self.assertEqual(e.world.done_sets(), 1)
+
+
+    def test_get_task_is_a_required_hook(self):
+        # Review finding 5: exactly-once queue completion must not depend on an optional hook.
+        e = Env(self)
+        w = e.world
+        kw = dict(judge=w.judge, review=w.review, ask=w.ask, question_open=w.question_open,
+                  mark_drift=w.mark_drift, drift_marked=w.drift_marked, ledger_pass=w.ledger_pass,
+                  ledger_completed=w.ledger_completed, set_task=w.set_task)
+        with self.assertRaises(TypeError):
+            Hooks(**kw)
+        with self.assertRaises(TypeError):
+            Hooks(**kw, get_task=None)
+        self.assertIsNotNone(Hooks(**kw, get_task=w.get_task).get_task)
+
+    def test_queue_done_not_repeated_after_crash_after_queue_on_fresh_objects(self):
+        e, s = self.ff_env()
+        e.world.crash_at = "after:queue"
+        with self.assertRaises(Boom):
+            e.finalizer().run("T1")
+        # a brand-new conductor view of the same durable queue
+        fresh = Finalizer(e.layer_wt, LAYER, e.trees, Journal(e.state), ApprovedMerges(e.state),
+                          e.world.hooks(), push=True)
+        self.assertEqual(fresh.run("T1"), "finished")
+        self.assertEqual(e.world.done_sets(), 1)
+        self.assertIn(("get_task", "T1"), e.world.calls)
 
 
 class ReconcileTests(unittest.TestCase):

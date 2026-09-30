@@ -695,6 +695,26 @@ class MergeEvidenceTests(LedgerTestBase):
         self.assertEqual(self.led.contracts()["C1"]["status"], "submitted")
         self.assertEqual(self.led.apply(self.pass_prop(**self.evidence()), "aud")["status"], "applied")
 
+    def test_explicit_null_evidence_is_rejected(self):
+        # Review finding 3: a present key must validate; null is not "absent".
+        cases = {
+            "task_commit null": {"task_commit": None},
+            "final_sha null": {"final_sha": None},
+            "merges null": {"merges": None},
+            "final_sha null with merges": self.evidence(final_sha=None),
+            "all null": {"task_commit": None, "final_sha": None, "merges": None},
+        }
+        for i, (label, extra) in enumerate(cases.items()):
+            with self.subTest(label):
+                before = self.led.snapshot()
+                with self.assertRaises(Rejected) as ctx:
+                    self.led.apply(self.pass_prop(pid=f"null-{i}", **extra), "aud")
+                self.assertTrue(str(ctx.exception).startswith("pass merge evidence incomplete:"),
+                                str(ctx.exception))
+                self.assertEqual(self.led.snapshot(), before)
+                self.assertIsNone(self.led.completion("C1"))
+        self.assertEqual(self.led.contracts()["C1"]["status"], "submitted")
+
     def test_old_evidence_rules_still_come_first(self):
         # a good merge cannot stand in for a missing task run
         before = self.led.snapshot()

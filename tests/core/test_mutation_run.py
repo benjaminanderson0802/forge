@@ -5,11 +5,14 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from core import mutation
 from core.mutation import MutationResult, find_mutants, run_mutation
 
 
@@ -255,6 +258,43 @@ class BudgetTests(Base):
         self.assertEqual([c["timeout"] for c in run.calls], [5.0, 5.0, 4.0, 2.5])
 
 
+    def test_timeout_recomputed_after_setup(self):
+        # Review finding 2: setup (cache dir, writing the mutant) takes time.
+        # The subprocess timeout must use the time left right before launch.
+        self.write("m.py", lines_source(1))
+        real_mkdtemp = mutation.tempfile.mkdtemp
+
+        def slow_mkdtemp(*a, **kw):
+            self.clock.now += 3.0
+            return real_mkdtemp(*a, **kw)
+
+        run = FakeRun(self.clock, [(1, False, 1.0)])
+        with mock.patch.object(mutation.tempfile, "mkdtemp", slow_mkdtemp):
+            res = self.go({"m.py": {1}}, run, budget_s=10.0, per_mutant_timeout_s=8.0)
+        self.assertEqual([c["timeout"] for c in run.calls], [7.0])
+        self.assertEqual(res.killed, 1)
+        self.assertTrue(res.complete)
+
+    def test_setup_exhausting_budget_skips_launch(self):
+        src = lines_source(2)
+        self.write("m.py", src)
+        ids = [m.id for m in find_mutants("m.py", src, {1, 2})]
+        real_mkdtemp = mutation.tempfile.mkdtemp
+
+        def slow_mkdtemp(*a, **kw):
+            self.clock.now += 20.0
+            return real_mkdtemp(*a, **kw)
+
+        run = FakeRun(self.clock, [])
+        with mock.patch.object(mutation.tempfile, "mkdtemp", slow_mkdtemp):
+            res = self.go({"m.py": {1, 2}}, run, budget_s=10.0, per_mutant_timeout_s=8.0)
+        self.assertEqual(run.calls, [])
+        self.assertEqual(res.not_run, ids)
+        self.assertFalse(res.complete)
+        self.assertFalse(res.passed)
+        self.assertEqual((self.root / "m.py").read_bytes(), src.encode("utf-8"))
+
+
 class SafetyTests(Base):
     def test_file_restored_when_run_raises(self):
         src = lines_source(2)
@@ -395,6 +435,57 @@ class RealRunTests(unittest.TestCase):
         self.assertEqual(res.killed, 2, res.reason)
         self.assertTrue(res.complete)
         self.assertTrue(res.passed)
+
+
+    # Review finding 1: a test process that leaves a child holding the
+    # captured pipes must not stall the runner past its timeout.
+    _ORPHAN = ("import subprocess, sys, time, pathlib\n"
+               "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+               "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n"
+               "print('started', flush=True)\n"
+               "time.sleep(60)\n")
+
+    def _alive(self, pid):
+        if os.name == "nt":
+            return False  # os.kill(pid, 0) would terminate on Windows; timing is the check
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            return stat.split(")")[-1].split()[0] != "Z"
+        except OSError:
+            return True
+
+    def test_default_run_timeout_not_held_by_orphan_child(self):
+        script = self.root / "spawn.py"
+        script.write_text(self._ORPHAN, encoding="utf-8", newline="")
+        pidfile = self.root / "child.pid"
+        env = dict(os.environ)
+        start = time.monotonic()
+        code, timed_out = mutation._default_run(
+            [sys.executable, str(script), str(pidfile)], self.root, 1.5, env)
+        elapsed = time.monotonic() - start
+        self.assertEqual((code, timed_out), (124, True))
+        self.assertLess(elapsed, 10.0)
+        pid = int(pidfile.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 5.0
+        while self._alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(self._alive(pid), "grandchild survived the tree kill")
+
+    def test_run_mutation_restores_and_keeps_budget_with_orphan_child(self):
+        self.put("calc.py", "def f(a, b): return a + b\n")
+        self.put("spawn.py", self._ORPHAN)
+        argv = [sys.executable, "spawn.py", str(self.root / "child.pid")]
+        start = time.monotonic()
+        res = run_mutation(self.root, {"calc.py": {1}}, argv, mutation_min=0.8,
+                           budget_s=60.0, per_mutant_timeout_s=1.5)
+        self.assertLess(time.monotonic() - start, 15.0)
+        self.assertEqual(res.killed, 1)  # full per-mutant timeout
+        self.assertEqual((self.root / "calc.py").read_text(encoding="utf-8"),
+                         "def f(a, b): return a + b\n")
 
 
 if __name__ == "__main__":
