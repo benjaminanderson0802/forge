@@ -32,6 +32,17 @@ Register-ScheduledTask -TaskName 'Forge watchdog' -Action $wdAction -Trigger $wd
     -Principal $principal -Description 'Forge: restarts the conductor if it hangs. Does nothing while Forge is stopped.' -Force | Out-Null
 Write-Host '[OK] Background task "Forge watchdog" registered.' -ForegroundColor Green
 
+# 1c. Status page: http://127.0.0.1:8765 (loopback only), started at logon, restarted every 5 minutes if it died
+$spAction = New-ScheduledTaskAction -Execute $pyw -Argument '-m core.status_page' -WorkingDirectory $forge
+$spLogon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$spEvery5 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
+$spSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Days 3650) `
+    -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Priority 7 -Hidden
+Register-ScheduledTask -TaskName 'Forge status page' -Action $spAction -Trigger @($spLogon, $spEvery5) -Settings $spSettings `
+    -Principal $principal -Description 'Forge: the local status page at http://127.0.0.1:8765 (progress, usage, questions, Stop).' -Force | Out-Null
+Start-ScheduledTask -TaskName 'Forge status page'
+Write-Host '[OK] Status page registered: http://127.0.0.1:8765' -ForegroundColor Green
+
 # 2. Never sleep while plugged in (screen may still turn off)
 powercfg /change standby-timeout-ac 0 | Out-Null
 powercfg /change hibernate-timeout-ac 0 | Out-Null
@@ -43,6 +54,7 @@ $stop = "@echo off`r`necho stopped by Stop Forge shortcut> `"$state\KILL`"`r`nec
 $start = "@echo off`r`ndel /q `"$state\KILL`" 2>nul`r`nschtasks /Run /TN `"Forge conductor`" >nul`r`necho Forge is running again in the background.`r`ntimeout /t 5`r`n"
 [IO.File]::WriteAllText((Join-Path $desk 'Stop Forge.cmd'), $stop)
 [IO.File]::WriteAllText((Join-Path $desk 'Start Forge.cmd'), $start)
+[IO.File]::WriteAllText((Join-Path $desk 'Forge status.url'), "[InternetShortcut]`r`nURL=http://127.0.0.1:8765/`r`n")
 Write-Host '[OK] "Stop Forge" and "Start Forge" are on your desktop.' -ForegroundColor Green
 
 # 4. Start now
