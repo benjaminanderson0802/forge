@@ -12,9 +12,9 @@ from core.agents import FakeAgent
 from core.bootstrap import Conductor, Team
 
 try:
-    from tests.core.test_bootstrap import Harness
+    from tests.core.test_bootstrap import HEALTHY_CHECKS, Harness, healthy_probes
 except ImportError:
-    from test_bootstrap import Harness
+    from test_bootstrap import HEALTHY_CHECKS, Harness, healthy_probes
 
 
 class LiveRunTests(Harness):
@@ -43,7 +43,8 @@ class LiveRunTests(Harness):
         c = Conductor(self.repo, self.work, self.state, self.team,
                       {"claude_daily_token_cap": 10**9, "codex_daily_token_cap": 10**9, **limits},
                       owner_email="ben@example.com", mailer=lambda s, b: self.mails.append((s, b)),
-                      inbox=lambda: [], gh=self.gh, clock=lambda: self.now, judge_cmds=[], push=False)
+                      inbox=lambda: [], gh=self.gh, clock=lambda: self.now, judge_cmds=[], push=False,
+                      checks=dict(HEALTHY_CHECKS), probes=healthy_probes())
         self.c = c
         return c
 
@@ -668,8 +669,10 @@ class ReviewSmokeTests(Harness):
         self.assertNotEqual((self.state / "meter.json").read_bytes(), before)
         self.assertEqual(c.meter.used_today("codex"), 3 + 14)
         self.assertEqual(c.meter.used_today("claude"), 28)
-        self.assertEqual(len(list((self.state / "runs").glob("*/prompt.md"))), 6)
-        self.assertEqual(len(list((self.state / "runs").glob("*/output.json"))), 6)
+        # T1B2c: the launch gate may probe claude/codex first; those guarded probe runs are recorded too.
+        role_runs = [d for d in (self.state / "runs").iterdir() if "-probe-" not in d.name]
+        self.assertEqual(len([d for d in role_runs if (d / "prompt.md").exists()]), 6)
+        self.assertEqual(len([d for d in role_runs if (d / "output.json").exists()]), 6)
         self.assertTrue((self.state / "smoke_ok.json").exists())
 
     def test_R29_guarded_smoke_refuses_reached_token_cap(self):
@@ -739,6 +742,8 @@ class ReviewRoundTwoRunTests(Harness):
             "guarded_smoke": patch("core.bootstrap._guarded_smoke", return_value=[]),
             "smoke": patch("core.bootstrap.smoke", return_value=[]),
             "run": patch.object(Conductor, "run", return_value="idle"),
+            "checks": patch("core.bootstrap.real_checks", side_effect=lambda: dict(HEALTHY_CHECKS)),
+            "probes": patch("core.bootstrap.real_probes", side_effect=lambda limits: healthy_probes()),
         }
         self.cli = {}
         for name, patcher in patches.items():
@@ -1152,6 +1157,7 @@ class RealTeamTokenCapTests(Harness):
             self.repo, self.work, self.state, bootstrap.real_team(limits), limits,
             owner_email="ben@example.com", mailer=lambda s, b: self.mails.append((s, b)),
             inbox=lambda: [], gh=self.gh, clock=self.clock, judge_cmds=[], push=False,
+            checks=dict(HEALTHY_CHECKS), probes=healthy_probes(),
         )
         self.agent_runs = []
         for role in Team.__dataclass_fields__:
@@ -1223,8 +1229,8 @@ class R37PerLaunchCapTests(Harness):
         # Simulate concurrent provider usage without changing guarded state
         # during an agent call: retain the real Meter in a sibling temp directory.
         c.meter = Meter(self.state.parent / "shared-usage", c.clock)
-        runner = patch.object(c, "_run_tests", side_effect=lambda task: (
-            (0, "Ran 1 test\nOK", False) if (c.wt / "feat.py").exists()
+        runner = patch.object(c, "_run_tests", side_effect=lambda task, cwd=None: (
+            (0, "Ran 1 test\nOK", False) if ((cwd or c.wt) / "feat.py").exists()
             else (1, "Ran 1 test\nFAILED (errors=1)", False)
         ))
         runner.start()
@@ -1423,8 +1429,8 @@ class R38DeferredTroubleshootingTests(Harness):
             "test_writer": self.write_tests, "builder": builder,
             "troubleshooter": troubleshoot,
         })
-        runner = patch.object(c, "_run_tests", side_effect=lambda task: (
-            (0, "Ran 1 test\nOK", False) if (c.wt / "feat.py").exists()
+        runner = patch.object(c, "_run_tests", side_effect=lambda task, cwd=None: (
+            (0, "Ran 1 test\nOK", False) if ((cwd or c.wt) / "feat.py").exists()
             else (1, self.failure_output, False)
         ))
         runner.start()
@@ -1491,6 +1497,8 @@ class R39SmokeCleanupTests(Harness):
         team, calls = self.smoke_team()
         c = self.make_conductor() if guarded else None
         if c is not None:
+            for role in vars(team):  # T1B2c: the launch gate needs a real provider name to find evidence for
+                getattr(team, role).provider = "codex" if role in ("test_writer", "reviewer") else "claude"
             c.team = team
         remove = shutil.rmtree
         attempts = []
@@ -1580,6 +1588,8 @@ class R40PausedRunTests(Harness):
             "guarded_smoke": patch("core.bootstrap._guarded_smoke", return_value=[]),
             "smoke": patch("core.bootstrap.smoke", return_value=[]),
             "run": patch.object(Conductor, "run", return_value="idle"),
+            "checks": patch("core.bootstrap.real_checks", side_effect=lambda: dict(HEALTHY_CHECKS)),
+            "probes": patch("core.bootstrap.real_probes", side_effect=lambda limits: healthy_probes()),
         }
         self.cli = {}
         for name, patcher in patches.items():
@@ -1800,7 +1810,9 @@ class R42StopDuringRunTests(Harness):
         with self.subTest(check="no tamper or halt alert"):
             self.assert_no_stop_alert(c)
         with self.subTest(check="stop logged with role and run id"):
-            runs = list((self.state / "runs").iterdir())
+            # Layer 1B: the launch gate's readiness probes (probe-<name>) also leave run records; only the
+            # test writer's own run is the one this check is about.
+            runs = [r for r in (self.state / "runs").iterdir() if not r.name.split("-", 1)[1].startswith("probe-")]
             self.assertEqual(len(runs), 1)
             self.assertIn(f"stop requested during test_writer run {runs[0].name}",
                           (self.state / "errors.log").read_text(encoding="utf-8"))
@@ -1931,7 +1943,9 @@ class R42StopDuringRunTests(Harness):
             queue = json.loads((self.state / "queue.json").read_text(encoding="utf-8"))
             queue["tasks"][0]["title"] = "tampered task title"
             (self.state / "queue.json").write_text(json.dumps(queue), encoding="utf-8")
-            (cwd / "troubleshooter-stray.txt").write_text("retain this edit\n", encoding="utf-8")
+            # Layer 1B runs the troubleshooter in a throwaway tree (cwd), so the edit is made in the layer
+            # worktree itself: that is the tree a reset or clean after tampering would wrongly touch.
+            (wt / "troubleshooter-stray.txt").write_text("retain this edit\n", encoding="utf-8")
             return '{"kind":"fix","notes":"untrusted result"}', 1
 
         c = self.init(agents={"troubleshooter": troubleshoot})
@@ -1998,8 +2012,19 @@ class R42StopDuringRunTests(Harness):
             return '{"files":[]}', 1
 
         c = self.make_conductor(agents={"test_writer": tamper})
-        path.write_text("original stop reason\n", encoding="utf-8")
-        # Call directly: step() must never launch an agent with an existing stop flag.
+        c._refresh_readiness()  # Layer 1B: usable evidence first; no probe runs while a stop flag is set
+        # R49 (Layer 1D): nothing launches while a stop flag is set, so the flag is planted in the race window
+        # between the pre-launch check and the before-run fingerprint (Ben pressing Stop at that instant).
+        real_fingerprint = c._fingerprint
+        planted = []
+
+        def fingerprint():
+            if not planted:
+                planted.append(True)
+                path.write_text("original stop reason\n", encoding="utf-8")
+            return real_fingerprint()
+
+        c._fingerprint = fingerprint
         with self.assertRaises(bootstrap.Tampered):
             c._call("test_writer", "Cannot un-stop Forge", bootstrap.S_TESTS, cwd=self.work)
         self.assertEqual(len(c.team.test_writer.prompts), 1)

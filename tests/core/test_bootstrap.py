@@ -22,6 +22,16 @@ def py_test(path):
     return f'python -m unittest {path}'
 
 
+# T1B2b: every Conductor in these tests gets a healthy, fake readiness setup (no real checks or agents).
+HEALTHY_CHECKS = {name: (lambda: (True, "ok")) for name in
+                  ("git", "github", "gmail", "docker", "n8n", "ollama", "python_libs", "browser")}
+
+
+def healthy_probes():
+    return {"claude": FakeAgent(lambda p, c: ("ok", 0), provider="claude"),
+            "codex": FakeAgent(lambda p, c: ("ok", 0), provider="codex")}
+
+
 class Harness(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -50,8 +60,10 @@ class Harness(unittest.TestCase):
     def agent(self, script, provider):
         return FakeAgent(script, provider=provider)
 
-    def make_conductor(self, agents=None, limits=None):
+    def make_conductor(self, agents=None, limits=None, checks=None, probes=None):
         agents = agents or {}
+        self.checks = dict(HEALTHY_CHECKS) if checks is None else checks
+        self.probes = healthy_probes() if probes is None else probes
         noop = lambda prompt, cwd: ('{"status":"ok"}', 1)
         members = {
             "test_writer": self.agent(agents.get("test_writer", noop), "codex"),
@@ -65,7 +77,8 @@ class Harness(unittest.TestCase):
         self.c = Conductor(self.repo, self.work, self.state, self.team,
                            limits or {"claude_daily_token_cap": 10**9, "codex_daily_token_cap": 10**9},
                            owner_email="ben@example.com", mailer=lambda s, b: self.mails.append((s, b)),
-                           inbox=lambda: self.messages, gh=self.gh, judge_cmds=[], push=False)
+                           inbox=lambda: self.messages, gh=self.gh, judge_cmds=[], push=False,
+                           checks=self.checks, probes=self.probes)
         return self.c
 
     def task(self, **kw):
@@ -75,8 +88,8 @@ class Harness(unittest.TestCase):
         d.update(kw)
         return d
 
-    def init(self, *tasks, agents=None, limits=None):
-        c = self.make_conductor(agents, limits)
+    def init(self, *tasks, agents=None, limits=None, checks=None, probes=None):
+        c = self.make_conductor(agents, limits, checks=checks, probes=probes)
         c.init_queue(self.layer, list(tasks or [self.task()]))
         return c
 
@@ -260,7 +273,13 @@ class BootstrapTests(Harness):
 
     def test_builder_blocked_result_is_failed_attempt(self):
         """Spec: builder status blocked becomes a failed attempt and triggers troubleshooting rules."""
-        c=self.advance_to_build(agents={"test_writer":self.write_tests,"builder":lambda p,c: (json.dumps({"status":"blocked","summary":"cannot proceed","tried":["route a","route b"],"error":"boom"}),1)})
+        # T1B2e: a complete claim for a capability the map shows failing (docker is missing, which is not
+        # troubleshootable, so routing only files a held item and the build step still runs).
+        claim={"status":"blocked","summary":"cannot proceed","tried":["route a","route b"],"error":"boom",
+               "capability":"docker","meanwhile":"work on the parts that need no docker"}
+        checks=dict(HEALTHY_CHECKS,docker=lambda: (False,"docker not installed or not on PATH"))
+        c=self.init(agents={"test_writer":self.write_tests,"builder":lambda p,c: (json.dumps(claim),1)},checks=checks)
+        self.assertEqual(c.step(),"worked")
         c.step()
         task=json.loads((self.state/"queue.json").read_text())["tasks"][0]
         self.assertNotEqual(task["status"],"blocked")
@@ -883,7 +902,7 @@ class R15BootstrapTests(Harness):
         task = json.loads((self.state / "queue.json").read_text())["tasks"][0]
         self.assertEqual(task["status"], status_before)
         self.assertEqual(meter_path.read_bytes(), meter_before)
-        self.assertFalse(list((self.state / "runs").glob("*/output.json")))
+        self.assertFalse(list((self.state / "runs").glob("*-test_writer-*/output.json")))
         self.assertNotIn("tests/core/test_feat.py", self.branch_files())
         # Restoring access must not let the next step accept the rewritten queue.
         self.assertEqual(c.step(), "killed")
@@ -931,7 +950,7 @@ class R15BootstrapTests(Harness):
         self.assertTrue(any("tamper" in subject.lower() and "extra" in body
                             and any(word in body.lower() for word in ("permission", "denied", "fail", "unreadable"))
                             for subject, body in self.mails))
-        self.assertFalse(list((self.state / "runs").glob("*/output.json")))
+        self.assertFalse(list((self.state / "runs").glob("*-test_writer-*/output.json")))
         self.assertNotIn("tests/core/test_feat.py", self.branch_files())
 
     def test_R15_before_run_stat_failure_prevents_agent_launch(self):

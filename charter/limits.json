@@ -8,5 +8,6 @@
   "mutation_min": 0.8,
   "max_parallel_idle": 3,
   "mail_per_hour": 3,
-  "mail_per_day": 10
+  "mail_per_day": 10,
+  "agent_runs_per_day": 150
 }
