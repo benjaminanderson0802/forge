@@ -3,6 +3,7 @@ background process; prompts go in on stdin; results come back as AgentResult (ne
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -220,6 +221,13 @@ def parse_codex(code: int, events_out: str, last_message: str, schema: dict | No
     return _finish("codex", last_message.strip(), tokens, schema)
 
 
+def _deadline(own: int, timeout_s: float | None) -> int:
+    """T1C4: a caller's deadline can only shorten an agent's own timeout (whole seconds, at least 1)."""
+    if timeout_s is None:
+        return own
+    return max(1, min(int(own), int(math.ceil(float(timeout_s)))))
+
+
 class ClaudeAgent:
     provider = "claude"  # R6/R29: the id the Meter and the token caps use
 
@@ -228,7 +236,7 @@ class ClaudeAgent:
         self.timeout_s, self.permission_mode, self.allowed_tools = timeout_s, permission_mode, allowed_tools
         self.cmd = cmd or ["claude"]
 
-    def run(self, prompt: str, cwd: Path, schema: dict | None = None) -> AgentResult:
+    def run(self, prompt: str, cwd: Path, schema: dict | None = None, timeout_s: float | None = None) -> AgentResult:
         base = _resolve(self.cmd)
         if not base:
             return AgentResult("", 0, False, f"agent command not found: {self.cmd[0]}", None, "claude")
@@ -238,7 +246,7 @@ class ClaudeAgent:
         if schema:
             prompt += "\n\nAnswer with ONLY a JSON object with these keys: " + ", ".join(schema.get("required", []))
         try:
-            _, out, _ = launch(args, cwd, prompt, self.timeout_s)
+            _, out, _ = launch(args, cwd, prompt, _deadline(self.timeout_s, timeout_s))
         except TimeoutError as e:
             return AgentResult("", 0, False, str(e), None, "claude")
         return parse_claude(out, schema)
@@ -251,7 +259,7 @@ class CodexAgent:
         self.timeout_s, self.sandbox = timeout_s, sandbox
         self.cmd = cmd or ["codex"]
 
-    def run(self, prompt: str, cwd: Path, schema: dict | None = None) -> AgentResult:
+    def run(self, prompt: str, cwd: Path, schema: dict | None = None, timeout_s: float | None = None) -> AgentResult:
         base = _resolve(self.cmd)
         if not base:
             return AgentResult("", 0, False, f"agent command not found: {self.cmd[0]}", None, "codex")
@@ -266,7 +274,7 @@ class CodexAgent:
             args += ["--output-schema", str(tmp / "schema.json")]
         args += ["-"]
         try:
-            code, out, _ = launch(args, cwd, prompt, self.timeout_s)
+            code, out, _ = launch(args, cwd, prompt, _deadline(self.timeout_s, timeout_s))
         except TimeoutError as e:
             return AgentResult("", 0, False, str(e), None, "codex")
         finally:
@@ -279,10 +287,11 @@ class FakeAgent:
     """For drills and tests. script(prompt, cwd) -> (text, tokens); exceptions become failed results."""
 
     def __init__(self, script: Callable[[str, Path], tuple[str, int]], provider: str = "fake"):
-        self.script, self.provider, self.prompts = script, provider, []
+        self.script, self.provider, self.prompts, self.timeouts = script, provider, [], []
 
-    def run(self, prompt: str, cwd: Path, schema: dict | None = None) -> AgentResult:
+    def run(self, prompt: str, cwd: Path, schema: dict | None = None, timeout_s: float | None = None) -> AgentResult:
         self.prompts.append(prompt)
+        self.timeouts.append(timeout_s)
         try:
             text, tokens = self.script(prompt, Path(cwd))
         except Exception as e:  # noqa: BLE001
