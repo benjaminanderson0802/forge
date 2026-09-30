@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable
 
 from core.ledger import Ledger, Rejected
+from core.roles import role_text
 from core.usage import Meter
 
 ROLES = {"ci": "ci", "forge-manager": "manager", "forge-executor": "executor",
@@ -682,7 +683,7 @@ class Conductor:
     def _tests_stage(self, tid: str) -> None:
         t = self._task(tid)
         self._reset_wt()
-        prompt = ("You are the TEST WRITER. Write only these files: " + ", ".join(t["test_files"]) +
+        prompt = (role_text(self.repo, "test_writer") + "\n\nWrite only these files: " + ", ".join(t["test_files"]) +
                   ". The tests must fail until the feature exists. Do not write any other file.\n\n" +
                   self._task_prompt(t) + "\nAnswer with JSON: {\"files\": [...], \"summary\": \"...\"}")
         try:
@@ -756,7 +757,7 @@ class Conductor:
         self._reset_wt()
         tests_commit = t["tests_commit"]
 
-        prompt = "You are the BUILDER. Make the tests pass by changing only the files you may change.\n\n" + \
+        prompt = role_text(self.repo, "builder") + "\n\nMake the tests pass by changing only the files you may change.\n\n" + \
                  self._task_prompt(t)
         if t.get("review_feedback"):
             prompt += "\nREVIEW FEEDBACK:\n" + "\n".join(f"- {x}" for x in t["review_feedback"]) + "\n"
@@ -831,7 +832,7 @@ class Conductor:
 
         diff = _git(self.wt, "diff", f"{tests_commit}..{sha}")
         try:
-            rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this change against the task. "
+            rv = self._call("reviewer", role_text(self.repo, "reviewer") + "\n\nCheck this change against the task. "
                                         "Reject shortcuts, bare-minimum work, drift from the task, and anything that "
                                         "weakens tests.\n\n" + self._task_prompt(t) + "\nDIFF:\n" + diff[:60000] +
                             "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW)
@@ -883,7 +884,7 @@ class Conductor:
     def _troubleshoot(self, tid: str, reason: str, output: str) -> None:
         t = self._task(tid)
         self._reset_wt()
-        prompt = ("You are the TROUBLESHOOTER. The builder is stuck on this task. Diagnose the cause and give "
+        prompt = (role_text(self.repo, "troubleshooter") + "\n\nThe builder is stuck on this task. Diagnose the cause and give "
                   "concrete notes the next builder attempt can follow. If this route is a dead end, say so and "
                   "name the alternative.\n\n" + self._task_prompt(t) +
                   "\nRECENT FAILURES:\n" + "\n".join(t["notes"][-6:]) +
@@ -910,7 +911,7 @@ class Conductor:
         design = self.wt / "docs" / "specs" / "layer-1-design.md"
         text = design.read_text(encoding="utf-8") if design.exists() else "(no design file)"
         listing = "\n".join(f"- {t['id']} [{t['status']}] {t['title']}" for t in q["tasks"])
-        r = self._call("drift_keeper", "You are the DRIFT KEEPER (read-only). Is this work still on course for "
+        r = self._call("drift_keeper", role_text(self.repo, "drift_keeper") + "\n\nIs this work still on course for "
                                        "the design? Say replan only if it is drifting.\n\nTASKS:\n" + listing +
                        "\n\nDESIGN:\n" + text[:40000] +
                        "\nAnswer with JSON: {\"status\": \"ok\" | \"replan\", \"reasons\": [...]}", S_DRIFT)
@@ -942,7 +943,7 @@ class Conductor:
         self._reset_wt()
         plan_file = _norm(t["plan_file"])
         try:
-            r = self._call("planner", "You are the PLANNER. Write the implementation plan to " + plan_file +
+            r = self._call("planner", role_text(self.repo, "planner") + "\n\nWrite the implementation plan to " + plan_file +
                            " (and no other file), then return its tasks.\n\n" + self._task_prompt(t) +
                            "\nEach task needs: id, title, section, files_in_scope, test_files, test_cmd.\n"
                            "Answer with JSON: {\"tasks\": [...]}", S_PLAN)
@@ -970,7 +971,7 @@ class Conductor:
         if not reason:
             plan_text = (self.wt / plan_file).read_text(encoding="utf-8")
             try:
-                rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this plan against the task and "
+                rv = self._call("reviewer", role_text(self.repo, "reviewer") + "\n\nCheck this plan against the task and "
                                             "design: complete, testable, no placeholders, no drift.\n\n" +
                                 self._task_prompt(t) + "\nPLAN:\n" + plan_text[:60000] + "\nTASKS JSON:\n" +
                                 json.dumps(tasks)[:20000] +
