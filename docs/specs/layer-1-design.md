@@ -35,7 +35,7 @@ The engines are fixed by role (D-020): when a cap is hit, the team slows down; i
 4. **Judges:**
    - acceptance tests at the exact commit, in a throwaway worktree
    - all drills
-   - mutation testing on changed lines: each mutant must be caught, and the rate must be at least `mutation_min` (charter limits)
+   - mutation testing on changed lines: the kill rate must be at least `mutation_min` (charter limits), and every surviving mutant is reported to the Builder and Reviewer as evidence (D-038)
 5. **Reviewer:** the verdict and its reasons go into the ledger. On a fail, the reasons are fed to the next Builder attempt.
 6. **Merge** into the layer branch. `main` changes only with Ben's approval (D-027).
 7. **Drift keeper** runs after every merge. Coverage must rise. If there's no gain in 3 merges, or no merge in 2 active hours, it re-plans.
