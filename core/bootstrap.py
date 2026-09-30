@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from core import channel
 from core import coverage as cov_mod
 from core import drift as drift_mod
 from core import manager as manager_mod
@@ -248,6 +249,8 @@ class Conductor:
         p = self.state / name
         tmp = p.with_suffix(p.suffix + ".tmp")
         raw = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
+        if name == "questions.json":
+            self._write_ben_queue(data)  # 1E: queue.jsonl, the design's view of the open questions
         if not durable:
             tmp.write_bytes(raw)
             os.replace(tmp, p)
@@ -922,6 +925,10 @@ class Conductor:
 
     # ------------------------------------------------------------------ email
     def _ask(self, kind: str, subject: str, body: str, halt: bool = False, hold: bool = False, **extra) -> str:
+        if self._channel_on:  # 1E / D-023: every question states its default; only instant kinds mail at once
+            body = f"{body}\n\nIf you don't answer: {extra.get('default') or channel.default_for(kind)}"
+            if not halt and not hold and not channel.is_instant(kind):
+                hold, extra = True, dict(extra, digest=True)
         qs = self._read("questions.json", {})
         seq = self._read("q_seq.json", {"n": len(qs)})
         seq["n"] = int(seq.get("n", 0)) + 1
@@ -943,6 +950,8 @@ class Conductor:
         """R20/R24/R25: every email goes through here. Nothing but a halt alert while KILL is set; at most
         mail_per_hour / mail_per_day attempts (counted before sending); each email gets a recorded Message-ID."""
         if (self.state / "KILL").exists() and not halt:
+            return False
+        if not halt and self._quiet_now():  # 1E / D-023: quiet hours; nothing is attempted, nothing counted
             return False
         now = self.clock()
         notes = self._read("notices.json", {})
@@ -990,7 +999,7 @@ class Conductor:
 
     def _notice_once(self, key: str, subject: str, body: str, every_h: float = 12) -> bool:
         """R22: a notice goes out at most once per every_h hours, and never while KILL is set."""
-        if (self.state / "KILL").exists():
+        if (self.state / "KILL").exists() or self._quiet_now():  # 1E: a quiet-hours notice waits, it isn't lost
             return False
         now = self.clock()
         notes = self._read("notices.json", {})
@@ -1042,8 +1051,7 @@ class Conductor:
                     continue
                 if m.get("outgoing") or (m.get("message_id") and str(m["message_id"]).strip() in own_ids):
                     continue  # R18/R26: Forge's own mail is never an answer
-                sender = re.findall(r"[\w.+-]+@[\w.-]+", str(m.get("from", "")).lower())
-                if self.owner not in sender:
+                if not self._from_owner(m.get("from", "")):
                     continue
                 subject, body = str(m.get("subject", "")), clean_reply(str(m.get("body", "")))
                 if is_stop(subject, body):
@@ -1058,6 +1066,14 @@ class Conductor:
                     self._answer(mq.group(1), body, mq.group(2))
             except Exception as e:  # noqa: BLE001 - R35: one bad message never blocks the rest
                 self._log(f"inbox message failed: {e!r}"[:500])
+        self._take_channel_answers()  # 1E: answers from the status page (and any later channel)
+
+    def _from_owner(self, sender) -> bool:
+        """1E: exactly one address, and it is the owner's. The owner's address in a display name
+        ("ben@..." <someone@else>) or next to another address is someone else."""
+        from email.utils import getaddresses
+        addrs = [a.strip().lower() for _, a in getaddresses([str(sender or "")]) if a.strip()]
+        return len(addrs) == 1 and addrs[0] == self.owner
 
     def _answer(self, qid: str, body: str, code: str) -> None:
         qs = self._read("questions.json", {})
@@ -1125,6 +1141,125 @@ class Conductor:
         self._write("questions.json", _prune_questions(qs))
         return False
 
+    # ------------------------------------------------------------------ Ben's channel (1E, D-021 to D-024)
+    local_tz = None  # None: the PC's own zone (Ben's local time); tests set a fixed zone
+    page_url = "http://127.0.0.1:8765"
+    channel_dir = None  # None: <state>/../channel, outside the fingerprinted state (the page writes there any time)
+    STALL_EVERY_S, DIGEST_RETRY_S, DIGEST_IDS_KEEP = 12 * 3600, 3600, 500
+
+    @property
+    def _channel_on(self) -> bool:
+        """The digest / quiet-hours policy is on only when the charter limits set digest_hour (D-035: switched on
+        deliberately, after a watched cycle)."""
+        return self.limits.get("digest_hour") is not None
+
+    def _local_now(self) -> datetime:
+        return channel.to_local(self.clock(), self.local_tz)
+
+    def _quiet_now(self) -> bool:
+        return self._channel_on and channel.is_quiet(self._local_now(), int(self.limits.get("quiet_start", 23)),
+                                                     int(self.limits.get("quiet_end", 7)))
+
+    @property
+    def channel_in(self) -> Path:
+        return Path(self.channel_dir or (self.state.parent / "channel")) / "in"
+
+    def _write_ben_queue(self, questions) -> None:
+        try:
+            channel.write_queue(self.state / "queue.jsonl", questions if isinstance(questions, dict) else {})
+        except OSError as e:  # the view is a convenience; questions.json stays the source of truth
+            self._log(f"queue.jsonl write failed: {e!r}"[:500])
+
+    def _take_channel_answers(self) -> None:
+        """Answers dropped by the status page (or a later channel) are checked exactly like email replies: an open
+        question and its code. A STOP creates KILL at once; answers after it are kept for after the restart."""
+        if (self.state / "KILL").exists():
+            return
+        answers = channel.take_answers(self.channel_in)
+        for i, a in enumerate(answers):
+            try:
+                text = clean_reply(a["answer"])
+                if is_stop("", text):
+                    (self.state / "KILL").write_text(f"stopped by owner via {a['source']}\n")
+                    for rest in answers[i + 1:]:
+                        channel.drop_answer(self.channel_in, rest["qid"], rest["code"], rest["answer"], rest["source"])
+                    return
+                self._answer(a["qid"], text, a["code"])
+            except Exception as e:  # noqa: BLE001 - one bad answer never blocks the rest
+                self._log(f"channel answer failed: {e!r}"[:500])
+
+    def _mail_used(self) -> tuple[int, int]:
+        now = self.clock()
+        ages = []
+        for x in self._read("mail_log.json", {}).get("sent", []):
+            try:
+                ages.append((now - datetime.fromisoformat(x)).total_seconds())
+            except (TypeError, ValueError):
+                continue
+        return sum(1 for a in ages if a < 3600), sum(1 for a in ages if a < 86400)
+
+    def _work_can_run(self, q: dict) -> bool:
+        if any(t.get("status") in ("todo", "tests_ok") for t in q.get("tasks", [])):
+            return True
+        try:
+            return self._active_finalization(q) is not None
+        except (RuntimeError, OSError, ValueError, KeyError):
+            return True  # unsure: no early digest
+
+    def _channel_tick(self) -> None:
+        """D-023 digest: at most one a local day, at or after digest_hour, when there is something to report; and
+        an early one (at most every 12 hours) when nothing can run and Ben hasn't yet heard of a held question.
+        Every attempt is recorded before sending and retried at most hourly; all mail goes through _send."""
+        if not self._channel_on or (self.state / "KILL").exists() or self._quiet_now():
+            return
+        try:
+            now, local = self.clock(), self._local_now()
+            today = local.date().isoformat()
+            st = self._read("digest.json", {})
+            st = st if isinstance(st, dict) else {}
+
+            def age(key: str) -> float:
+                try:
+                    return (now - datetime.fromisoformat(st[key])).total_seconds()
+                except (KeyError, TypeError, ValueError):
+                    return float("inf")
+
+            if age("tried_at") < self.DIGEST_RETRY_S:
+                return
+            qs = self._read("questions.json", {})
+            items = channel.queue_items(qs)
+            q = self._queue()
+            tasks = q.get("tasks", [])
+            summary = json.dumps(sorted((str(t.get("id")), str(t.get("status"))) for t in tasks if isinstance(t, dict)))
+            included = set(st.get("included", []))
+            fresh = [i["id"] for i in items if i["via"] == "digest" and i["id"] not in included]
+            daily = local.hour >= int(self.limits["digest_hour"]) and st.get("sent_day") != today
+            if daily and not items and summary == st.get("summary", json.dumps([])):
+                st["sent_day"] = today  # nothing open, nothing changed: no email
+                self._write("digest.json", st)
+                return
+            early = bool(fresh) and age("stall_at") >= self.STALL_EVERY_S and not self._work_can_run(q)
+            if not (daily or early):
+                return
+            st["tried_at"] = now.isoformat()  # R25: the attempt is recorded first
+            self._write("digest.json", st)
+            subject, body = channel.build_digest(
+                qs, tasks, owner=self.owner, local_now=local, mail_used=self._mail_used(),
+                mail_caps=(int(self.limits.get("mail_per_hour", 6)), int(self.limits.get("mail_per_day", 30))),
+                page_url=self.page_url)
+            if not self._send(subject, body):
+                return
+            st["included"] = (list(st.get("included", [])) + [i["id"] for i in items if i["id"] not in included]
+                              )[-self.DIGEST_IDS_KEEP:]
+            st["summary"] = summary
+            if daily:
+                st["sent_day"] = today
+            if early:
+                st["stall_at"] = now.isoformat()
+            self._write("digest.json", st)
+        except Exception as e:  # noqa: BLE001 - the digest never stops the conductor
+            self._log(f"digest error: {e!r}"[:500])
+
     # ------------------------------------------------------------------ main step
     def step(self) -> str:
         if (self.state / "KILL").exists():  # R21: KILL stops everything, email included
@@ -1132,6 +1267,7 @@ class Conductor:
         self._handle_inbox()
         if (self.state / "KILL").exists():
             return "killed"
+        self._channel_tick()  # 1E: the daily digest (a no-op unless the channel policy is on)
         if (self.state / "PAUSED").exists():
             return "paused"
         if self._capped():

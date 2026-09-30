@@ -591,6 +591,160 @@ def drill_13():
             "questions, dead ends or run records; it runs in a throwaway checkout and a write is rejected")
 
 
+# ---------------------------------------------------------------------- 1D: the always-on service (gate drills)
+def _unit_drill(*names: str) -> str:
+    """1D's gate drills need real processes and the unit-test harness, so they live in
+    tests/core/test_service_drills.py; this runs those classes and fails the drill on any failure."""
+    import io
+    import unittest
+    suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+    out = io.StringIO()
+    res = unittest.TextTestRunner(stream=out, verbosity=0).run(suite)
+    assert res.wasSuccessful() and res.testsRun, out.getvalue()[-2000:]
+    return f"{res.testsRun} checks passed"
+
+
+def drill_14():
+    """Stop pressed while a real agent process runs: tree killed, attempt undone, no failure, no tamper alarm."""
+    return _unit_drill("tests.core.test_service_drills.DrillKillMidStep") + \
+        ": the agent's process tree died within seconds, the attempt was undone and the loop ended"
+
+
+def drill_15():
+    """Restart after a crash or a hang: the watchdog restarts a dead or hung service, never while KILL is set."""
+    return _unit_drill("tests.core.test_service_drills.DrillRestart") + \
+        ": crashed and hung services were restarted; KILL and a lock with no heartbeat were left alone"
+
+
+def drill_16():
+    """Active vs idle: while Ben is active, one agent and a pause after every work step; idle, back to back."""
+    return _unit_drill("tests.core.test_service_drills.DrillActiveVsIdle") + \
+        ": an active Ben got one agent and a pause after each work step; an idle Ben got back-to-back work"
+
+
+# ---------------------------------------------------------------------- 1E: Ben's channel (all mail faked)
+def _channel_conductor(limits=None):
+    """A conductor with fake agents, fake mail and a fake inbox; returns (conductor, sent mails, inbox, agent calls)."""
+    from core.agents import FakeAgent
+    from core.bootstrap import Conductor, Team
+    root = Path(tempfile.mkdtemp(prefix="forge-drill-1e-"))
+    calls, mails, inbox = [], [], []
+
+    def agent_fn(prompt, cwd):
+        calls.append(prompt)
+        return '{"status":"ok"}', 1
+    team = Team(**{r: FakeAgent(agent_fn, provider="claude") for r in
+                   ("test_writer", "builder", "reviewer", "troubleshooter", "drift_keeper", "planner")})
+    lim = {"claude_daily_token_cap": 10**9, "codex_daily_token_cap": 10**9, "mail_per_hour": 3, "mail_per_day": 10}
+    lim.update(limits or {})
+    c = Conductor(root / "repo", root / "work", root / "state", team, lim, owner_email="ben@example.com",
+                  mailer=lambda s, b: mails.append((s, b)), inbox=lambda: list(inbox), gh=lambda a: (0, ""),
+                  checks={}, probes={}, push=False)
+    return c, mails, inbox, calls
+
+
+def _qs(c):
+    return json.loads((c.state / "questions.json").read_text(encoding="utf-8"))
+
+
+def drill_17():
+    """STOP by email halts Forge: KILL is set, no agent runs, no email goes out."""
+    c, mails, inbox, calls = _channel_conductor()
+    c._ask("gate", "layer-1 is ready", "report", pr="7")
+    sent = len(mails)
+    inbox.append({"from": "Ben <ben@example.com>", "subject": "Re: [Forge] conductor started", "body": "STOP\n"})
+    assert c.step() == "killed", "STOP did not halt"
+    assert (c.state / "KILL").exists()
+    inbox.clear()
+    assert c.step() == "killed" and not calls, "work ran after STOP"
+    assert c._send("[Forge] x", "y") is False and len(mails) == sent, "mail sent after STOP"
+    return "an owner STOP set KILL; later steps stay killed, no agent ran, no email went out"
+
+
+def drill_18():
+    """A reply answers the right question only: its qid and its code, from the owner."""
+    c, mails, inbox, _ = _channel_conductor()
+    c._ask("replan", "Forge paused", "reasons")
+    c._ask("blocked", "Task T1 is blocked", "details")
+    qs = _qs(c)
+    a, b = qs["replan-1"]["code"], qs["blocked-2"]["code"]
+    inbox.append({"from": "ben@example.com", "subject": f"Re: [Forge Q-replan-1 {b}] x", "body": "go on"})
+    c._handle_inbox()
+    inbox.clear()
+    assert all(v["status"] == "open" for v in _qs(c).values()), "a mismatched code answered a question"
+    inbox.append({"from": "ben@example.com", "subject": f"Re: [Forge Q-blocked-2 {b}] x", "body": "try plan B"})
+    c._handle_inbox()
+    qs = _qs(c)
+    assert qs["blocked-2"]["status"] == "answered" and qs["blocked-2"]["answer"] == "try plan B"
+    assert qs["replan-1"]["status"] == "open", "the wrong question was answered"
+    return "a reply with another question's code was ignored; the matching reply answered only its own question"
+
+
+def drill_19():
+    """A foreign sender is ignored: no STOP, no answer, even with the right code or Ben's address as a name."""
+    c, _, inbox, _ = _channel_conductor()
+    c._ask("gate", "layer-1 is ready", "report", pr="7")
+    code = _qs(c)["gate-1"]["code"]
+    for frm in ("mallory@evil.example", '"ben@example.com" <mallory@evil.example>',
+                "mallory@evil.example, ben@example.com"):
+        inbox[:] = [{"from": frm, "subject": f"Re: [Forge Q-gate-1 {code}] y", "body": "y"},
+                    {"from": frm, "subject": "STOP", "body": "STOP"}]
+        c._handle_inbox()
+        assert not (c.state / "KILL").exists(), f"foreign STOP obeyed: {frm}"
+        assert _qs(c)["gate-1"]["status"] == "open", f"foreign answer accepted: {frm}"
+    return "replies and STOP from other senders (including Ben's address as a display name) changed nothing"
+
+
+def drill_20():
+    """The status page's Stop button halts Forge; a cross-site POST cannot."""
+    import http.client
+    import threading
+    from core import status_page
+    c, _, _, calls = _channel_conductor()
+    srv = status_page.make_server(c.state, c.channel_in.parent, c.limits, port=0)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        def post(headers):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("POST", "/stop", body=b"", headers={"Host": f"127.0.0.1:{port}", **headers})
+            status = conn.getresponse().status
+            conn.close()
+            return status
+        assert post({"Origin": "https://evil.example"}) == 403 and not (c.state / "KILL").exists()
+        assert post({"Origin": f"http://127.0.0.1:{port}"}) == 303
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert c.step() == "killed" and not calls, "Stop button did not halt"
+    return "a cross-site Stop was refused; the page's Stop set KILL and the next step was killed"
+
+
+def drill_21():
+    """The digest policy cannot flood: 3 days, a new question every 10 minutes, nothing but the digest."""
+    from datetime import datetime, timedelta, timezone
+    tz = timezone(timedelta(hours=-5))
+    c, mails, _, _ = _channel_conductor({"digest_hour": 8, "quiet_start": 23, "quiet_end": 7})
+    c.local_tz = tz
+    c._save_queue({"layer": "layer-1", "tasks": [{"id": "T1", "title": "t", "status": "blocked", "notes": [],
+                                                  "trouble_notes": [], "fail_signatures": []}]})
+    now = [datetime(2026, 10, 1, 0, 0, tzinfo=tz)]
+    c.clock = lambda: now[0]
+    per_day: dict = {}
+    while now[0] < datetime(2026, 10, 4, tzinfo=tz):
+        c._ask("blocked", f"blocked {now[0].isoformat()}", "details")
+        before = len(mails)
+        c._handle_inbox()
+        c._channel_tick()
+        per_day[now[0].day] = per_day.get(now[0].day, 0) + len(mails) - before
+        quiet = now[0].hour >= 23 or now[0].hour < 7
+        assert not (quiet and len(mails) > before), "mail in quiet hours"
+        now[0] += timedelta(minutes=10)
+    assert all(n <= 3 for n in per_day.values()), f"too many emails: {per_day}"
+    assert all(s.startswith("[Forge] Daily digest") for s, _ in mails), "a question was mailed on its own"
+    return f"432 questions over 3 days produced {len(mails)} emails ({per_day}), all digests, none at night"
+
+
 DRILLS = [
     (1, "False 'done' claim with failing test", drill_1),
     (2, "Agent edits tests or core files", drill_2),
@@ -602,9 +756,17 @@ DRILLS = [
     (8, "Agent edits files outside its contract", drill_8),
     (9, "False 'done' claim is recorded", drill_9),
     (10, "Runner crash at each step of an attempt", drill_10),
-    (11, "Coverage must rise", drill_11),
-    (12, "Re-plan triggers", drill_12),
-    (13, "A fresh Manager sees the ledger only", drill_13),
+    (11, "1C: Coverage must rise", drill_11),
+    (12, "1C: Re-plan triggers", drill_12),
+    (13, "1C: A fresh Manager sees the ledger only", drill_13),
+    (14, "1D: Kill mid-step", drill_14),
+    (15, "1D: Restart after a crash or a hang", drill_15),
+    (16, "1D: Active vs idle behaviour", drill_16),
+    (17, "1E: STOP by email halts", drill_17),
+    (18, "1E: A reply answers the right question", drill_18),
+    (19, "1E: A foreign sender is ignored", drill_19),
+    (20, "1E: The status page Stop button halts", drill_20),
+    (21, "1E: The digest policy cannot flood", drill_21),
 ]
 
 
