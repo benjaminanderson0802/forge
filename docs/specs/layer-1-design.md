@@ -86,3 +86,21 @@ Every task is still a ledger contract. From **1C** on, the 1B conductor runs the
 | 1E Ben channel | Queue, instant email, digest, reply reading, status page | Drills: STOP by email halts; a reply answers the right question; a foreign sender is ignored |
 
 Layer 1 is done when all five gates pass and Forge builds a small real project from an approved spec with no human help except approvals.
+
+
+## Input for 1E (Ben's channel): ChatGPT Dots evaluation (2026-09-30)
+
+OpenAI launched Dots on 2026-09-29: always-on ChatGPT agents on a cloud computer, with event triggers, approval gates and an activity view. Ben is on Pro, which includes one Dot. What was found, from the Dot's own answers and OpenAI's docs:
+
+- **No verified API for a personal Dot.** The nearest mechanism is MCP Events (developers.openai.com/plugins/build/mcp-events): a plugin server sends signed webhooks, and they wake **chats**. Dots aren't named as a recipient. The spec is a **draft**, and it needs a plugin server that ChatGPT can reach over HTTPS, which would open Ben's PC to the internet.
+- **Two-way messaging:** the Dot can ask Ben questions in the app. There's no built-in callback that returns an answer to Forge in a fixed format, and SMS or Dot-initiated calls aren't established.
+- **Limits:** no published per-day task limits. Dot rules are instructions, not enforced caps.
+
+**Decision for 1E:**
+- **Email stays Forge's channel** (R17-R40 caps and checks). Forge keeps enforcing all caps, spending blocks and the audit log itself.
+- 1E includes a **Dot round-trip trial as its own task**: a Forge event produces one question to Ben, and Ben's answer is written back and validated by Forge.
+- **Adopt a Dot as the channel only if:**
+  1. the round trip passes end to end;
+  2. it needs no inbound exposure of Ben's PC (or uses a vetted, authenticated tunnel);
+  3. Forge's caps still apply.
+- **Until then, use a Dot only outside the trusted core**, for example venture research. Its findings are data, and Forge verifies them before use.
