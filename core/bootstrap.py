@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable
 
 from core.ledger import Ledger, Rejected
+from core.mutation import changed_lines, run_mutation
 from core.usage import Meter
 from core.weaktest import empty_implementation, real_failing_run, stub_targets
 
@@ -858,11 +859,12 @@ class Conductor:
         changed = [f for f in changed if f not in tests]
         out_of_scope = [f for f in changed if not any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])]
 
-        def fail(reason: str, sig: str, output: str = "", submitted: bool = False) -> None:
+        def fail(reason: str, sig: str, output: str = "", submitted: bool = False,
+                 payload: dict | None = None) -> None:
             _git(self.wt, "reset", "-q", "--hard", tests_commit)
             _git(self.wt, "clean", "-q", "-fd")
             if submitted:
-                self._apply(f"{tag}-fail", "fail", cid, "forge-auditor")
+                self._apply(f"{tag}-fail", "fail", cid, "forge-auditor", payload)
             else:
                 self._apply(f"{tag}-release", "release", cid, "forge-core")
             if self._ledger().contracts().get(cid, {}).get("status") == "failed":
@@ -892,7 +894,10 @@ class Conductor:
             "violations": violations, "out_of_scope": []})
         self._apply(f"{tag}-submit", "submit", cid, "forge-executor", {"commit": sha})
 
-        results = [("task tests", *self._run_tests(t)[:2])] + [(cmd, *self._run_cmd(cmd)) for cmd in self.judge_cmds]
+        started = time.monotonic()
+        task_run = self._run_tests(t)
+        baseline = time.monotonic() - started
+        results = [("task tests", *task_run[:2])] + [(cmd, *self._run_cmd(cmd)) for cmd in self.judge_cmds]
         for cmd, code, output in results:
             if code != 0:
                 self._apply(f"{tag}-ci", "test_run", cid, "ci", {"run_id": f"{tag}-ci", "commit": sha, "passed": False})
@@ -902,11 +907,14 @@ class Conductor:
                 return fail(f"judge failed: {cmd}", sig, tail, submitted=True)
         self._apply(f"{tag}-ci", "test_run", cid, "ci", {"run_id": f"{tag}-ci", "commit": sha, "passed": True})
 
+        mres = self._mutation_judge(t, tests_commit, sha, baseline)  # D-038: always before the reviewer
+        mutation = mres.as_dict()
         diff = _git(self.wt, "diff", f"{tests_commit}..{sha}")
         try:
             rv = self._call("reviewer", "You are the REVIEWER (read-only). Check this change against the task. "
                                         "Reject shortcuts, bare-minimum work, drift from the task, and anything that "
                                         "weakens tests.\n\n" + self._task_prompt(t) + "\nDIFF:\n" + diff[:60000] +
+                            self._mutation_evidence(mres) +
                             "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW)
         except Capped:  # R37: undo the submitted run like a failed judge, but record no failure
             self._apply(f"{tag}-capped", "fail", cid, "forge-auditor")
@@ -916,19 +924,67 @@ class Conductor:
             _git(self.wt, "clean", "-q", "-fd")
             raise
         if not rv.ok:
-            return fail(f"reviewer output unusable: {rv.error}", f"reviewer-error:{rv.error}", submitted=True)
-        if (rv.data or {}).get("verdict") != "pass":
-            reasons = [str(x) for x in (rv.data or {}).get("reasons") or ["no reasons given"]]
-            self._update(tid, review_feedback=reasons)
-            return fail("review failed: " + "; ".join(reasons), "review:" + "|".join(reasons), submitted=True)
+            return fail(f"reviewer output unusable: {rv.error}", f"reviewer-error:{rv.error}", submitted=True,
+                        payload={"verdict": None, "reasons": [], "mutation": mutation, "gate": "reviewer_error"})
+        verdict = (rv.data or {}).get("verdict")
+        verdict = verdict if verdict in ("pass", "fail") else None
+        given = (rv.data or {}).get("reasons")
+        given = [str(x) for x in given] if isinstance(given, list) else []
+        survivor_feedback = [f"surviving mutant {m.id}: {m.original} -> {m.replacement} at line {m.line}: "
+                             "add or strengthen code so the tests catch it" for m in mres.survivors]
+        if not mres.passed:  # the mutation gate fails the attempt whatever the verdict
+            ids = mres.survivor_ids()
+            reason = "mutation gate: " + mres.reason + ("; survivors: " + ", ".join(ids) if ids else "")
+            sig = (hashlib.sha256(("mutation:" + "|".join(sorted(ids))).encode("utf-8")).hexdigest()
+                   if mres.complete else "mutation-incomplete")
+            self._update(tid, review_feedback=survivor_feedback + given)
+            return fail(reason, sig, self._survivor_listing(mres), submitted=True,
+                        payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "mutation"})
+        if verdict != "pass":
+            reasons = given or ["no reasons given"]
+            self._update(tid, review_feedback=survivor_feedback + reasons)
+            return fail("review failed: " + "; ".join(reasons), "review:" + "|".join(reasons), submitted=True,
+                        payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "review"})
 
-        if not self._apply(f"{tag}-pass", "pass", cid, "forge-auditor", {"run_id": f"{tag}-ci"}):
-            return fail("ledger refused the pass (evidence incomplete)", "ledger-refused-pass", submitted=True)
+        if not self._apply(f"{tag}-pass", "pass", cid, "forge-auditor", {
+                "run_id": f"{tag}-ci", "verdict": "pass", "reasons": given, "mutation": mutation}):
+            return fail("ledger refused the pass (evidence incomplete)", "ledger-refused-pass", submitted=True,
+                        payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "review"})
         self._update(tid, status="done", done_commit=sha)
         self._push()
         q = self._queue()
         q["drift_due"] = True  # the drift keeper runs as the next step, so it can be stopped like any agent
         self._save_queue(q)
+
+    def _mutation_judge(self, t: dict, tests_commit: str, sha: str, baseline: float):
+        """Layer-1 design 3.4: mutate the builder's changed in-scope lines and run the task tests on each mutant.
+        The worktree must be exactly the builder's commit afterwards (else an R13 stage error)."""
+        tests = {_norm(x) for x in t["test_files"]}
+        diff = _git(self.wt, "diff", "-U0", f"{tests_commit}..{sha}")
+        changed = {f: lines for f, lines in changed_lines(diff).items()
+                   if f not in tests and any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])}
+        timeout = float(self.limits.get("test_timeout_s", 600))
+        mres = run_mutation(self.wt, changed,
+                            [sys.executable, "-m", "unittest", *(parse_test_cmd(t["test_cmd"], t["test_files"]) or [])],
+                            mutation_min=float(self.limits.get("mutation_min", 0.8)),
+                            budget_s=float(self.limits.get("mutation_budget_s", self.limits.get("test_timeout_s", 600))),
+                            per_mutant_timeout_s=min(timeout, max(5.0, 3 * baseline)))
+        if self._changed():
+            _git(self.wt, "reset", "-q", "--hard", sha)
+            _git(self.wt, "clean", "-q", "-fd")
+            raise RuntimeError("mutation left changes")
+        return mres
+
+    @staticmethod
+    def _survivor_listing(mres) -> str:
+        if not mres.survivors:
+            return "- survivors: none"
+        return "\n".join(f"- {m.id}: {m.original} -> {m.replacement} survived (line {m.line})" for m in mres.survivors)
+
+    def _mutation_evidence(self, mres) -> str:
+        return ("\nMUTATION EVIDENCE:\n" + mres.reason +
+                f"\nscore: {mres.score:.2f} (mutation_min {float(self.limits.get('mutation_min', 0.8)):.2f})"
+                f"\ncomplete: {'yes' if mres.complete else 'no'}\n" + self._survivor_listing(mres) + "\n")
 
     def _is_ancestor(self, sha: str) -> bool:
         return subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], cwd=str(self.wt),
