@@ -387,3 +387,11 @@ The first run with real agents and real email hit four faults no fake-based test
     Unreadable lines are skipped. A missing log counts as 0.
   - **The result:** the returned `AgentResult` keeps its failure (`ok` false, the same error) but carries those tokens, so `_call` meters them as usual (R6).
   - **Codex** reports usage only on a completed turn and keeps no session log under `--ephemeral`. A timed-out Codex run stays unmetered: a known gap, noted in STATUS.
+
+## Live-use amendment (2026-09-30, planner memory)
+
+- **R47 The planner sees every earlier rejection of its plan task, not just the last three notes.** P1B2's attempts regressed: problems fixed two attempts earlier came back, because only the last 3 notes mentioning "plan" were shown, and reopen notes pushed real rejections out. Now:
+  - **The planner prompt** includes every note of the task that starts with `plan rejected` or `plan review failed`, oldest first, under `YOUR EARLIER ATTEMPTS WERE REJECTED FOR (fix ALL of these; none may come back):`.
+  - **Limits:** at most the last `PLAN_MEMORY_NOTES` (10) such notes, and at most `PLAN_MEMORY_CHARS` (12,000) characters in total. When over, the oldest notes are dropped first.
+  - **Other notes** are not shown under that heading: reopen notes, Ben's replies, git errors.
+  - **Notes are kept longer:** the task's notes list keeps its last `NOTES_KEEP` (30) entries as before (R19), so 10 rejections are always available.
