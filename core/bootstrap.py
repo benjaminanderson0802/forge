@@ -120,6 +120,13 @@ class Capped(Exception):
     """R37: the agent's provider is at its daily token cap; nothing was launched."""
 
 
+class Stopped(Capped):
+    """R42: KILL or PAUSED appeared during an agent run (Ben stopped Forge). Undone like a cap, not tampering."""
+
+
+STOP_FILES = ("KILL", "PAUSED")
+
+
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
 
@@ -317,6 +324,11 @@ class Conductor:
             changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
         except Exception as e:  # noqa: BLE001 - R15: a check that can't complete counts as tampering
             changed = [f"state could not be fingerprinted after the run: {type(e).__name__}: {e}"]
+        if changed and all(k in STOP_FILES and k not in before for k in changed):  # R42: a stop, not tampering
+            if r.tokens:
+                self.meter.add(r.provider or "unknown", r.tokens)
+            self._log(f"stop requested during {role} run {run_id} ({', '.join(changed)}); run discarded")
+            raise Stopped(", ".join(changed))
         if changed:
             (self.state / "KILL").write_text("state tampered during an agent run\n")
             try:
@@ -561,7 +573,7 @@ class Conductor:
             try:
                 self._drift_check()
             except Capped:
-                return "capped"
+                return self._held()
             except Tampered:
                 return "killed"
             return "worked"
@@ -577,8 +589,8 @@ class Conductor:
                         self._build_stage(t["id"])
                 except Tampered:
                     return "killed"
-                except Capped:  # R37: the attempt was undone by its stage; retried when the cap resets
-                    return "capped"
+                except Capped:  # R37/R42: the attempt was undone by its stage; retried when the cap resets
+                    return self._held()
                 except (RuntimeError, OSError) as e:  # R8: git or filesystem trouble is a failed attempt
                     self._log(f"stage error on {t['id']}: {e!r}")
                     try:
@@ -597,6 +609,14 @@ class Conductor:
             self._gate()
             return "gate"
         return "idle"
+
+    def _held(self) -> str:
+        """R42: why an undone attempt stopped: Ben's stop, a pause, or a token cap."""
+        if (self.state / "KILL").exists():
+            return "killed"
+        if (self.state / "PAUSED").exists():
+            return "paused"
+        return "capped"
 
     def run(self, max_steps: int | None = None, idle_sleep_s: int = 60, heartbeat: Path | None = None,
             sleep: Callable[[float], None] = time.sleep) -> str:
@@ -1401,6 +1421,8 @@ def _guarded_smoke(c: Conductor, workdir: Path, force: bool = False) -> list[str
         try:
             problems = smoke(c.team, workdir, lambda role, prompt, schema, cwd: c._call(role, prompt, schema, cwd=cwd),
                              warn=c._log)
+        except Stopped as e:  # R42
+            problems = [f"stopped during the smoke test ({e})"]
         except Capped as e:  # R37
             problems = [f"token cap reached during the smoke test ({e})"]
         except Tampered as e:
