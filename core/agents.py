@@ -194,8 +194,11 @@ def _n(v) -> int:
         return 0
     if isinstance(v, int):  # exact, any size
         return v if v > 0 else 0
-    if isinstance(v, str) and v.strip().isdigit():
-        return int(v.strip())
+    if isinstance(v, str) and v.strip().isdecimal():  # isdecimal: "²" is a digit but not a number
+        try:
+            return int(v.strip())
+        except ValueError:
+            return 0
     try:
         f = float(v)
     except (TypeError, ValueError, OverflowError):
