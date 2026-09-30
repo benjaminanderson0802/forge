@@ -395,3 +395,15 @@ The first run with real agents and real email hit four faults no fake-based test
   - **Limits:** at most the last `PLAN_MEMORY_NOTES` (10) such notes, and at most `PLAN_MEMORY_CHARS` (12,000) characters in total. When over, the oldest notes are dropped first.
   - **Other notes** are not shown under that heading: reopen notes, Ben's replies, git errors.
   - **Notes are kept longer:** the task's notes list keeps its last `NOTES_KEEP` (30) entries as before (R19), so 10 rejections are always available.
+
+## Live-use amendment (2026-09-30, provider limits)
+
+- **R48 A provider's own usage limit is a pause, not a failed attempt.** At 10:55 UTC on 2026-09-30, Ben's Claude plan hit its session limit ("You've hit your session limit · resets 6am"). Every planner call then failed within seconds. The conductor counted each one as a plan rejection, so P1D and P1E used up all 3 attempts and were blocked in under a minute. Now:
+  - **Detection:** after an agent run, `_call` checks for a provider limit. If the result failed and its error matches `LIMIT_RE`, the run is a limit hit. `LIMIT_RE` is case-insensitive: `(session|usage|rate)[ _-]?limit`, `limit (reached|exceeded)`, `quota exceeded` or `too many requests`.
+  - **On a limit hit:**
+    - The run's tokens are metered.
+    - `state/holds.json` records `{provider: <now + HOLD_MINUTES (30)>}` in ISO form.
+    - `limit hit for <provider>; holding until <time>` is logged.
+    - `Capped(provider)` is raised, so the stage undoes the attempt exactly as for a token cap (R37): nothing is counted as a failure or a rejection.
+  - **While a hold is active** (`now < until`): the provider counts as capped, both in `_capped()` and in `_call`'s pre-launch check (R37). No agent of that provider is launched. An expired or unreadable hold entry is ignored.
+  - **The token cap check (R37)** is unchanged.
