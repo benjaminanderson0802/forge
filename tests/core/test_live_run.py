@@ -2013,8 +2013,18 @@ class R42StopDuringRunTests(Harness):
 
         c = self.make_conductor(agents={"test_writer": tamper})
         c._refresh_readiness()  # Layer 1B: usable evidence first; no probe runs while a stop flag is set
-        path.write_text("original stop reason\n", encoding="utf-8")
-        # Call directly: step() must never launch an agent with an existing stop flag.
+        # R49 (Layer 1D): nothing launches while a stop flag is set, so the flag is planted in the race window
+        # between the pre-launch check and the before-run fingerprint (Ben pressing Stop at that instant).
+        real_fingerprint = c._fingerprint
+        planted = []
+
+        def fingerprint():
+            if not planted:
+                planted.append(True)
+                path.write_text("original stop reason\n", encoding="utf-8")
+            return real_fingerprint()
+
+        c._fingerprint = fingerprint
         with self.assertRaises(bootstrap.Tampered):
             c._call("test_writer", "Cannot un-stop Forge", bootstrap.S_TESTS, cwd=self.work)
         self.assertEqual(len(c.team.test_writer.prompts), 1)

@@ -11,6 +11,8 @@ import signal
 import subprocess
 import tempfile
 import uuid
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -32,8 +34,45 @@ def load_limits(forge_root: Path) -> dict:
     return json.loads((Path(forge_root) / "charter" / "limits.json").read_text(encoding="utf-8"))
 
 
-def launch(args: list[str], cwd: Path, stdin_text: str, timeout_s: int) -> tuple[int, str, str]:
-    """Run hidden and low-priority; on timeout kill the whole process tree and raise TimeoutError."""
+class Stopped(TimeoutError):
+    """R42/R49: the run was stopped because a stop flag (KILL or PAUSED) appeared. A TimeoutError, so every agent
+    turns it into a failed result; the conductor recognises its message ("agent stopped:") and raises its own
+    core.bootstrap.Stopped, so nothing is recorded (a stop is never a failure)."""
+
+
+_LIVE: set = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def _kill_tree(p: subprocess.Popen) -> None:
+    try:
+        if IS_WIN:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            os.killpg(p.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+
+
+def live_count() -> int:
+    with _LIVE_LOCK:
+        return len(_LIVE)
+
+
+def kill_live() -> None:
+    """T1D3: kill every agent process tree this process started (used before a stall exit)."""
+    with _LIVE_LOCK:
+        procs = list(_LIVE)
+    for p in procs:
+        _kill_tree(p)
+
+
+def launch(args: list[str], cwd: Path, stdin_text: str, timeout_s: int,
+           should_stop: Callable[[], bool] | None = None, poll_s: float = 2.0) -> tuple[int, str, str]:
+    """Run hidden and low-priority; on timeout kill the whole process tree and raise TimeoutError.
+    R49: with should_stop, it is checked every poll_s seconds; when it returns True the tree is killed and
+    Stopped is raised."""
     kw: dict = {}
     if IS_WIN:
         kw["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
@@ -42,17 +81,31 @@ def launch(args: list[str], cwd: Path, stdin_text: str, timeout_s: int) -> tuple
         kw["preexec_fn"] = lambda: os.nice(10)
     p = subprocess.Popen(args, cwd=str(cwd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, encoding="utf-8", errors="replace", **kw)
+    with _LIVE_LOCK:
+        _LIVE.add(p)
     try:
-        out, err = p.communicate(stdin_text, timeout=timeout_s)
-        return p.returncode, out, err
-    except subprocess.TimeoutExpired:
-        if IS_WIN:
-            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True,
-                           creationflags=subprocess.CREATE_NO_WINDOW)
-        else:
-            os.killpg(p.pid, signal.SIGKILL)
-        p.communicate()
-        raise TimeoutError(f"agent timed out after {timeout_s}s")
+        deadline = time.monotonic() + timeout_s
+        first = True
+        while True:
+            left = deadline - time.monotonic()
+            wait = left if should_stop is None else min(left, poll_s)
+            try:
+                # after a timed-out wait, communicate() resumes where it was; input may only be passed once
+                out, err = p.communicate(stdin_text if first else None, timeout=max(wait, 0.01))
+                return p.returncode, out, err
+            except subprocess.TimeoutExpired:
+                first = False
+                if time.monotonic() >= deadline:
+                    _kill_tree(p)
+                    p.communicate()
+                    raise TimeoutError(f"agent timed out after {timeout_s}s")
+                if should_stop is not None and should_stop():
+                    _kill_tree(p)
+                    p.communicate()
+                    raise Stopped("agent stopped: a stop flag (KILL or PAUSED) is set")
+    finally:
+        with _LIVE_LOCK:
+            _LIVE.discard(p)
 
 
 def _resolve(cmd: list[str]) -> list[str] | None:
@@ -277,8 +330,13 @@ def _deadline(own: int, timeout_s: float | None) -> int:
     return max(1, min(int(own), int(math.ceil(float(timeout_s)))))
 
 
+def _stop_kw(agent) -> dict:
+    return {"should_stop": agent.should_stop} if agent.should_stop is not None else {}
+
+
 class ClaudeAgent:
     provider = "claude"  # R6/R29: the id the Meter and the token caps use
+    should_stop: Callable[[], bool] | None = None  # R49: set by the conductor to its stop-flag check
 
     def __init__(self, timeout_s: int = 1800, permission_mode: str = "acceptEdits",
                  allowed_tools: list[str] | None = None, cmd: list[str] | None = None,
@@ -298,7 +356,7 @@ class ClaudeAgent:
         if schema:
             prompt += "\n\nAnswer with ONLY a JSON object with these keys: " + ", ".join(schema.get("required", []))
         try:
-            _, out, _ = launch(args, cwd, prompt, _deadline(self.timeout_s, timeout_s))
+            _, out, _ = launch(args, cwd, prompt, _deadline(self.timeout_s, timeout_s), **_stop_kw(self))
         except TimeoutError as e:
             return AgentResult("", claude_log_tokens(sid, self.projects_dir), False, str(e), None, "claude")
         r = parse_claude(out, schema)
@@ -309,6 +367,7 @@ class ClaudeAgent:
 
 class CodexAgent:
     provider = "codex"  # R6/R29: the id the Meter and the token caps use
+    should_stop: Callable[[], bool] | None = None  # R49: set by the conductor to its stop-flag check
 
     def __init__(self, timeout_s: int = 1800, sandbox: str = "read-only", cmd: list[str] | None = None):
         self.timeout_s, self.sandbox = timeout_s, sandbox
@@ -329,7 +388,7 @@ class CodexAgent:
             args += ["--output-schema", str(tmp / "schema.json")]
         args += ["-"]
         try:
-            code, out, _ = launch(args, cwd, prompt, _deadline(self.timeout_s, timeout_s))
+            code, out, _ = launch(args, cwd, prompt, _deadline(self.timeout_s, timeout_s), **_stop_kw(self))
         except TimeoutError as e:
             return AgentResult("", 0, False, str(e), None, "codex")
         finally:

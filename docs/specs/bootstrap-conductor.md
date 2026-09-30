@@ -331,6 +331,8 @@ The first run with real agents and real email hit four faults no fake-based test
   - **`step()`**, on a `Capped` (including `Stopped`) from a stage or the drift check, returns `"killed"` if `KILL` exists, else `"paused"` if `PAUSED` exists, else `"capped"`.
   - **The smoke test:** a `Stopped` gives the problem `stopped during the smoke test`, not "token cap reached".
   - **Still tampering:** any other changed file, or `KILL`/`PAUSED` being **removed** or **changed** (present before the run), is still tampering (R9). An agent can never un-stop Forge.
+  - R49 extends this: no launch while a stop flag is set, and a running agent is killed when one appears.
+
 ## Live-use amendment (2026-09-30, token metering)
 
 - **R43 The token caps count what a run really costs: cached input is weighted at one tenth.** In the first live cycle, a single planner run was metered at about 4.6 million Claude tokens. Nearly all of it was cache reads of the same context, which both providers bill at about a tenth of fresh input. Counting them in full would cap Forge for the rest of the day after two plans. The caps (`claude_daily_token_cap`, `codex_daily_token_cap`) are unchanged. What is counted:
@@ -399,11 +401,21 @@ The first run with real agents and real email hit four faults no fake-based test
 ## Live-use amendment (2026-09-30, provider limits)
 
 - **R48 A provider's own usage limit is a pause, not a failed attempt.** At 10:55 UTC on 2026-09-30, Ben's Claude plan hit its session limit ("You've hit your session limit · resets 6am"). Every planner call then failed within seconds. The conductor counted each one as a plan rejection, so P1D and P1E used up all 3 attempts and were blocked in under a minute. Now:
-  - **Detection:** after an agent run, `_call` checks for a provider limit. If the result failed and its error matches `LIMIT_RE`, the run is a limit hit. `LIMIT_RE` is case-insensitive: `(session|usage|rate)[ _-]?limit`, `limit (reached|exceeded)`, `quota exceeded` or `too many requests`.
+  - **Detection:** after an agent run, `_guarded_run` checks for a provider limit. If the result failed and its error matches the limit detector, the run is a limit hit. The detector is case-insensitive: `(session|usage|rate)[ _-]?limit`, `limit (reached|exceeded)`, `quota exceeded` or `too many requests` (R50 widens it and moves it to `core.usage`).
   - **On a limit hit:**
     - The run's tokens are metered.
-    - `state/holds.json` records `{provider: <now + HOLD_MINUTES (30)>}` in ISO form.
+    - `state/holds.json` records `{provider: <until>}` in ISO form (originally now + 30 minutes; since R50, the reset time the message names, or 1 hour).
     - `limit hit for <provider>; holding until <time>` is logged.
     - `Capped(provider)` is raised, so the stage undoes the attempt exactly as for a token cap (R37): nothing is counted as a failure or a rejection.
   - **While a hold is active** (`now < until`): the provider counts as capped, both in `_capped()` and in `_call`'s pre-launch check (R37). No agent of that provider is launched. An expired or unreadable hold entry is ignored.
   - **The token cap check (R37)** is unchanged.
+
+## Layer 1D amendments: the always-on service (2026-09-30)
+
+Plan: `docs/superpowers/plans/2026-09-30-layer-1d.md`. Module: `core/service.py`. Layer 1D numbered these rules R41–R45 on its branch; they collided with the live-use amendments above and are renumbered R49–R53. Its mid-run kill and limit holds were unified with R42 and R48 (one mechanism each).
+
+- **R49 A stop works mid-cycle (extends R42).** KILL or PAUSED is checked before every agent launch (`_call` and `_guarded_run`, readiness probes included), not only at the start of `step()`: if either is set, nothing is launched and `Stopped` is raised. A real agent is given the stop check (`should_stop`), and `launch` polls it every 2 seconds; when a stop flag appears, the agent's process tree is killed and the run reports `agent stopped: …`, which `_guarded_run` turns into `Stopped` (never a failure, even if the flag was cleared meanwhile). The after-run rule is R42's: only `KILL`/`PAUSED` appearing is a stop; any other change, or a flag removed or changed, is still tampering (R9). There is one exception class, `Stopped` (a `Capped`), so every stage undoes the attempt exactly as for a cap (R37). `run()` returns `"killed"` right after any step that ended with KILL set. A stop during the smoke test gives `stopped during the smoke test (<flags>)` and is not a smoke failure (no `smoke_fail.json`).
+- **R50 Limit windows are holds (extends R48).** One detector (`core.usage.limit_hold_until`) reads the failed run's error and text. It matches R48's wording (`(session|usage|rate)[ _-]?limit`, `limit (reached|exceeded)`, `quota exceeded`, `too many requests`) and Layer 1D's (`hit your … limit`, `weekly limit`). The hold lasts until the reset the message names ("resets 6am (America/Chicago)"), or 1 hour if it can't be read, always between 5 minutes and 24 hours. Holds live in `state/holds.json`, written only through `Meter.hold` (a later hold extends an earlier one, never shortens it). `Meter.over` is true while held, so `_call`'s pre-launch check and `_capped()` both see it.
+- **R51 Launches per day are capped.** `limits["agent_runs_per_day"]` caps all providers by the number of agent launches today (UTC), counted from `state/runs/`.
+- **R52 The service.** `main run` starts a heartbeat thread writing `state/service/heartbeat.json` (outside `state/bootstrap/`, so it never trips R14) and runs the loop through `service.Service.serve()`: sleeps end within 2 seconds on KILL or on `state/service/WAKE`; while Ben is active (input in the last 10 minutes, or unknown) there is a pause of `active_step_gap_s` (30 s) after every work step; `state/service/status.json` is written after every step. One step running longer than `step_stall_s` (4 hours) kills the process tree and exits, so the task restarts it and crash recovery resumes.
+- **R53 Watchdog.** The "Forge watchdog" task runs `python -m core.service watchdog` every 5 minutes. KILL set: nothing. Heartbeat fresh: nothing. Stale heartbeat and the conductor lock free: `schtasks /Run`. Stale heartbeat and the lock held: `schtasks /End` then `/Run`. A lock held with no heartbeat file is left alone.

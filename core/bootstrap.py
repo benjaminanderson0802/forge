@@ -21,19 +21,19 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from core import coverage as cov_mod
 from core import drift as drift_mod
 from core import manager as manager_mod
-from core import readiness
+from core import readiness, service
 from core.finalize import ApprovedMerges, Finalizer, Hooks, Journal, safe_push
 from core.ledger import Ledger, Rejected
 from core.mutation import changed_lines, run_mutation
 from core.roles import role_text
-from core.usage import Meter
+from core.usage import Meter, limit_hold_until
 from core.weaktest import empty_implementation, real_failing_run, stub_targets
 from core.worktrees import Worktrees
 
@@ -46,9 +46,6 @@ MIN_SECTION_CHARS = 600  # R41: a task's section is its builder's only instructi
 PLAN_REVIEW_MAX = 200_000  # R44: the plan reviewer sees the whole plan, up to this size
 PLAN_ATTEMPTS = 3  # R45: a plan task is blocked after this many rejections
 PLAN_MEMORY_NOTES, PLAN_MEMORY_CHARS = 10, 12000  # R47
-LIMIT_RE = re.compile(r"(session|usage|rate)[ _-]?limit|limit (reached|exceeded)|quota exceeded|too many requests",
-                      re.I)  # R48
-HOLD_MINUTES = 30  # R48
 SUBJECT_CAP, CLOSED_KEEP, SENT_IDS_KEEP = 300, 50, 500  # R26, R28
 MUTATION_NA = "not applicable: merge commit adds no builder lines"
 
@@ -150,10 +147,13 @@ class NotReady(Exception):
 
 
 class Stopped(Capped):
-    """R42: KILL or PAUSED appeared during an agent run (Ben stopped Forge). Undone like a cap, not tampering."""
+    """R42/R49: Ben stopped Forge. KILL or PAUSED was set before a launch (nothing is launched), appeared while an
+    agent ran (its process tree is killed), or was the only state change during the run. A Capped, so every stage
+    undoes the attempt exactly as for a cap (R37): never a failure, never tampering. step() reports it via _held()."""
 
 
 STOP_FILES = ("KILL", "PAUSED")
+STOP_MARK = "agent stopped:"  # R49: core.agents.Stopped's message; an agent killed by a stop flag reports it
 
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
@@ -368,9 +368,10 @@ class Conductor:
     # ------------------------------------------------------------------ agents
     def _call(self, role: str, prompt: str, schema: dict | None, cwd: Path | None = None, needs=None,
               timeout_s: float | None = None):
+        self._raise_if_stopped()  # R42/R49: before anything else, including readiness refreshes
         agent = self._agent(role)
         provider = getattr(agent, "provider", None)
-        if provider and (self.meter.over(provider, self.limits) or self._on_hold(provider)):  # R37/R48: before every launch
+        if provider and self.meter.over(provider, self.limits):  # R37/R48/R50/R51: caps, holds, runs per day
             raise Capped(provider)
         self._launch_gate(provider, needs)
         prompt = prompt + self._prompt_blocks(role)
@@ -401,6 +402,7 @@ class Conductor:
         """R14/R15 guarded agent run: run record, fingerprint before and after, KILL on tamper, metering."""
         role = label
         provider = getattr(agent, "provider", None)
+        self._raise_if_stopped()  # R42/R49: checked before every launch, probes included
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + role + "-" + uuid.uuid4().hex[:6]
         d = self.state / "runs" / run_id
         d.mkdir(parents=True, exist_ok=True)
@@ -417,6 +419,8 @@ class Conductor:
         # T1C4: a deadline (the builder's remaining focus time) is passed to agents that accept one; the run's
         # duration on the conductor clock is recorded as active time (never for readiness probes).
         extra = {"timeout_s": timeout_s} if timeout_s is not None and self._takes_timeout(agent) else {}
+        if hasattr(agent, "should_stop"):  # R42/R49: a real agent's process tree is killed when a stop flag appears
+            agent.should_stop = self._stop_requested
         t0 = self.clock()
         try:
             r = agent.run(prompt, Path(cwd) if cwd else self.wt, schema, **extra)
@@ -446,20 +450,34 @@ class Conductor:
             raise Tampered(", ".join(changed))
         if r.tokens:
             self.meter.add(r.provider or "unknown", r.tokens)
-        if not r.ok and provider and LIMIT_RE.search(str(r.error or "")):  # R48: a pause, not a failed attempt
-            until = (self.clock() + timedelta(minutes=HOLD_MINUTES)).isoformat()
-            holds = self._read("holds.json", {})
-            holds = holds if isinstance(holds, dict) else {}
-            holds[provider] = until
-            self._write("holds.json", holds)
-            self._log(f"limit hit for {provider}; holding until {until}")
-            raise Capped(provider)
-        if not label.startswith("probe-"):  # after the tamper comparison, like the meter (R14)
-            self._activity().add(self.last_run_s)
         (d / "output.json").write_bytes(json.dumps({"ok": r.ok, "error": r.error, "text": r.text, "data": r.data,
                                                     "tokens": r.tokens, "provider": r.provider},
                                                    indent=2).encode("utf-8"))
+        if not r.ok and STOP_MARK in (r.error or ""):  # R42/R49: the agent was killed by a stop; never a failure
+            self._log(f"stop requested during {role} run {run_id} (agent stopped); run discarded")
+            raise Stopped(", ".join(self._stop_flags()) or "stop")
+        if not r.ok:  # R48/R50: a provider's usage limit is a hold until it resets, never a failed attempt
+            until = limit_hold_until(f"{r.error or ''}\n{r.text or ''}", self.clock())
+            if until is not None:
+                held = provider or r.provider or "unknown"
+                self.meter.hold(held, until)
+                self._log(f"limit hit for {held} during {role} run {run_id}; holding until {until.isoformat()}")
+                raise Capped(held)
+        if not label.startswith("probe-"):  # after the tamper comparison, like the meter (R14)
+            self._activity().add(self.last_run_s)
         return r
+
+    def _stop_flags(self) -> list[str]:
+        return [f for f in STOP_FILES if (self.state / f).exists()]
+
+    def _stop_requested(self) -> bool:
+        """R42/R49: the check a real agent polls while it runs (core.agents.launch)."""
+        return bool(self._stop_flags())
+
+    def _raise_if_stopped(self) -> None:
+        flags = self._stop_flags()
+        if flags:
+            raise Stopped(", ".join(flags))
 
     def _fingerprint(self) -> dict:
         """R9/R10/R14: every file in state/. The conductor writes nothing there while an agent runs, so nothing
@@ -495,15 +513,7 @@ class Conductor:
 
     def _capped(self) -> bool:
         providers = {getattr(getattr(self.team, f), "provider", None) for f in Team.__dataclass_fields__}
-        return any(p and (self.meter.over(p, self.limits) or self._on_hold(p)) for p in providers)
-
-    def _on_hold(self, provider: str) -> bool:
-        """R48: a provider is on hold after hitting its own usage limit, until the recorded time."""
-        try:
-            until = (self._read("holds.json", {}) or {}).get(provider)
-            return bool(until) and self.clock() < datetime.fromisoformat(str(until))
-        except (ValueError, TypeError, AttributeError):
-            return False
+        return any(p and self.meter.over(p, self.limits) for p in providers)  # R37/R48: Meter.over includes holds
 
     # ------------------------------------------------------------------ readiness (D-030)
     @property
@@ -1260,7 +1270,7 @@ class Conductor:
         return "capped"
 
     def run(self, max_steps: int | None = None, idle_sleep_s: int = 60, heartbeat: Path | None = None,
-            sleep: Callable[[float], None] = time.sleep) -> str:
+            sleep: Callable[[float], None] = time.sleep, on_step: Callable[[str], None] | None = None) -> str:
         """Loop forever (or max_steps). Nothing ends the loop except the kill switch: errors are logged,
         Ben is told once after 3 in a row, and the loop backs off (R12, R13)."""
         n, status, errors, told = 0, "idle", 0, False
@@ -1273,8 +1283,13 @@ class Conductor:
                 status = "error"
                 self._log(f"step crashed: {e!r}")
             n += 1
-            if status == "killed":
-                return status
+            if status == "killed" or (self.state / "KILL").exists():  # T1D2: a stop pressed mid-step ends the loop
+                return "killed"
+            if on_step:  # T1D2: the always-on service (core.service): status, pacing; never fatal
+                try:
+                    on_step(status)
+                except Exception as e:  # noqa: BLE001
+                    self._log(f"on_step hook failed: {e!r}"[:500])
             if status == "error":
                 errors += 1
                 if errors >= 3 and not told:
@@ -2691,8 +2706,10 @@ def main(argv: list[str]) -> int:
         return 0
     if lock is None:
         return 0  # another conductor holds the lock; the watchdog calls us harmlessly
+    health = None
     try:
         if a.cmd == "run":
+            health = service.Health(forge / "state" / "service", limits).start()  # T1D2: heartbeat and stall exit
             if (c.state / "KILL").exists():  # R32: while stopped, only retry a pending halt alert
                 c._retry_halts()
                 return 0
@@ -2728,8 +2745,10 @@ def main(argv: list[str]) -> int:
                        "The conductor is running in the background. You'll hear from it only when something "
                        "needs you, when a layer is ready for approval, or if it hits trouble.\n\n"
                        "To stop everything: reply STOP to any Forge email.")
-        print(c.run(heartbeat=c.state / "conductor.heartbeat"))
+        print(service.Service(c, forge / "state" / "service", limits, health=health).serve())  # T1D2
     finally:
+        if health:
+            health.stop()
         lock.close()
     return 0
 
@@ -2755,7 +2774,7 @@ def _guarded_smoke(c: Conductor, workdir: Path, force: bool = False) -> list[str
         try:
             problems = smoke(c.team, workdir, lambda role, prompt, schema, cwd: c._call(role, prompt, schema, cwd=cwd),
                              warn=c._log)
-        except Stopped as e:  # R42
+        except Stopped as e:  # R42/R49
             problems = [f"stopped during the smoke test ({e})"]
         except Capped as e:  # R37
             problems = [f"token cap reached during the smoke test ({e})"]
@@ -2765,7 +2784,9 @@ def _guarded_smoke(c: Conductor, workdir: Path, force: bool = False) -> list[str
             problems = [f"state files changed during the smoke test (Forge halted): {e}"[:500]]
         except RuntimeError as e:  # fail-closed preconditions (R15)
             problems = [str(e)[:500]]
-    if problems:
+    if problems and c._stop_requested():  # R49: a stop is not a failed smoke test (no 30-minute wait)
+        pass
+    elif problems:
         c._write("smoke_fail.json", {"at": c.clock().isoformat(), "problems": problems})
     else:
         (c.state / "smoke_fail.json").unlink(missing_ok=True)
