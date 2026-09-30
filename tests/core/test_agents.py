@@ -283,6 +283,138 @@ class R43TokenWeightTests(unittest.TestCase):
                 self.assertEqual(result.tokens, expected)
 
 
+class R46FailedRunMeteringTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cwd = Path(tmp.name)
+        self.projects_dir = self.cwd / "projects"
+        self.projects_dir.mkdir()
+        resolve = patch("core.agents._resolve", return_value=["fake-claude"])
+        resolve.start()
+        self.addCleanup(resolve.stop)
+        launcher = patch("core.agents.launch")
+        self.launch_mock = launcher.start()
+        self.addCleanup(launcher.stop)
+
+    def session_id(self, args):
+        from uuid import UUID
+        self.assertEqual(args.count("--session-id"), 1)
+        index = args.index("--session-id")
+        self.assertLess(index + 1, len(args))
+        session_id = args[index + 1]
+        self.assertEqual(UUID(session_id).version, 4)
+        return session_id
+
+    def write_log(self, session_id, rows, folder="arbitrary-project"):
+        directory = self.projects_dir / folder
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / (session_id + ".jsonl")
+        path.write_text("\n".join(row if isinstance(row, str) else json.dumps(row)
+                                  for row in rows) + "\n", encoding="utf-8")
+        return path
+
+    def usage_rows(self):
+        first = {"type": "assistant", "message": {"id": "msg-first", "usage": {
+            "input_tokens": 23, "output_tokens": 7,
+            "cache_creation_input_tokens": 19, "cache_read_input_tokens": 1009}}}
+        second = {"type": "assistant", "message": {"id": "msg-second", "usage": {
+            "input_tokens": "5", "output_tokens": 2,
+            "cache_creation_input_tokens": 3, "cache_read_input_tokens": 29}}}
+        return [first, first, "{broken JSON", {},
+                {"message": {"id": "no-usage"}},
+                {"message": {"usage": {"input_tokens": 99999}}},
+                {"message": {"id": "bad-values", "usage": {
+                    "input_tokens": "unknown", "output_tokens": -500,
+                    "cache_creation_input_tokens": -100, "cache_read_input_tokens": "bad"}}},
+                second, first, second]
+
+    def test_every_run_has_a_fresh_uuid4_session_id(self):
+        self.launch_mock.return_value = (0, '{"result":"ok","usage":{}}', "")
+        agent = ClaudeAgent()
+        for _ in range(3):
+            self.assertTrue(agent.run("hello", self.cwd).ok)
+        self.assertEqual(self.launch_mock.call_count, 3)
+        ids = [self.session_id(call.args[0]) for call in self.launch_mock.call_args_list]
+        self.assertEqual(len(set(ids)), 3)
+
+    def test_timeout_recovers_weighted_deduplicated_log_usage(self):
+        error = "agent timed out after 17s"
+
+        def timeout(args, cwd, stdin_text, timeout_s):
+            self.write_log(self.session_id(args), self.usage_rows())
+            raise TimeoutError(error)
+
+        self.launch_mock.side_effect = timeout
+        result = ClaudeAgent(timeout_s=17, projects_dir=self.projects_dir).run("hello", self.cwd)
+        self.launch_mock.assert_called_once()
+        self.assertFalse(result.ok)
+        self.assertIn("timed out", result.error)
+        self.assertEqual(result.error, error)
+        # Per message: (23 + 7 + 19 + 100) + (5 + 2 + 3 + 2).
+        self.assertEqual(result.tokens, 161)
+
+    def test_unreadable_output_recovers_log_usage_and_preserves_error(self):
+        stdout = "garbage stdout: interrupted before the result"
+
+        def unreadable(args, cwd, stdin_text, timeout_s):
+            self.write_log(self.session_id(args), self.usage_rows())
+            return 1, stdout, ""
+
+        self.launch_mock.side_effect = unreadable
+        result = ClaudeAgent(projects_dir=self.projects_dir).run("hello", self.cwd)
+        self.launch_mock.assert_called_once()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, parse_claude(stdout, None).error)
+        self.assertEqual(result.tokens, 161)
+
+    def test_success_uses_parse_claude_without_reading_log(self):
+        from unittest.mock import patch
+        for usage, expected in (({"input_tokens": 11, "output_tokens": 4,
+                                 "cache_creation_input_tokens": 2,
+                                 "cache_read_input_tokens": 39}, 20), ({}, 0)):
+            with self.subTest(usage=usage):
+                stdout = json.dumps({"is_error": False, "result": "done", "usage": usage})
+
+                def success(args, cwd, stdin_text, timeout_s):
+                    self.write_log(self.session_id(args), self.usage_rows())
+                    return 0, stdout, ""
+
+                self.launch_mock.side_effect = success
+                agent = ClaudeAgent(projects_dir=self.projects_dir)
+                with patch("core.agents.claude_log_tokens") as log_reader:
+                    result = agent.run("hello", self.cwd)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+                self.assertEqual(result, parse_claude(stdout, None))
+                log_reader.assert_not_called()
+
+    def test_timeout_without_log_returns_zero_tokens(self):
+        self.launch_mock.side_effect = TimeoutError("agent timed out after 17s")
+        result = ClaudeAgent(projects_dir=self.projects_dir).run("hello", self.cwd)
+        self.launch_mock.assert_called_once()
+        self.session_id(self.launch_mock.call_args.args[0])
+        self.assertFalse(result.ok)
+        self.assertIn("timed out", result.error)
+        self.assertEqual(result.tokens, 0)
+
+    def test_log_reader_finds_session_in_any_project_folder(self):
+        from core import agents
+        from uuid import uuid4
+        for folder in ("unrelated-project", "another project", "-C-work-repo"):
+            with self.subTest(folder=folder):
+                session_id = str(uuid4())
+                self.write_log(session_id, self.usage_rows(), folder)
+                self.assertEqual(agents.claude_log_tokens(session_id, self.projects_dir), 161)
+
+    def test_log_reader_unknown_session_returns_zero(self):
+        from core import agents
+        from uuid import uuid4
+        self.write_log(str(uuid4()), self.usage_rows())
+        self.assertEqual(agents.claude_log_tokens(str(uuid4()), self.projects_dir), 0)
+
+
 class AdapterTests(unittest.TestCase):
     def test_missing_cli_is_failed_result(self):
         for a in (ClaudeAgent(cmd=["no-such-binary-xyz"]), CodexAgent(cmd=["no-such-binary-xyz"])):
