@@ -191,6 +191,10 @@ def _n(v) -> int:
     numeric strings can) counts as 0, so a bad, negative or infinite field can never cancel out real usage."""
     if isinstance(v, bool):
         return 0
+    if isinstance(v, int):  # exact, any size
+        return v if v > 0 else 0
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
     try:
         f = float(v)
     except (TypeError, ValueError, OverflowError):
