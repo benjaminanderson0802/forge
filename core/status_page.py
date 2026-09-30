@@ -13,6 +13,8 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import time
+import threading
 import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -155,12 +157,53 @@ def render(state: Path, limits: dict, now: datetime | None = None, *, local_tz=N
             f"<style>{_CSS}</style></head><body><main>" + "".join(out) + "</main></body></html>")
 
 
+def conductor_between_runs(service_root: Path, now: float | None = None, stale_s: float = 180.0) -> bool:
+    """Only while the conductor sleeps (or isn't running) may an answer file appear: a file that appears during an
+    agent run is tampering by design (the drop folder is fingerprinted), so the page must never write one then."""
+    hb = _read(Path(service_root), "heartbeat.json", {})
+    at = hb.get("at") if isinstance(hb, dict) else None
+    now = time.time() if now is None else now
+    if not isinstance(at, (int, float)) or now - at > stale_s or hb.get("phase") == "exited":
+        return True  # not running: nothing can mistake the file for an agent's write
+    return hb.get("phase") == "sleep"
+
+
+class AnswerOutbox:
+    """Holds answers from the page until the conductor is between runs, then drops them (in order)."""
+
+    def __init__(self, drop: Path, service_root: Path, idle=conductor_between_runs):
+        self.drop, self.service_root, self.idle = Path(drop), Path(service_root), idle
+        self.pending: list[tuple[str, str, str]] = []
+        self.lock = threading.Lock()
+
+    def add(self, qid: str, code: str, answer: str) -> None:
+        with self.lock:
+            self.pending.append((qid, code, answer))
+        self.flush()
+
+    def flush(self) -> int:
+        with self.lock:
+            if not self.pending or not self.idle(self.service_root):
+                return 0
+            n = 0
+            while self.pending:
+                qid, code, answer = self.pending[0]
+                try:
+                    channel.drop_answer(self.drop, qid, code, answer, "status page")
+                except ValueError:
+                    pass
+                self.pending.pop(0)
+                n += 1
+            return n
+
+
 def make_server(state: Path, channel_dir: Path, limits: dict, host: str = "127.0.0.1", port: int = PORT,
-                local_tz=None) -> ThreadingHTTPServer:
+                local_tz=None, outbox: "AnswerOutbox | None" = None) -> ThreadingHTTPServer:
     """A server bound to the loopback address only (D-022). port=0 picks a free port (tests)."""
     if host not in LOOPBACK:
         raise ValueError(f"the status page binds 127.0.0.1 only, not {host!r}")
     state, drop = Path(state), Path(channel_dir) / "in"
+    outbox = outbox or AnswerOutbox(drop, state.parent / "service")
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "ForgeStatus"
@@ -234,13 +277,24 @@ def make_server(state: Path, channel_dir: Path, limits: dict, host: str = "127.0
             open_q = {i["id"]: i for i in channel.queue_items(_read(state, "questions.json", {}))}
             if not answer or qid not in open_q or open_q[qid]["code"] != code:
                 return self._send(400, "That question is not open, or the answer is empty. Reload the page.")
-            try:
-                channel.drop_answer(drop, qid, code, answer, "status page")
-            except ValueError:
+            if not channel._QID_RE.match(qid) or not channel._CODE_RE.match(code):
                 return self._send(400, "Bad request")
+            outbox.add(qid, code, answer)  # delivered now if the conductor is between runs, else when it next is
             return self._send(303, "", location="/")
 
-    return ThreadingHTTPServer((host, port), Handler)
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.outbox = outbox
+
+    def _pump() -> None:  # deliver held answers as soon as the conductor is between runs
+        while True:
+            time.sleep(2)
+            try:
+                outbox.flush()
+            except Exception:  # noqa: BLE001 - never let the pump die
+                pass
+
+    threading.Thread(target=_pump, daemon=True).start()
+    return server
 
 
 def main(argv: list[str]) -> int:
