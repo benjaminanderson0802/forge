@@ -368,3 +368,9 @@ The first run with real agents and real email hit four faults no fake-based test
   - **On a fail:** unchanged (the reasons become the rejection note, R41).
   - **The reviewer sees the whole plan.** In the first cycle the tasks JSON was cut at 20,000 characters, so the reviewer rightly rejected a "truncated" plan. Now the plan file and the tasks JSON are passed in full. If their combined length exceeds `PLAN_REVIEW_MAX` (200,000 characters), code rejects the plan before any review, with `plan rejected: plan too large for review (<n> characters); split this plan task`.
   - **Build reviews** (`S_REVIEW` after a build) are unchanged.
+
+## Live-use amendment (2026-09-30, plan attempts)
+
+- **R45 Plans get three attempts, and the planner checks itself against the rules first.** Under R44, plan reviews converged to a single blocking reason per attempt. Each attempt fixed the last reason, but a new contradiction with an existing rule surfaced each time. With only two attempts, plan tasks still blocked. Now:
+  - **`PLAN_ATTEMPTS = 3`:** a plan task is blocked after its third rejection, not its second. Test-writer rejections are unchanged (2).
+  - **The planner is told** to check every task against the numbered rules in `docs/specs/bootstrap-conductor.md` and the decisions in `docs/DECISIONS.md` before answering. The prompt says that any contradiction with them will be rejected as blocking.

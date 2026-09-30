@@ -34,6 +34,7 @@ TASK_FIELDS = ("id", "title", "section", "files_in_scope", "test_files", "test_c
 NOTE_CAP, NOTES_KEEP, BODY_CAP = 2000, 30, 20000  # R19
 MIN_SECTION_CHARS = 600  # R41: a task's section is its builder's only instructions
 PLAN_REVIEW_MAX = 200_000  # R44: the plan reviewer sees the whole plan, up to this size
+PLAN_ATTEMPTS = 3  # R45: a plan task is blocked after this many rejections
 SUBJECT_CAP, CLOSED_KEEP, SENT_IDS_KEEP = 300, 50, 500  # R26, R28
 
 
@@ -1019,7 +1020,10 @@ class Conductor:
                            "and signatures, behaviour, edge cases, dependencies on earlier tasks, and the acceptance "
                            f"criteria the tests must check (at least {MIN_SECTION_CHARS} characters). Every task must "
                            "be fully doable by a builder that may change ONLY its files_in_scope: no steps for Ben, "
-                           "the conductor, or files outside that scope.\n" +
+                           "the conductor, or files outside that scope.\n"
+                           "Before answering (R45), check every task against the numbered rules in "
+                           "docs/specs/bootstrap-conductor.md and the decisions in docs/DECISIONS.md: any contradiction "
+                           "with them will be rejected as blocking.\n" +
                            ("\nYOUR EARLIER ATTEMPTS WERE REJECTED FOR:\n" + "\n".join(prior) + "\n" if prior else "") +
                            "Answer with JSON: {\"tasks\": [...]}", S_PLAN)
         except Capped:
@@ -1078,7 +1082,7 @@ class Conductor:
             self._reset_wt()
             rejects = t.get("plan_rejects", 0) + 1
             self._update(tid, notes=t["notes"] + [reason], plan_rejects=rejects)
-            if rejects >= 2:
+            if rejects >= PLAN_ATTEMPTS:  # R45
                 self._block(tid, reason)
             return
         tasks = self._attach_review_notes(tasks, (rv.data or {}).get("task_notes"), plan_file)  # R44
