@@ -344,3 +344,26 @@ The first run with real agents and real email hit four faults no fake-based test
     `cached_input_tokens` is clamped to `0..input_tokens`; missing fields count as 0.
   - **A usage field that can't be read as a finite non-negative number** counts as 0 everywhere: non-numeric text, negative, infinite or NaN, true/false, or missing. Numbers and numeric strings ("1000") are read normally. So a bad field can never cancel real usage, and a bad cached count counts all input as fresh.
   - Everything else about metering is unchanged (R6/R37).
+
+## Live-use amendment (2026-09-30, plan review)
+
+- **R44 The plan reviewer blocks only for blocking problems; its detailed notes travel with the tasks.** In the first live cycle, every plan was rejected for reasonable edge-case details: a new set each attempt. Two rejections block a plan task, so planning stalled although the plans were sound. Now:
+  - **The plan review uses the schema `S_PLAN_REVIEW`:**
+    - `verdict`: `pass` or `fail`;
+    - `reasons`: a list of strings;
+    - `task_notes`: optional, a list of `{task, note}`.
+  - **The reviewer is told to fail ONLY for blocking problems:**
+    - a requirement of this plan task that no task covers;
+    - a task that contradicts `docs/DECISIONS.md` or the design;
+    - a task that can't be done within its `files_in_scope`;
+    - wrong ordering or dependencies between tasks;
+    - placeholders or thin sections.
+
+    Edge cases, extra tests and implementation details go in `task_notes` against the task they affect. Those are not a reason to fail.
+  - **On a pass:**
+    - Each note whose `task` matches a returned task id is appended to that task's `section`, under the heading `REVIEWER NOTES (handle and test these):`, one `- ` line per note.
+    - Notes whose `task` matches no returned task are appended to every task under `PLAN-WIDE REVIEWER NOTES:`.
+    - Empty notes are dropped. Each note is capped at `NOTE_CAP` characters, and each task gets at most 10 notes (the first 10).
+    - The notes are also appended to the plan file under `## Reviewer notes` in the same plan commit.
+  - **On a fail:** unchanged (the reasons become the rejection note, R41).
+  - **Build reviews** (`S_REVIEW` after a build) are unchanged.
