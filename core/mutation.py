@@ -6,9 +6,17 @@ line of the enclosing expression, so only code on changed lines is mutated.
 
 import ast
 import io
+import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 import tokenize
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -202,3 +210,129 @@ def find_mutants(path: str, source: str, lines: set[int]) -> list[Mutant]:
                               replacement, mutated))
     assert len({m.id for m in mutants}) == len(mutants)
     return mutants
+
+
+@dataclass
+class MutationResult:
+    total: int
+    killed: int
+    survivors: list[Mutant] = field(default_factory=list)
+    not_run: list[str] = field(default_factory=list)
+    complete: bool = True
+    score: float = 1.0
+    passed: bool = True
+    reason: str = ""
+
+    def survivor_ids(self) -> list[str]:
+        return [m.id for m in self.survivors]
+
+    def as_dict(self) -> dict:
+        return {
+            "total": self.total,
+            "killed": self.killed,
+            "score": self.score,
+            "complete": self.complete,
+            "passed": self.passed,
+            "reason": self.reason,
+            "not_run": list(self.not_run),
+            "survivors": [{"id": m.id, "file": m.file, "line": m.line,
+                           "original": m.original, "replacement": m.replacement}
+                          for m in self.survivors],
+        }
+
+
+def _default_run(argv: list[str], root: Path, timeout: float,
+                 env: dict) -> tuple[int, bool]:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        proc = subprocess.run(list(argv), cwd=root, capture_output=True,
+                              stdin=subprocess.DEVNULL, timeout=timeout, env=env,
+                              creationflags=flags)
+    except subprocess.TimeoutExpired:
+        return 124, True
+    return proc.returncode, False
+
+
+def run_mutation(root: Path, changed: dict[str, set[int]], test_argv: list[str], *,
+                 mutation_min: float, budget_s: float, per_mutant_timeout_s: float,
+                 clock: Callable[[], float] = time.monotonic,
+                 run: Callable[[list[str], Path, float, dict], tuple[int, bool]]
+                 | None = None) -> MutationResult:
+    """Run each mutant's tests under one hard total budget (layer-1 design 3.4).
+
+    A mutant only gets a verdict if its run finished inside the budget; anything
+    cut short by the deadline is reported in `not_run`, so an out-of-budget
+    run is never complete.
+    """
+    deadline = clock() + budget_s  # taken once, before generation
+    runner = _default_run if run is None else run
+    root = Path(root)
+    originals: dict[str, bytes] = {}
+    mutants: list[Mutant] = []
+    for rel in sorted(changed):
+        target = root / rel
+        try:
+            raw = target.read_bytes()
+            text = raw.decode("utf-8")
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError,
+                UnicodeDecodeError):
+            continue
+        found = find_mutants(rel, text, set(changed[rel]))
+        if found:
+            originals[rel] = raw
+            mutants.extend(found)
+
+    killed = 0
+    survivors: list[Mutant] = []
+    not_run: list[str] = []
+    for index, mutant in enumerate(mutants):
+        remaining = deadline - clock()
+        if remaining <= 0:
+            not_run.extend(m.id for m in mutants[index:])
+            break
+        timeout = min(per_mutant_timeout_s, remaining)
+        target = root / mutant.file
+        cache = tempfile.mkdtemp(prefix="forge-mut-pyc-")
+        env = dict(os.environ)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["PYTHONPYCACHEPREFIX"] = cache
+        try:
+            with open(target, "w", encoding="utf-8", newline="") as handle:
+                handle.write(mutant.source)
+            code, timed_out = runner(list(test_argv), root, timeout, env)
+        finally:
+            target.write_bytes(originals[mutant.file])
+            shutil.rmtree(cache, ignore_errors=True)
+        overran = clock() >= deadline
+        if overran or (timed_out and timeout < per_mutant_timeout_s):
+            not_run.append(mutant.id)
+        elif timed_out or code != 0:
+            killed += 1
+        else:
+            survivors.append(mutant)
+
+    for rel, raw in originals.items():
+        try:
+            same = (root / rel).read_bytes() == raw
+        except OSError:
+            same = False
+        if not same:
+            raise RuntimeError(f"mutation restore failed: {rel}")
+
+    judged = killed + len(survivors)
+    score = killed / judged if judged else 1.0
+    complete = not not_run
+    passed = complete and score >= mutation_min
+    if not mutants:
+        reason = "no mutation sites on changed lines"
+    elif not complete:
+        reason = (f"incomplete: budget ran out, {len(not_run)} of {len(mutants)} "
+                  f"mutants not run")
+    else:
+        sign = ">=" if score >= mutation_min else "<"
+        plural = "survivor" if len(survivors) == 1 else "survivors"
+        reason = (f"killed {killed} of {judged} ({score:.2f} {sign} "
+                  f"{mutation_min:.2f}); {len(survivors)} {plural}")
+    return MutationResult(total=len(mutants), killed=killed, survivors=survivors,
+                          not_run=not_run, complete=complete, score=score,
+                          passed=passed, reason=reason)
