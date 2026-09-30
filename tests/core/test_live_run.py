@@ -2245,3 +2245,73 @@ class R44PlanReviewNotesTests(Harness):
         self.assertFalse((c.wt / "plan.md").exists())
         self.assertNotIn("plan.md", self.branch_files())
         self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+
+
+class R45PlanAttemptsTests(Harness):
+    def rejected_plan(self):
+        child = self.task(section="x" * 600)
+
+        def planner(prompt, cwd):
+            (cwd / "plan.md").write_text(
+                "# Implementation plan\n" + child["section"], encoding="utf-8")
+            return json.dumps({"tasks": [child]}), 1
+
+        return self.init(
+            {"id": "P1", "kind": "plan", "title": "Plan", "section": "Plan",
+             "plan_file": "plan.md", "status": "todo"},
+            agents={"planner": planner,
+                    "reviewer": lambda prompt, cwd: (
+                        '{"verdict":"fail","reasons":["Task contradicts an existing rule."]}', 1)},
+        )
+
+    def test_R45_plan_attempts_is_three(self):
+        self.assertEqual(getattr(bootstrap, "PLAN_ATTEMPTS", None), 3)
+
+    def test_R45_plan_retries_twice_then_blocks_on_third_rejection(self):
+        c = self.rejected_plan()
+        for attempt in range(1, 4):
+            with self.subTest(attempt=attempt):
+                self.assertEqual(c.step(), "worked")
+                self.assertEqual(len(c.team.planner.prompts), attempt)
+                self.assertEqual(len(c.team.reviewer.prompts), attempt)
+                task = c._task("P1")
+                self.assertEqual(task["plan_rejects"], attempt)
+                self.assertEqual(task["status"], "todo" if attempt < 3 else "blocked")
+                questions = list(c._read("questions.json", {}).values())
+                if attempt < 3:
+                    self.assertEqual(questions, [])
+                else:
+                    self.assertEqual(len(questions), 1)
+                    self.assertEqual(questions[0]["kind"], "blocked")
+                    self.assertEqual(questions[0]["task"], "P1")
+                    self.assertEqual(questions[0]["status"], "open")
+
+    def test_R45_planner_prompt_requires_rule_and_decision_self_check(self):
+        c = self.rejected_plan()
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(c.team.planner.prompts), 1)
+        prompt = " ".join(c.team.planner.prompts[0].split())
+        for phrase in ("docs/specs/bootstrap-conductor.md", "docs/DECISIONS.md",
+                       "rejected as blocking"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, prompt)
+
+    def test_R45_test_writer_still_blocks_after_two_rejections(self):
+        def writer(prompt, cwd):
+            (cwd / "stray.txt").write_text("outside test_files\n", encoding="utf-8")
+            return '{"files":["stray.txt"]}', 1
+
+        c = self.init(agents={"test_writer": writer})
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(c._task("T1")["test_rejects"], 1)
+        self.assertEqual(c._task("T1")["status"], "todo")
+        self.assertEqual(c._read("questions.json", {}), {})
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(c.team.test_writer.prompts), 2)
+        self.assertEqual(c._task("T1")["test_rejects"], 2)
+        self.assertEqual(c._task("T1")["status"], "blocked")
+        questions = list(c._read("questions.json", {}).values())
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0]["kind"], "blocked")
+        self.assertEqual(questions[0]["task"], "T1")
+        self.assertEqual(questions[0]["status"], "open")
