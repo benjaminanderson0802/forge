@@ -260,6 +260,17 @@ class SnapshotTests(Base):
         self.assertEqual(snap["phase"], "step")
         self.assertEqual(snap["recent_errors"], [f"line {i}" for i in range(15, 20)])
 
+    def test_snapshot_shows_holds_and_runs_against_the_daily_cap(self):
+        from core.usage import Meter
+        now = datetime(2026, 9, 30, 22, 15, tzinfo=timezone.utc)
+        Meter(self.state, clock=lambda: now).hold("claude", datetime(2026, 10, 1, 11, tzinfo=timezone.utc))
+        (self.state / "runs" / "20260930T220000-builder-abc123").mkdir(parents=True)
+        snap = service.snapshot(self.state, self.root, {"claude_daily_token_cap": 10, "agent_runs_per_day": 150},
+                                now=now)
+        self.assertEqual(snap["caps"]["claude"]["held_until"], "2026-10-01T11:00:00+00:00")
+        self.assertTrue(snap["caps"]["claude"]["over"])
+        self.assertEqual((snap["runs_today"], snap["runs_cap"]), (1, 150))
+
     def test_snapshot_of_an_empty_install_does_not_crash(self):
         snap = service.snapshot(self.state, self.root, {}, now=datetime.now(timezone.utc))
         self.assertFalse(snap["running"])

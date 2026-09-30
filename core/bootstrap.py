@@ -29,7 +29,7 @@ from core.finalize import ApprovedMerges, Finalizer, Hooks, Journal, safe_push
 from core.ledger import Ledger, Rejected
 from core.mutation import changed_lines, run_mutation
 from core.roles import role_text
-from core.usage import Meter
+from core.usage import Meter, limit_hold_until
 from core.weaktest import empty_implementation, real_failing_run, stub_targets
 from core.worktrees import Worktrees
 
@@ -125,6 +125,11 @@ class Tampered(Exception):
 
 class Capped(Exception):
     """R37: the agent's provider is at its daily token cap; nothing was launched."""
+
+
+class Killed(Capped):
+    """T1D3: KILL was set before a launch, or appeared while an agent ran. A Capped, so every stage undoes the
+    attempt with no failure recorded; run() then returns "killed"."""
 
 
 class NotReady(Exception):
@@ -344,6 +349,8 @@ class Conductor:
 
     # ------------------------------------------------------------------ agents
     def _call(self, role: str, prompt: str, schema: dict | None, cwd: Path | None = None, needs=None):
+        if (self.state / "KILL").exists():  # T1D3: before anything else, including readiness refreshes
+            raise Killed("KILL")
         agent = getattr(self.team, role)
         provider = getattr(agent, "provider", None)
         if provider and self.meter.over(provider, self.limits):  # R37: checked before every launch
@@ -355,6 +362,8 @@ class Conductor:
     def _guarded_run(self, label: str, agent, prompt: str, cwd: Path | None, schema: dict | None):
         """R14/R15 guarded agent run: run record, fingerprint before and after, KILL on tamper, metering."""
         role = label
+        if (self.state / "KILL").exists():  # T1D3: KILL is checked before every launch
+            raise Killed("KILL")
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + role + "-" + uuid.uuid4().hex[:6]
         d = self.state / "runs" / run_id
         d.mkdir(parents=True, exist_ok=True)
@@ -368,6 +377,9 @@ class Conductor:
             raise RuntimeError("state file unreadable before agent run: " + ", ".join(unreadable))
         if not before.get(LOCK_NAME, "lock:0:").startswith("lock:0:"):  # R15: only an empty lock is trusted
             raise RuntimeError(f"state file {LOCK_NAME} is not empty before agent run")
+        if hasattr(agent, "should_stop"):  # T1D3: a real agent's process tree is killed when KILL appears
+            kill = self.state / "KILL"
+            agent.should_stop = kill.exists
         try:
             r = agent.run(prompt, Path(cwd) if cwd else self.wt, schema)
         except Exception as e:  # noqa: BLE001 - an agent crash is a failed result
@@ -378,6 +390,9 @@ class Conductor:
             changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
         except Exception as e:  # noqa: BLE001 - R15: a check that can't complete counts as tampering
             changed = [f"state could not be fingerprinted after the run: {type(e).__name__}: {e}"]
+        if changed == ["KILL"] and (self.state / "KILL").exists():  # T1D3: Ben pressed stop during the run
+            self._log(f"stopped by KILL during {role} run {run_id}; nothing from the run is recorded")
+            raise Killed("KILL")
         if changed:
             (self.state / "KILL").write_text("state tampered during an agent run\n")
             try:
@@ -393,6 +408,15 @@ class Conductor:
         (d / "output.json").write_bytes(json.dumps({"ok": r.ok, "error": r.error, "text": r.text, "data": r.data,
                                                     "tokens": r.tokens, "provider": r.provider},
                                                    indent=2).encode("utf-8"))
+        if not r.ok and "agent stopped: KILL" in (r.error or ""):  # T1D3: a stop is never a failure
+            raise Killed("KILL")
+        if not r.ok:  # T1D3: a used-up plan limit window is a cap until it resets, never a failed attempt
+            until = limit_hold_until(f"{r.error or ''}\n{r.text or ''}", self.clock())
+            if until is not None:
+                provider = getattr(agent, "provider", None) or r.provider or "unknown"
+                self.meter.hold(provider, until)
+                self._log(f"{provider} limit window during {role} run {run_id}; on hold until {until.isoformat()}")
+                raise Capped(provider)
         return r
 
     def _fingerprint(self) -> dict:
@@ -2331,6 +2355,8 @@ def _guarded_smoke(c: Conductor, workdir: Path, force: bool = False) -> list[str
         try:
             problems = smoke(c.team, workdir, lambda role, prompt, schema, cwd: c._call(role, prompt, schema, cwd=cwd),
                              warn=c._log)
+        except Killed:  # T1D3
+            problems = ["stopped: KILL is set"]
         except Capped as e:  # R37
             problems = [f"token cap reached during the smoke test ({e})"]
         except NotReady as e:  # D-030
@@ -2339,7 +2365,9 @@ def _guarded_smoke(c: Conductor, workdir: Path, force: bool = False) -> list[str
             problems = [f"state files changed during the smoke test (Forge halted): {e}"[:500]]
         except RuntimeError as e:  # fail-closed preconditions (R15)
             problems = [str(e)[:500]]
-    if problems:
+    if problems and (c.state / "KILL").exists():  # T1D3: a stop is not a failed smoke test (no 30-minute wait)
+        pass
+    elif problems:
         c._write("smoke_fail.json", {"at": c.clock().isoformat(), "problems": problems})
     else:
         (c.state / "smoke_fail.json").unlink(missing_ok=True)
