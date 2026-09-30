@@ -98,7 +98,7 @@ class DeclaredNeeds(GateHarness):
 
         def planner(p, cwd):
             (cwd / "plan.md").write_text("plan\n")
-            child = self.task(id="T2")
+            child = self.task(id="T2", section="s" * 600)  # R41: sections >= 600 chars
             del child["kind"]
             if child_needs is not None:
                 child["needs"] = child_needs

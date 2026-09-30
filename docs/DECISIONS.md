@@ -157,3 +157,25 @@ Restarting requires Ben to deliberately clear the stop.
 This comes from the email-flood incident (`docs/incidents/2026-09-29-email-flood.md`).
 
 **D-036 (2026-09-29, proposed) The rabbit-hole limit applies to every agent, including the one talking to Ben.** A fix-and-review loop gets at most 3 rounds or about 45 minutes. Then Ben gets a short report (what is fixed, what is left, a recommendation) and chooses whether to continue.
+
+## Building around the clock
+
+**D-037 (2026-09-30) Ben's approval to build Forge is standing and complete. Approvals are never a build blocker.** Ben's words: "I approve the building and implementation of the project, entirely… approvals should never be a blocker… we need building 24/7."
+- **Protected-file changes that build Forge** (`core/`, `drills/`, `tests/`, `charter/`, `.github/`, specs, the docs, including this file) are pre-approved. The builder in charge (the supervisor or a chat session) applies the `human-approved` label and merges when **all** of these hold:
+  1. The tests were written first by a different agent (Codex).
+  2. The full core suite and the drills pass.
+  3. A read-only Codex review raises no unresolved findings.
+  4. CI's "core" check passes.
+
+  This replaces the per-change approval in D-010 for build work. Forge's own conductor agents still never hold credentials that can apply the label (D-010 stands for them).
+- **Loops don't wait on Ben.** This supersedes D-036's "Ben chooses whether to continue". After 3 rounds or about 45 minutes on one problem, the builder writes a short report and proceeds on its own best recommendation (a different approach, or re-scope and move on). It doesn't stop.
+- **What still goes to Ben** is not approval to build. It's the things only he can do or that act in the world outside the build:
+  - spending money, and paid subscriptions;
+  - creating accounts, and human-only sign-up steps;
+  - messages to anyone other than Ben;
+  - legal commitments.
+
+  These go in his queue while building continues on everything else.
+- **A builder is always on.** An hourly "Forge supervisor" scheduled task works from `docs/SUPERVISOR.md`, so building continues whether or not a chat is open.
+
+**D-038 (2026-09-30) The mutation gate is a rate, not "every mutant".** The design said both that "each mutant must be caught" and that "the rate must be at least `mutation_min`". The 1B plan reviewer rightly flagged the contradiction. Some mutants are equivalent (they don't change behaviour) and can never be caught, so a 100% rule is unworkable. The gate is: the kill rate on changed lines is at least `mutation_min` (0.8 in `charter/limits.json`), and every surviving mutant is reported to the Builder and Reviewer as evidence. Decided by the builder under D-037.

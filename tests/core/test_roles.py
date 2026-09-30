@@ -219,7 +219,7 @@ class ConductorRolePromptTests(Harness):
 
         def planner(p, cwd):
             (cwd / planfile).write_text("plan\n", encoding="utf-8")
-            return json.dumps({"tasks": [self.task(id="T2")]}), 1
+            return json.dumps({"tasks": [self.task(id="T2", section="s" * 600)]}), 1  # R41: sections >= 600 chars
 
         c = self.init(task, agents={"planner": planner, "test_writer": self.write_tests,
                                     "builder": lambda p, cwd: ('{"status":"done"}', 1)})

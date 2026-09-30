@@ -452,7 +452,7 @@ class PromptBlocks(ReadinessHarness):
 
         def planner(p, cwd):
             (cwd / planfile).write_text("plan\n")
-            return json.dumps({"tasks": [self.task(id="T2")]}), 1
+            return json.dumps({"tasks": [self.task(id="T2", section="s" * 600)]}), 1  # R41: sections >= 600 chars
         c = self.init(task, agents={"planner": planner}, checks=self.broken_docker())
         c.clock = lambda: self.now
         c.step()

@@ -32,7 +32,7 @@ class ClaudeParseTests(unittest.TestCase):
         out = json.dumps({"is_error": False, "result": "ok", "usage": {"input_tokens": 10, "output_tokens": 5,
                           "cache_creation_input_tokens": 2, "cache_read_input_tokens": 3}})
         r = parse_claude(out, None)
-        self.assertEqual((r.ok, r.text, r.tokens, r.provider), (True, "ok", 20, "claude"))
+        self.assertEqual((r.ok, r.text, r.tokens, r.provider), (True, "ok", 17, "claude"))
 
     def test_not_logged_in(self):
         r = parse_claude(json.dumps({"is_error": True, "result": "Not logged in · Please run /login"}), None)
@@ -60,7 +60,7 @@ class CodexParseTests(unittest.TestCase):
                           {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 80,
                                                                "output_tokens": 5, "reasoning_output_tokens": 7}})
         r = parse_codex(0, out, "ok", None)
-        self.assertEqual((r.ok, r.text, r.tokens, r.provider), (True, "ok", 112, "codex"))
+        self.assertEqual((r.ok, r.text, r.tokens, r.provider), (True, "ok", 40, "codex"))
 
     def test_codex_no_turn_completed(self):
         r = parse_codex(1, self.events({"type": "thread.started"}), "", None)
@@ -70,6 +70,428 @@ class CodexParseTests(unittest.TestCase):
         out = self.events({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}})
         r = parse_codex(0, out, '{"verdict": "fail", "reasons": ["x"]}', {"type": "object", "required": ["verdict"]})
         self.assertTrue(r.ok); self.assertEqual(r.data["verdict"], "fail")
+
+class R43TokenWeightTests(unittest.TestCase):
+    def test_codex_nonfinite_fields_preserve_valid_usage(self):
+        for field, expected in (("cached_input_tokens", 1057), ("input_tokens", 57)):
+            for value in (float("inf"), float("-inf"), float("nan")):
+                with self.subTest(field=field, value=value):
+                    usage = {"input_tokens": 1000, "cached_input_tokens": 400,
+                             "output_tokens": 50, "reasoning_output_tokens": 7}
+                    usage[field] = value
+                    out = json.dumps({"type": "turn.completed", "usage": usage})
+                    result = parse_codex(0, out, "ok", None)
+                    self.assertTrue(result.ok, result.error)
+                    self.assertEqual(result.tokens, expected)
+
+    def test_claude_nonfinite_fields_preserve_valid_usage(self):
+        for field, expected in (("cache_read_input_tokens", 1057), ("input_tokens", 97)):
+            for value in (float("inf"), float("-inf"), float("nan")):
+                with self.subTest(field=field, value=value):
+                    usage = {"input_tokens": 1000, "output_tokens": 50,
+                             "cache_creation_input_tokens": 7, "cache_read_input_tokens": 400}
+                    usage[field] = value
+                    out = json.dumps({"is_error": False, "result": "ok", "usage": usage})
+                    result = parse_claude(out, None)
+                    self.assertTrue(result.ok, result.error)
+                    self.assertEqual(result.tokens, expected)
+
+    def test_codex_boolean_fields_count_as_zero(self):
+        for field, expected in (("input_tokens", 57), ("cached_input_tokens", 1057),
+                                ("output_tokens", 647), ("reasoning_output_tokens", 690)):
+            for value in (True, False):
+                with self.subTest(field=field, value=value):
+                    usage = {"input_tokens": 1000, "cached_input_tokens": 400,
+                             "output_tokens": 50, "reasoning_output_tokens": 7}
+                    usage[field] = value
+                    out = json.dumps({"type": "turn.completed", "usage": usage})
+                    result = parse_codex(0, out, "ok", None)
+                    self.assertTrue(result.ok, result.error)
+                    self.assertEqual(result.tokens, expected)
+
+    def test_claude_boolean_fields_count_as_zero(self):
+        for field, expected in (("input_tokens", 97), ("output_tokens", 1047),
+                                ("cache_creation_input_tokens", 1090), ("cache_read_input_tokens", 1057)):
+            for value in (True, False):
+                with self.subTest(field=field, value=value):
+                    usage = {"input_tokens": 1000, "output_tokens": 50,
+                             "cache_creation_input_tokens": 7, "cache_read_input_tokens": 400}
+                    usage[field] = value
+                    out = json.dumps({"is_error": False, "result": "ok", "usage": usage})
+                    result = parse_claude(out, None)
+                    self.assertTrue(result.ok, result.error)
+                    self.assertEqual(result.tokens, expected)
+
+    def test_codex_json_negative_overflow_preserves_valid_usage(self):
+        cases = (
+            ('{"input_tokens": 1000, "cached_input_tokens": -1e400, '
+             '"output_tokens": 50, "reasoning_output_tokens": 7}', 1057),
+            ('{"input_tokens": -1e400, "cached_input_tokens": 400, '
+             '"output_tokens": 50, "reasoning_output_tokens": 7}', 57),
+        )
+        for usage_json, expected in cases:
+            with self.subTest(usage=usage_json):
+                out = '{"type": "turn.completed", "usage": ' + usage_json + '}'
+                result = parse_codex(0, out, "ok", None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+
+    def test_claude_json_negative_overflow_preserves_valid_usage(self):
+        cases = (
+            ('{"input_tokens": 1000, "cache_read_input_tokens": -1e400, '
+             '"output_tokens": 50, "cache_creation_input_tokens": 7}', 1057),
+            ('{"input_tokens": -1e400, "cache_read_input_tokens": 400, '
+             '"output_tokens": 50, "cache_creation_input_tokens": 7}', 97),
+        )
+        for usage_json, expected in cases:
+            with self.subTest(usage=usage_json):
+                out = '{"is_error": false, "result": "ok", "usage": ' + usage_json + '}'
+                result = parse_claude(out, None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+
+    def test_codex_bad_cached_input_counts_all_input_as_fresh(self):
+        for cached in ("unknown", -10500):
+            with self.subTest(cached_input_tokens=cached):
+                out = json.dumps({"type": "turn.completed", "usage": {
+                    "input_tokens": 1000, "output_tokens": 50,
+                    "cached_input_tokens": cached}})
+                result = parse_codex(0, out, "ok", None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, 1050)
+
+    def test_claude_bad_cache_read_cannot_cancel_real_usage(self):
+        for cached in ("unknown", -10500):
+            with self.subTest(cache_read_input_tokens=cached):
+                out = json.dumps({"is_error": False, "result": "ok", "usage": {
+                    "input_tokens": 1000, "output_tokens": 50,
+                    "cache_read_input_tokens": cached}})
+                result = parse_claude(out, None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, 1050)
+
+    def test_codex_bad_other_fields_preserve_valid_usage(self):
+        for field, expected in (("input_tokens", 57), ("output_tokens", 647),
+                                ("reasoning_output_tokens", 690)):
+            for value in ("unknown", -10500):
+                with self.subTest(field=field, value=value):
+                    usage = {"input_tokens": 1000, "cached_input_tokens": 400,
+                             "output_tokens": 50, "reasoning_output_tokens": 7}
+                    usage[field] = value
+                    out = json.dumps({"type": "turn.completed", "usage": usage})
+                    result = parse_codex(0, out, "ok", None)
+                    self.assertTrue(result.ok, result.error)
+                    self.assertEqual(result.tokens, expected)
+
+    def test_claude_bad_other_fields_preserve_valid_usage(self):
+        for field, expected in (("input_tokens", 97), ("output_tokens", 1047),
+                                ("cache_creation_input_tokens", 1090)):
+            for value in ("unknown", -10500):
+                with self.subTest(field=field, value=value):
+                    usage = {"input_tokens": 1000, "output_tokens": 50,
+                             "cache_creation_input_tokens": 7, "cache_read_input_tokens": 400}
+                    usage[field] = value
+                    out = json.dumps({"is_error": False, "result": "ok", "usage": usage})
+                    result = parse_claude(out, None)
+                    self.assertTrue(result.ok, result.error)
+                    self.assertEqual(result.tokens, expected)
+
+    def test_codex_numeric_strings_count_as_numbers(self):
+        for field, expected in (("input_tokens", 67), ("cached_input_tokens", 967),
+                                ("output_tokens", 747), ("reasoning_output_tokens", 790)):
+            with self.subTest(field=field):
+                usage = {"input_tokens": 1000, "cached_input_tokens": 400,
+                         "output_tokens": 50, "reasoning_output_tokens": 7}
+                usage[field] = "100"
+                out = json.dumps({"type": "turn.completed", "usage": usage})
+                result = parse_codex(0, out, "ok", None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+
+    def test_claude_numeric_strings_count_as_numbers(self):
+        for field, expected in (("input_tokens", 197), ("output_tokens", 1147),
+                                ("cache_creation_input_tokens", 1190), ("cache_read_input_tokens", 1067)):
+            with self.subTest(field=field):
+                usage = {"input_tokens": 1000, "output_tokens": 50,
+                         "cache_creation_input_tokens": 7, "cache_read_input_tokens": 400}
+                usage[field] = "100"
+                out = json.dumps({"is_error": False, "result": "ok", "usage": usage})
+                result = parse_claude(out, None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+
+    def test_claude_large_cache_read_uses_floor_division(self):
+        for cached in (1_000_000, 1_000_009):
+            with self.subTest(cache_read_input_tokens=cached):
+                out = json.dumps({"is_error": False, "result": "ok", "usage": {
+                    "input_tokens": 23, "output_tokens": 7,
+                    "cache_creation_input_tokens": 19, "cache_read_input_tokens": cached}})
+                result = parse_claude(out, None)
+                self.assertTrue(result.ok, result.error)
+                # Fresh input, output and cache creation retain their full weight.
+                self.assertEqual(result.tokens, 100_049)
+
+    def test_codex_splits_fresh_and_cached_input(self):
+        out = json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 103, "cached_input_tokens": 89,
+            "output_tokens": 5, "reasoning_output_tokens": 7}})
+        result = parse_codex(0, out, "ok", None)
+        self.assertTrue(result.ok, result.error)
+        # 14 fresh + 8 weighted cached + 5 output + 7 reasoning.
+        self.assertEqual(result.tokens, 34)
+
+    def test_codex_cached_greater_than_input_is_clamped(self):
+        out = json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 103, "cached_input_tokens": 999,
+            "output_tokens": 5, "reasoning_output_tokens": 7}})
+        result = parse_codex(0, out, "ok", None)
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.tokens, 22)
+
+    def test_codex_negative_cached_counts_as_zero(self):
+        out = json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 103, "cached_input_tokens": -89,
+            "output_tokens": 5, "reasoning_output_tokens": 7}})
+        result = parse_codex(0, out, "ok", None)
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.tokens, 115)
+
+    def test_codex_missing_fields_count_as_zero(self):
+        cases = [
+            ({}, 0),
+            ({"input_tokens": 103}, 103),
+            ({"cached_input_tokens": 89}, 0),
+            ({"output_tokens": 5}, 5),
+            ({"reasoning_output_tokens": 7}, 7),
+            ({"input_tokens": 103, "cached_input_tokens": 89}, 22),
+        ]
+        for usage, expected in cases:
+            with self.subTest(usage=usage):
+                out = json.dumps({"type": "turn.completed", "usage": usage})
+                result = parse_codex(0, out, "ok", None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+
+    def test_no_cache_fields_preserves_plain_totals(self):
+        usage = {"input_tokens": 103, "output_tokens": 5}
+        claude = parse_claude(json.dumps({"is_error": False, "result": "ok", "usage": usage}), None)
+        codex = parse_codex(0, json.dumps({"type": "turn.completed", "usage": {
+            **usage, "reasoning_output_tokens": 7}}), "ok", None)
+        for provider, result, expected in (("claude", claude, 108), ("codex", codex, 115)):
+            with self.subTest(provider=provider):
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+
+
+class R46FailedRunMeteringTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cwd = Path(tmp.name)
+        self.projects_dir = self.cwd / "projects"
+        self.projects_dir.mkdir()
+        resolve = patch("core.agents._resolve", return_value=["fake-claude"])
+        resolve.start()
+        self.addCleanup(resolve.stop)
+        launcher = patch("core.agents.launch")
+        self.launch_mock = launcher.start()
+        self.addCleanup(launcher.stop)
+
+    def session_id(self, args):
+        from uuid import UUID
+        self.assertEqual(args.count("--session-id"), 1)
+        index = args.index("--session-id")
+        self.assertLess(index + 1, len(args))
+        session_id = args[index + 1]
+        self.assertEqual(UUID(session_id).version, 4)
+        return session_id
+
+    def write_log(self, session_id, rows, folder="arbitrary-project"):
+        directory = self.projects_dir / folder
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / (session_id + ".jsonl")
+        path.write_text("\n".join(row if isinstance(row, str) else json.dumps(row)
+                                  for row in rows) + "\n", encoding="utf-8")
+        return path
+
+    def usage_rows(self):
+        first = {"type": "assistant", "message": {"id": "msg-first", "usage": {
+            "input_tokens": 23, "output_tokens": 7,
+            "cache_creation_input_tokens": 19, "cache_read_input_tokens": 1009}}}
+        second = {"type": "assistant", "message": {"id": "msg-second", "usage": {
+            "input_tokens": "5", "output_tokens": 2,
+            "cache_creation_input_tokens": 3, "cache_read_input_tokens": 29}}}
+        return [first, first, "{broken JSON", {},
+                {"message": {"id": "no-usage"}},
+                {"message": {"usage": {"input_tokens": 99999}}},
+                {"message": {"id": "bad-values", "usage": {
+                    "input_tokens": "unknown", "output_tokens": -500,
+                    "cache_creation_input_tokens": -100, "cache_read_input_tokens": "bad"}}},
+                second, first, second]
+
+    def test_every_run_has_a_fresh_uuid4_session_id(self):
+        self.launch_mock.return_value = (0, '{"result":"ok","usage":{}}', "")
+        agent = ClaudeAgent()
+        for _ in range(3):
+            self.assertTrue(agent.run("hello", self.cwd).ok)
+        self.assertEqual(self.launch_mock.call_count, 3)
+        ids = [self.session_id(call.args[0]) for call in self.launch_mock.call_args_list]
+        self.assertEqual(len(set(ids)), 3)
+
+    def test_timeout_recovers_weighted_deduplicated_log_usage(self):
+        error = "agent timed out after 17s"
+
+        def timeout(args, cwd, stdin_text, timeout_s):
+            self.write_log(self.session_id(args), self.usage_rows())
+            raise TimeoutError(error)
+
+        self.launch_mock.side_effect = timeout
+        result = ClaudeAgent(timeout_s=17, projects_dir=self.projects_dir).run("hello", self.cwd)
+        self.launch_mock.assert_called_once()
+        self.assertFalse(result.ok)
+        self.assertIn("timed out", result.error)
+        self.assertEqual(result.error, error)
+        # Per message: (23 + 7 + 19 + 100) + (5 + 2 + 3 + 2).
+        self.assertEqual(result.tokens, 161)
+
+    def test_unreadable_output_recovers_log_usage_and_preserves_error(self):
+        stdout = "garbage stdout: interrupted before the result"
+
+        def unreadable(args, cwd, stdin_text, timeout_s):
+            self.write_log(self.session_id(args), self.usage_rows())
+            return 1, stdout, ""
+
+        self.launch_mock.side_effect = unreadable
+        result = ClaudeAgent(projects_dir=self.projects_dir).run("hello", self.cwd)
+        self.launch_mock.assert_called_once()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, parse_claude(stdout, None).error)
+        self.assertEqual(result.tokens, 161)
+
+    def test_success_uses_parse_claude_without_reading_log(self):
+        from unittest.mock import patch
+        for usage, expected in (({"input_tokens": 11, "output_tokens": 4,
+                                 "cache_creation_input_tokens": 2,
+                                 "cache_read_input_tokens": 39}, 20), ({}, 0)):
+            with self.subTest(usage=usage):
+                stdout = json.dumps({"is_error": False, "result": "done", "usage": usage})
+
+                def success(args, cwd, stdin_text, timeout_s):
+                    self.write_log(self.session_id(args), self.usage_rows())
+                    return 0, stdout, ""
+
+                self.launch_mock.side_effect = success
+                agent = ClaudeAgent(projects_dir=self.projects_dir)
+                with patch("core.agents.claude_log_tokens") as log_reader:
+                    result = agent.run("hello", self.cwd)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.tokens, expected)
+                self.assertEqual(result, parse_claude(stdout, None))
+                log_reader.assert_not_called()
+
+    def test_timeout_without_log_returns_zero_tokens(self):
+        self.launch_mock.side_effect = TimeoutError("agent timed out after 17s")
+        result = ClaudeAgent(projects_dir=self.projects_dir).run("hello", self.cwd)
+        self.launch_mock.assert_called_once()
+        self.session_id(self.launch_mock.call_args.args[0])
+        self.assertFalse(result.ok)
+        self.assertIn("timed out", result.error)
+        self.assertEqual(result.tokens, 0)
+
+    def test_log_reader_finds_session_in_any_project_folder(self):
+        from core import agents
+        from uuid import uuid4
+        for folder in ("unrelated-project", "another project", "-C-work-repo"):
+            with self.subTest(folder=folder):
+                session_id = str(uuid4())
+                self.write_log(session_id, self.usage_rows(), folder)
+                self.assertEqual(agents.claude_log_tokens(session_id, self.projects_dir), 161)
+
+    def malformed_log_rows(self):
+        return [
+            ("list-id", {"message": {"id": ["bad-id"], "usage": {"input_tokens": 10}}}),
+            ("dict-id", {"message": {"id": {"bad": "id"}, "usage": {"input_tokens": 10}}}),
+            ("number-id", {"message": {"id": 42, "usage": {"input_tokens": 10}}}),
+            ("list-record", ["bad-record"]),
+            ("string-record", "bad-record"),
+            ("list-message", {"message": ["bad-message"]}),
+            ("string-message", {"message": "bad-message"}),
+            ("number-message", {"message": 42}),
+            ("null-message", {"message": None}),
+        ]
+
+    def test_log_reader_skips_malformed_records_and_counts_valid_records(self):
+        from core import agents
+        from uuid import uuid4
+        for name, malformed in self.malformed_log_rows():
+            with self.subTest(record=name):
+                session_id = str(uuid4())
+                rows = self.usage_rows()
+                # Encode explicitly so a string record is valid JSON, not a broken line.
+                rows.insert(1, json.dumps(malformed))
+                self.write_log(session_id, rows)
+                self.assertEqual(agents.claude_log_tokens(session_id, self.projects_dir), 161)
+
+    def test_timeout_with_malformed_records_returns_failed_result_and_valid_tokens(self):
+        for name, malformed in self.malformed_log_rows():
+            with self.subTest(record=name):
+                def timeout(args, cwd, stdin_text, timeout_s):
+                    rows = self.usage_rows()
+                    rows.insert(1, json.dumps(malformed))
+                    self.write_log(self.session_id(args), rows)
+                    raise TimeoutError("agent timed out after 17s")
+
+                self.launch_mock.side_effect = timeout
+                result = ClaudeAgent(projects_dir=self.projects_dir).run("hello", self.cwd)
+                self.assertIsInstance(result, AgentResult)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.error, "agent timed out after 17s")
+                self.assertEqual(result.provider, "claude")
+                self.assertEqual(result.tokens, 161)
+
+    def test_unicode_numeric_text_counts_as_zero(self):
+        from core.agents import _n
+        for value, expected in (("\u00b2", 0), ("\u216b", 0), ("\u00bd", 0), ("12", 12)):
+            with self.subTest(value=value):
+                self.assertEqual(_n(value), expected)
+
+    def test_timeout_with_unicode_usage_preserves_valid_tokens(self):
+        for value in ("\u00b2", "\u216b", "\u00bd"):
+            with self.subTest(value=value):
+                def timeout(args, cwd, stdin_text, timeout_s):
+                    rows = self.usage_rows()
+                    rows.insert(1, {"type": "assistant", "message": {
+                        "id": "unicode-usage", "usage": {
+                            "input_tokens": value, "output_tokens": 4}}})
+                    self.write_log(self.session_id(args), rows)
+                    raise TimeoutError("agent timed out after 17s")
+
+                self.launch_mock.side_effect = timeout
+                result = ClaudeAgent(projects_dir=self.projects_dir).run("hello", self.cwd)
+                self.assertIsInstance(result, AgentResult)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.error, "agent timed out after 17s")
+                self.assertEqual(result.provider, "claude")
+                # Both valid messages (161), plus valid output in the bad-usage record.
+                self.assertEqual(result.tokens, 165)
+
+    def test_parse_claude_with_unicode_usage_preserves_valid_tokens(self):
+        for value in ("\u00b2", "\u216b", "\u00bd"):
+            with self.subTest(value=value):
+                out = json.dumps({"is_error": False, "result": "ok", "usage": {
+                    "input_tokens": value, "output_tokens": 7,
+                    "cache_creation_input_tokens": 19, "cache_read_input_tokens": 1009}})
+                result = parse_claude(out, None)
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual((result.text, result.provider, result.tokens), ("ok", "claude", 126))
+
+    def test_log_reader_unknown_session_returns_zero(self):
+        from core import agents
+        from uuid import uuid4
+        self.write_log(str(uuid4()), self.usage_rows())
+        self.assertEqual(agents.claude_log_tokens(str(uuid4()), self.projects_dir), 0)
+
 
 class AdapterTests(unittest.TestCase):
     def test_missing_cli_is_failed_result(self):

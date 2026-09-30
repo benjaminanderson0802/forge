@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -186,6 +187,27 @@ def _finish(provider: str, text: str, tokens: int, schema: dict | None) -> Agent
     return AgentResult(text, tokens, True, None, data, provider)
 
 
+def _n(v) -> int:
+    """R43: a usage field as a count. Anything that can't be read as a finite non-negative number (numbers and
+    numeric strings can) counts as 0, so a bad, negative or infinite field can never cancel out real usage."""
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, int):  # exact, any size
+        return v if v > 0 else 0
+    if isinstance(v, str) and v.strip().isdecimal():  # isdecimal: "²" is a digit but not a number
+        try:
+            return int(v.strip())
+        except ValueError:
+            return 0
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if f != f or f in (float("inf"), float("-inf")) or f <= 0:
+        return 0
+    return int(f)
+
+
 def parse_claude(out: str, schema: dict | None) -> AgentResult:
     try:
         data = json.loads(out.strip().splitlines()[-1]) if out.strip() else None
@@ -194,8 +216,8 @@ def parse_claude(out: str, schema: dict | None) -> AgentResult:
     if not isinstance(data, dict):
         return AgentResult(out[-500:], 0, False, "unreadable output from Claude Code", None, "claude")
     u = data.get("usage") or {}
-    tokens = sum(int(u.get(k) or 0) for k in
-                 ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    tokens = sum(_n(u.get(k)) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens")) \
+        + _n(u.get("cache_read_input_tokens")) // 10  # R43: cache reads cost about a tenth
     text = str(data.get("result") or "")
     if data.get("is_error"):
         return AgentResult(text, tokens, False, text or "Claude Code reported an error", None, "claude")
@@ -211,7 +233,9 @@ def parse_codex(code: int, events_out: str, last_message: str, schema: dict | No
             continue
         if ev.get("type") == "turn.completed":
             u = ev.get("usage") or {}
-            tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "output_tokens", "reasoning_output_tokens"))
+            inp = _n(u.get("input_tokens"))
+            cached = min(_n(u.get("cached_input_tokens")), inp)  # R43: clamped to 0..input
+            tokens = (inp - cached) + cached // 10 + _n(u.get("output_tokens")) + _n(u.get("reasoning_output_tokens"))
             done = True
     if code != 0 or not done or not last_message.strip():
         why = _codex_error(events_out)
@@ -220,19 +244,47 @@ def parse_codex(code: int, events_out: str, last_message: str, schema: dict | No
     return _finish("codex", last_message.strip(), tokens, schema)
 
 
+def claude_log_tokens(session_id: str, projects_dir: Path) -> int:
+    """R46: a Claude run's use, read from Claude Code's session log (R43 weighting, each message id once)."""
+    seen, total = set(), 0
+    for f in Path(projects_dir).glob(f"*/{session_id}.jsonl"):
+        try:
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            m = e.get("message") if isinstance(e, dict) else None
+            if not isinstance(m, dict):
+                continue
+            mid, u = m.get("id"), m.get("usage")
+            if not isinstance(mid, str) or not mid or not isinstance(u, dict) or mid in seen:
+                continue
+            seen.add(mid)
+            total += sum(_n(u.get(k)) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens")) \
+                + _n(u.get("cache_read_input_tokens")) // 10
+    return total
+
+
 class ClaudeAgent:
     provider = "claude"  # R6/R29: the id the Meter and the token caps use
 
     def __init__(self, timeout_s: int = 1800, permission_mode: str = "acceptEdits",
-                 allowed_tools: list[str] | None = None, cmd: list[str] | None = None):
+                 allowed_tools: list[str] | None = None, cmd: list[str] | None = None,
+                 projects_dir: Path | None = None):
         self.timeout_s, self.permission_mode, self.allowed_tools = timeout_s, permission_mode, allowed_tools
         self.cmd = cmd or ["claude"]
+        self.projects_dir = Path(projects_dir) if projects_dir else Path.home() / ".claude" / "projects"  # R46
 
     def run(self, prompt: str, cwd: Path, schema: dict | None = None) -> AgentResult:
         base = _resolve(self.cmd)
         if not base:
             return AgentResult("", 0, False, f"agent command not found: {self.cmd[0]}", None, "claude")
-        args = base + ["-p", "--output-format", "json", "--permission-mode", self.permission_mode]
+        sid = str(uuid.uuid4())  # R46: known up front, so a failed run can still be metered from its log
+        args = base + ["-p", "--output-format", "json", "--permission-mode", self.permission_mode, "--session-id", sid]
         if self.allowed_tools:
             args += ["--allowedTools", ",".join(self.allowed_tools)]
         if schema:
@@ -240,8 +292,11 @@ class ClaudeAgent:
         try:
             _, out, _ = launch(args, cwd, prompt, self.timeout_s)
         except TimeoutError as e:
-            return AgentResult("", 0, False, str(e), None, "claude")
-        return parse_claude(out, schema)
+            return AgentResult("", claude_log_tokens(sid, self.projects_dir), False, str(e), None, "claude")
+        r = parse_claude(out, schema)
+        if not r.ok and not r.tokens:  # R46: unreadable output still costs what the log says
+            r.tokens = claude_log_tokens(sid, self.projects_dir)
+        return r
 
 
 class CodexAgent:

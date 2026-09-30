@@ -38,3 +38,8 @@ jobs:
       - name: Acceptance tests
         run: |
           if ls tests/acceptance/test_*.py >/dev/null 2>&1; then python -m unittest discover -s tests/acceptance -v; else echo "no acceptance tests yet"; fi
+      - name: Core unit tests
+        run: |
+          git config --global user.name "forge-ci"
+          git config --global user.email "forge-ci@localhost"
+          python -m unittest discover -s tests/core

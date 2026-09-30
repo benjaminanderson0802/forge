@@ -1338,7 +1338,7 @@ class R37PerLaunchCapTests(Harness):
         def planner(prompt, cwd):
             (cwd / "plan.md").write_text("Implement feature value 42 with acceptance tests.\n", encoding="utf-8")
             c.meter.add("codex", self.cap + 1)
-            return json.dumps({"tasks": [self.task(id="T2")]}), 1
+            return json.dumps({"tasks": [self.task(id="T2", section="Implement the feature module in feat.py and expose a public module-level VALUE constant set to the integer 42. Consumers must be able to import feat and read feat.VALUE without calling an initializer or providing configuration. Importing the module must be deterministic and must not print output, read environment variables, write files, or make network requests. Keep the implementation independent of the current working directory and ensure repeated imports preserve the same value and type. Add acceptance coverage in tests/core/test_feat.py that imports the module, verifies VALUE equals 42, and checks that it is an integer rather than a string or boolean. Cover a fresh import and a repeated import so accidental initialization side effects are caught. Acceptance is complete when the scoped unittest command passes and the module exposes the documented interface without additional dependencies.")]}), 1
 
         c = self.capped_conductor(self.task(kind="plan", plan_file="plan.md"), agents={"planner": planner})
         before = c._task("T1")
@@ -1684,3 +1684,726 @@ class R40PausedRunTests(Harness):
             self.assertEqual(bootstrap.main(["run"]), 0)
         self.assertEqual(len(observed), 2, "main must maintain a heartbeat while paused")
         self.assert_no_work()
+
+
+class R41CompletePlanTests(Harness):
+    def plan_task(self):
+        return {"id": "P1", "kind": "plan", "title": "Plan", "section": "Plan",
+                "plan_file": "plan.md", "status": "todo"}
+
+    def plan_writer(self, children):
+        def planner(prompt, cwd):
+            (cwd / "plan.md").write_text(
+                "# Implementation plan\n" + "\n".join(child["section"] for child in children),
+                encoding="utf-8")
+            return json.dumps({"tasks": children}), 1
+        return planner
+
+    def test_R41_planner_prompt_requires_complete_sections_and_minimum_is_600(self):
+        """R41: the planner is told sections are the agents' only complete instructions."""
+        c = self.init(self.plan_task(), agents={
+            "planner": self.plan_writer([self.task(section="x" * 600)]),
+        })
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(c.team.planner.prompts), 1)
+        prompt = " ".join(c.team.planner.prompts[0].lower().split())
+        with self.subTest(check="only instructions"):
+            self.assertRegex(prompt, r"section.{0,160}only (?:\w+ ){0,3}instructions?\b")
+        for phrase in ("complete", "files_in_scope", "test writer", "builder"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, prompt)
+        with self.subTest(check="minimum section length"):
+            self.assertEqual(getattr(bootstrap, "MIN_SECTION_CHARS", None), 600)
+
+    def test_R41_thin_section_rejected_before_review_and_plan_reset(self):
+        """R41: a 100-character child section is rejected by code and its plan discarded."""
+        child = self.task(id="THIN_CHILD", section="x" * 100)
+        c = self.init(self.plan_task(), agents={"planner": self.plan_writer([child])})
+        self.assertEqual(c.step(), "worked")
+        with self.subTest(check="review never launched"):
+            self.assertEqual(c.team.reviewer.prompts, [])
+        with self.subTest(check="rejection identifies thin child section"):
+            notes = c._task("P1")["notes"]
+            self.assertTrue(any(
+                child["id"] in note and "section" in note.lower()
+                and ("thin" in note.lower() or "short" in note.lower())
+                for note in notes), notes)
+        with self.subTest(check="no child queued"):
+            self.assertEqual([task["id"] for task in c._queue()["tasks"]], ["P1"])
+            self.assertEqual(c._task("P1")["status"], "todo")
+        with self.subTest(check="plan change reset"):
+            self.assertFalse((c.wt / "plan.md").exists())
+            self.assertNotIn("plan.md", self.branch_files())
+            self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+
+    def test_R41_complete_sections_reach_review_and_children_are_queued(self):
+        """R41: sections at and above 600 characters reach review and pass into the queue."""
+        children = [self.task(id="T1", section="x" * 600),
+                    self.task(id="T2", section="y" * 700)]
+        c = self.init(self.plan_task(), agents={"planner": self.plan_writer(children)})
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(c.team.reviewer.prompts), 1)
+        self.assertEqual(c._task("P1")["status"], "done")
+        self.assertEqual(c._task("P1")["notes"], [])
+        self.assertEqual([task["id"] for task in c._queue()["tasks"]], ["P1", "T1", "T2"])
+        for child in children:
+            with self.subTest(child=child["id"]):
+                queued = c._task(child["id"])
+                self.assertEqual(queued["status"], "todo")
+                self.assertEqual(queued["kind"], "build")
+                self.assertEqual(queued["section"], child["section"])
+        self.assertIn("plan.md", self.branch_files())
+
+    def test_R41_retry_prompt_contains_first_thin_plan_rejection(self):
+        """R41: the second planner attempt sees the actual first thin-section rejection."""
+        attempts = []
+
+        def planner(prompt, cwd):
+            attempts.append(prompt)
+            child = self.task(id="RETRY_CHILD", section="x" * (100 if len(attempts) == 1 else 600))
+            return self.plan_writer([child])(prompt, cwd)
+
+        c = self.init(self.plan_task(), agents={"planner": planner})
+        self.assertEqual(c.step(), "worked")
+        notes = c._task("P1")["notes"]
+        self.assertTrue(notes, "the thin first plan must produce a rejection reason")
+        reason = notes[-1]
+        self.assertIn("RETRY_CHILD", reason)
+        self.assertIn("section", reason.lower())
+        self.assertRegex(reason.lower(), r"thin|short")
+        self.assertEqual(c.team.reviewer.prompts, [])
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(attempts), 2)
+        self.assertIn(reason, attempts[1])
+        self.assertEqual(len(c.team.reviewer.prompts), 1)
+        self.assertEqual(c._task("P1")["status"], "done")
+        self.assertEqual(c._task("RETRY_CHILD")["status"], "todo")
+
+
+class R42StopDuringRunTests(Harness):
+    def assert_no_stop_alert(self, c):
+        self.assertEqual(c._read("questions.json", {}), {})
+        self.assertEqual(self.mails, [])
+        self.assertNotIn("halt", c._read("notices.json", {}))
+
+    def assert_call_stopped(self, flags):
+        def stop(prompt, cwd):
+            for flag in flags:
+                (self.state / flag).write_text("owner requested stop\n", encoding="utf-8")
+            return '{"files":[]}', 17
+
+        c = self.make_conductor(agents={"test_writer": stop})
+        c.meter.add("codex", 3)
+        caught = None
+        try:
+            c._call("test_writer", "Stop during this run", bootstrap.S_TESTS, cwd=self.work)
+        except Exception as exc:
+            caught = exc
+        self.assertEqual(len(c.team.test_writer.prompts), 1)
+        with self.subTest(check="Stopped exception and Capped inheritance"):
+            stopped = getattr(bootstrap, "Stopped", None)
+            self.assertIsNotNone(stopped, "core.bootstrap must expose Stopped")
+            self.assertTrue(issubclass(stopped, bootstrap.Capped))
+            self.assertIsInstance(caught, stopped)
+        with self.subTest(check="tokens still metered"):
+            self.assertEqual(c.meter.used_today("codex"), 20)
+        with self.subTest(check="no tamper or halt alert"):
+            self.assert_no_stop_alert(c)
+        with self.subTest(check="stop logged with role and run id"):
+            # Layer 1B: the launch gate's readiness probes (probe-<name>) also leave run records; only the
+            # test writer's own run is the one this check is about.
+            runs = [r for r in (self.state / "runs").iterdir() if not r.name.split("-", 1)[1].startswith("probe-")]
+            self.assertEqual(len(runs), 1)
+            self.assertIn(f"stop requested during test_writer run {runs[0].name}",
+                          (self.state / "errors.log").read_text(encoding="utf-8"))
+        for flag in flags:
+            with self.subTest(flag=flag):
+                self.assertEqual((self.state / flag).read_text(encoding="utf-8"),
+                                 "owner requested stop\n")
+
+    def test_R42_call_kill_appearing_is_metered_stop(self):
+        """R42: Stop Forge during an agent run is metered and raises Stopped without mail."""
+        self.assert_call_stopped(("KILL",))
+
+    def test_R42_call_paused_appearing_is_metered_stop(self):
+        """R42: a new PAUSED alone has the same stop semantics as KILL."""
+        self.assert_call_stopped(("PAUSED",))
+
+    def test_R42_call_both_stop_flags_appearing_is_stop(self):
+        """R42: both flags may appear together without being mistaken for tampering."""
+        self.assert_call_stopped(("KILL", "PAUSED"))
+
+    def assert_writer_stop(self, flags, expected):
+        def writer(prompt, cwd):
+            answer = self.write_tests(prompt, cwd)
+            (cwd / "README.md").write_text("unfinished edit\n", encoding="utf-8")
+            for flag in flags:
+                (self.state / flag).touch()
+            return answer
+
+        c = self.init(agents={"test_writer": writer})
+        before = c._task("T1")
+        result = c.step()
+        self.assertEqual(len(c.team.test_writer.prompts), 1)
+        with self.subTest(check="step result"):
+            self.assertEqual(result, expected)
+        with self.subTest(check="todo task unchanged, no failure notes or signatures"):
+            self.assertEqual(c._task("T1"), before)
+            self.assertEqual(c._task("T1")["status"], "todo")
+        with self.subTest(check="worktree reset"):
+            self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+            self.assertFalse((c.wt / "tests/core/test_feat.py").exists())
+            self.assertEqual((c.wt / "README.md").read_text(encoding="utf-8"), "initial\n")
+        with self.subTest(check="no alert"):
+            self.assert_no_stop_alert(c)
+        self.assertEqual(c.team.builder.prompts, [])
+
+    def test_R42_step_writer_killed_resets_without_failure(self):
+        """R42: a stopped test writer leaves a clean worktree and the original todo task."""
+        self.assert_writer_stop(("KILL",), "killed")
+
+    def test_R42_step_writer_paused_resets_without_failure(self):
+        """R42: a paused test writer returns paused and discards its edits."""
+        self.assert_writer_stop(("PAUSED",), "paused")
+
+    def test_R42_step_kill_takes_precedence_over_pause(self):
+        """R42: simultaneous stop flags return killed rather than paused or capped."""
+        self.assert_writer_stop(("KILL", "PAUSED"), "killed")
+
+    def test_R42_step_builder_killed_releases_claim_without_failure(self):
+        """R42: a stopped builder releases its claim and restores the acceptance-tests commit."""
+        def builder(prompt, cwd):
+            self.assertEqual(c._ledger().contracts()["T1"]["status"], "claimed")
+            answer = self.build_feature(prompt, cwd)
+            (cwd / "README.md").write_text("unfinished edit\n", encoding="utf-8")
+            (self.state / "KILL").touch()
+            return answer
+
+        c = self.init(agents={"test_writer": self.write_tests, "builder": builder})
+        self.assertEqual(c.step(), "worked")
+        before = c._task("T1")
+        tests_commit = before["tests_commit"]
+        result = c.step()
+        self.assertEqual(len(c.team.builder.prompts), 1)
+        with self.subTest(check="killed result"):
+            self.assertEqual(result, "killed")
+        with self.subTest(check="claim released, not failed"):
+            self.assertEqual(c._ledger().contracts()["T1"]["status"], "open")
+        with self.subTest(check="no failure note, signature, or counter change"):
+            self.assertEqual(c._task("T1"), before)
+            self.assertEqual(c._task("T1")["status"], "tests_ok")
+        with self.subTest(check="tests commit restored"):
+            self.assertEqual(bootstrap._git(c.wt, "rev-parse", "HEAD"), tests_commit)
+            self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+            self.assertTrue((c.wt / "tests/core/test_feat.py").is_file())
+            self.assertFalse((c.wt / "feat.py").exists())
+        with self.subTest(check="no alert"):
+            self.assert_no_stop_alert(c)
+        self.assertEqual(c.team.reviewer.prompts, [])
+        self.assertEqual(c.team.troubleshooter.prompts, [])
+
+    def test_R42_step_troubleshooter_killed_resets_and_keeps_pending(self):
+        """R42/R38: a stopped troubleshooter discards edits and keeps diagnosis pending."""
+        def troubleshoot(prompt, cwd):
+            (cwd / "troubleshooter-stray.txt").write_text("unfinished edit\n", encoding="utf-8")
+            (self.state / "KILL").write_text("owner requested stop\n", encoding="utf-8")
+            return '{"kind":"fix","notes":"discard this stopped result"}', 1
+
+        c = self.init(agents={
+            "test_writer": self.write_tests,
+            "builder": lambda prompt, cwd: ('{"status":"done"}', 1),
+            "troubleshooter": troubleshoot,
+        })
+        failure_output = "Ran 1 test\nFAILED: feat.VALUE is missing"
+        with patch.object(c, "_run_tests", return_value=(1, failure_output, False)):
+            self.assertEqual(c.step(), "worked")  # Acceptance tests.
+            self.assertEqual(c._task("T1")["status"], "tests_ok")
+            self.assertEqual(c.step(), "worked")  # First builder failure.
+            self.assertEqual(c._task("T1")["fails_since"], 1)
+            result = c.step()  # Second failure launches the troubleshooter.
+
+        self.assertEqual(len(c.team.builder.prompts), 2)
+        self.assertEqual(len(c.team.troubleshooter.prompts), 1)
+        with self.subTest(check="killed result"):
+            self.assertEqual(result, "killed")
+        with self.subTest(check="stray file removed"):
+            self.assertFalse((c.wt / "troubleshooter-stray.txt").exists())
+        with self.subTest(check="worktree clean"):
+            self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+        with self.subTest(check="troubleshooting still pending"):
+            self.assertEqual(c._task("T1").get("troubleshoot_pending"), {
+                "reason": "judge failed: task tests", "output": failure_output,
+            })
+        with self.subTest(check="no tamper question or alert"):
+            self.assert_no_stop_alert(c)
+
+    def test_R42_troubleshooter_tampering_does_not_reset_worktree(self):
+        """R42: tampered queue state cannot authorize a worktree reset or clean."""
+        def troubleshoot(prompt, cwd):
+            queue = json.loads((self.state / "queue.json").read_text(encoding="utf-8"))
+            queue["tasks"][0]["title"] = "tampered task title"
+            (self.state / "queue.json").write_text(json.dumps(queue), encoding="utf-8")
+            # Layer 1B runs the troubleshooter in a throwaway tree (cwd), so the edit is made in the layer
+            # worktree itself: that is the tree a reset or clean after tampering would wrongly touch.
+            (wt / "troubleshooter-stray.txt").write_text("retain this edit\n", encoding="utf-8")
+            return '{"kind":"fix","notes":"untrusted result"}', 1
+
+        c = self.init(agents={"troubleshooter": troubleshoot})
+        c._ensure_worktree(self.layer)
+        wt = c.wt  # Capture the trusted path before the queue is tampered with.
+        with self.assertRaises(bootstrap.Tampered):
+            c._troubleshoot("T1", "judge failed: task tests", "FAILED")
+        self.assertEqual(len(c.team.troubleshooter.prompts), 1)
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertTrue((wt / "troubleshooter-stray.txt").is_file(),
+                        "tampering must not trigger reset or clean after the agent run")
+
+    def assert_drift_keeper_stop(self, flag, expected):
+        def drift_keeper(prompt, cwd):
+            (cwd / "drift-stray.txt").write_text("unfinished edit\n", encoding="utf-8")
+            (self.state / flag).write_text("owner requested stop\n", encoding="utf-8")
+            return '{"status":"ok"}', 1
+
+        c = self.init(agents={"drift_keeper": drift_keeper})
+        c._ensure_worktree(self.layer)
+        queue = c._queue()
+        queue["drift_due"] = True
+        c._save_queue(queue)
+        result = c.step()
+        self.assertEqual(len(c.team.drift_keeper.prompts), 1)
+        with self.subTest(check="step result"):
+            self.assertEqual(result, expected)
+        with self.subTest(check="drift still due"):
+            self.assertIs(c._queue().get("drift_due"), True)
+        with self.subTest(check="worktree clean"):
+            self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+            self.assertFalse((c.wt / "drift-stray.txt").exists())
+
+    def test_R42_step_drift_keeper_killed_resets_and_keeps_due(self):
+        """R42: a killed drift keeper discards edits and leaves the check due."""
+        self.assert_drift_keeper_stop("KILL", "killed")
+
+    def test_R42_step_drift_keeper_paused_resets_and_keeps_due(self):
+        """R42: a paused drift keeper discards edits and leaves the check due."""
+        self.assert_drift_keeper_stop("PAUSED", "paused")
+
+    def test_R42_kill_plus_other_state_change_is_tampering(self):
+        """R42: a new KILL cannot hide a simultaneous change to another state file."""
+        def tamper(prompt, cwd):
+            (self.state / "KILL").touch()
+            (self.state / "queue.json").write_text('{}', encoding="utf-8")
+            return '{"files":[]}', 1
+
+        c = self.init(agents={"test_writer": tamper})
+        with self.assertRaises(bootstrap.Tampered):
+            c._call("test_writer", "Tamper while stopping", bootstrap.S_TESTS, cwd=self.work)
+        self.assertTrue((self.state / "KILL").exists())
+        questions = c._read("questions.json", {})
+        self.assertTrue(any(q["kind"] == "tamper" and q.get("halt") for q in questions.values()))
+
+    def assert_existing_flag_tampered(self, flag, remove):
+        path = self.state / flag
+
+        def tamper(prompt, cwd):
+            if remove:
+                path.unlink()
+            else:
+                path.write_text("changed stop reason\n", encoding="utf-8")
+            return '{"files":[]}', 1
+
+        c = self.make_conductor(agents={"test_writer": tamper})
+        c._refresh_readiness()  # Layer 1B: usable evidence first; no probe runs while a stop flag is set
+        path.write_text("original stop reason\n", encoding="utf-8")
+        # Call directly: step() must never launch an agent with an existing stop flag.
+        with self.assertRaises(bootstrap.Tampered):
+            c._call("test_writer", "Cannot un-stop Forge", bootstrap.S_TESTS, cwd=self.work)
+        self.assertEqual(len(c.team.test_writer.prompts), 1)
+        self.assertTrue((self.state / "KILL").exists())
+
+    def test_R42_existing_paused_removed_is_tampering(self):
+        self.assert_existing_flag_tampered("PAUSED", remove=True)
+
+    def test_R42_existing_kill_removed_is_tampering(self):
+        self.assert_existing_flag_tampered("KILL", remove=True)
+
+    def test_R42_existing_paused_content_changed_is_tampering(self):
+        self.assert_existing_flag_tampered("PAUSED", remove=False)
+
+    def test_R42_existing_kill_content_changed_is_tampering(self):
+        self.assert_existing_flag_tampered("KILL", remove=False)
+
+    def test_R42_guarded_smoke_reports_stop_without_success_stamp(self):
+        """R42: stopping a smoke agent reports a stop, never a token cap or success."""
+        c = self.make_conductor()
+        team, calls = SmokeTests.smoke_team(self)
+        writer = team.test_writer.script
+
+        def stop(prompt, cwd):
+            answer = writer(prompt, cwd)
+            (self.state / "KILL").touch()
+            return answer
+
+        team.test_writer = FakeAgent(stop, provider="codex")
+        c.team = team
+        c._write("smoke_ok.json", {"at": c.clock().isoformat()})
+        problems = bootstrap._guarded_smoke(c, self.work, force=True)
+        with self.subTest(check="stop problem"):
+            self.assertTrue(any("stopped during the smoke test" in p.lower() for p in problems), problems)
+            self.assertFalse(any("token cap reached" in p.lower() for p in problems), problems)
+        with self.subTest(check="no success stamp"):
+            self.assertFalse((self.state / "smoke_ok.json").exists())
+        with self.subTest(check="no later smoke roles"):
+            self.assertEqual([role for role, cwd in calls], ["test_writer"])
+        with self.subTest(check="no alert"):
+            self.assert_no_stop_alert(c)
+
+
+class R44PlanReviewNotesTests(Harness):
+    def plan_task(self):
+        return {"id": "P1", "kind": "plan", "title": "Plan", "section": "Plan",
+                "plan_file": "plan.md", "status": "todo"}
+
+    def review_plan(self, answer, children=None):
+        children = children or [self.task(id="T1", section="x" * 600),
+                                self.task(id="T2", section="y" * 700)]
+
+        def planner(prompt, cwd):
+            (cwd / "plan.md").write_text(
+                "# Implementation plan\n" + "\n".join(child["section"] for child in children),
+                encoding="utf-8")
+            return json.dumps({"tasks": children}), 1
+
+        c = self.init(self.plan_task(), agents={
+            "planner": planner,
+            "reviewer": lambda prompt, cwd: (json.dumps(answer), 1),
+        })
+        with patch.object(c.team.reviewer, "run", wraps=c.team.reviewer.run) as review:
+            self.assertEqual(c.step(), "worked")
+        self.assertEqual(review.call_count, 1)
+        return c, children, review.call_args.args[2]
+
+    def test_R44_plan_review_schema(self):
+        schema = getattr(bootstrap, "S_PLAN_REVIEW", None)
+        self.assertIsNotNone(schema, "R44 requires a separate S_PLAN_REVIEW schema")
+        self.assertEqual(schema["type"], "object")
+        self.assertEqual(set(schema["required"]), {"verdict", "reasons"})
+        props = schema["properties"]
+        self.assertEqual(props["verdict"]["type"], "string")
+        self.assertEqual(set(props["verdict"]["enum"]), {"pass", "fail"})
+        self.assertEqual(props["reasons"], {"type": "array", "items": {"type": "string"}})
+        self.assertEqual(props["task_notes"]["type"], "array")
+        item = props["task_notes"]["items"]
+        self.assertEqual(item["type"], "object")
+        self.assertEqual(set(item["required"]), {"task", "note"})
+        for field in ("task", "note"):
+            self.assertEqual(item["properties"][field]["type"], "string")
+        self.assertNotIn("task_notes", bootstrap.S_REVIEW["properties"])
+
+    def test_R44_reviewer_uses_plan_schema_and_blocking_only_prompt(self):
+        c, _, schema = self.review_plan({"verdict": "pass", "reasons": []})
+        prompt = " ".join(c.team.reviewer.prompts[0].split())
+        with self.subTest(check="blocking-only instruction"):
+            self.assertIn("ONLY for blocking problems", prompt)
+            self.assertIn("task_notes", prompt)
+        with self.subTest(check="schema passed to reviewer"):
+            self.assertIsNotNone(getattr(bootstrap, "S_PLAN_REVIEW", None))
+            self.assertEqual(schema, bootstrap.S_PLAN_REVIEW)
+
+    def test_R44_pass_routes_notes_and_commits_them_with_plan(self):
+        notes = [{"task": "T2", "note": "Test a missing input."},
+                 {"task": "T1", "note": "Check the empty result."},
+                 {"task": "T1", "note": "Test a repeated call."},
+                 {"task": "UNKNOWN", "note": "Keep error messages consistent."}]
+        c, children, _ = self.review_plan({"verdict": "pass", "reasons": [], "task_notes": notes})
+        with self.subTest(check="tasks advance"):
+            self.assertEqual(c._task("P1")["status"], "done")
+            self.assertEqual(c._task("P1")["notes"], [])
+            self.assertEqual([t["id"] for t in c._queue()["tasks"]], ["P1", "T1", "T2"])
+        for child, expected in zip(children, ([notes[1], notes[2]], [notes[0]])):
+            with self.subTest(child=child["id"]):
+                queued = c._task(child["id"])
+                self.assertEqual(queued["status"], "todo")
+                self.assertEqual(queued["kind"], "build")
+                self.assertTrue(queued["section"].startswith(child["section"]))
+                suffix = queued["section"][len(child["section"]):].strip()
+                self.assertTrue(suffix, "the child section must carry its reviewer notes")
+                self.assertEqual(suffix.splitlines()[0], "REVIEWER NOTES (handle and test these):")
+                self.assertIn("PLAN-WIDE REVIEWER NOTES:", suffix)
+                local, global_notes = suffix.split("PLAN-WIDE REVIEWER NOTES:")
+                self.assertEqual([line for line in local.splitlines() if line.startswith("- ")],
+                                 ["- " + n["note"] for n in expected])
+                self.assertEqual(global_notes.strip(), "- " + notes[3]["note"])
+        with self.subTest(check="same committed plan contains notes"):
+            committed = bootstrap._git(self.repo, "show", f"{self.layer}:plan.md")
+            self.assertIn("## Reviewer notes", committed)
+            original, reviewer_notes = committed.split("## Reviewer notes", 1)
+            self.assertEqual(original.strip(),
+                             "# Implementation plan\n" + "\n".join(t["section"] for t in children))
+            for note in notes:
+                self.assertIn(note["note"], reviewer_notes)
+            self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+            self.assertEqual(bootstrap._git(self.repo, "rev-list", "--count", f"main..{self.layer}"), "1")
+
+    def test_R44_empty_notes_are_dropped_without_changing_sections(self):
+        notes = [{"task": task, "note": note}
+                 for task in ("T1", "UNKNOWN") for note in ("", "   \t")]
+        c, children, _ = self.review_plan({"verdict": "pass", "reasons": [], "task_notes": notes})
+        self.assertEqual(c._task("P1")["status"], "done")
+        for child in children:
+            self.assertEqual(c._task(child["id"])["section"], child["section"])
+
+    def test_R44_notes_are_capped_and_first_ten_kept_per_task(self):
+        long_note = "L" * bootstrap.NOTE_CAP + "DISCARDED_TAIL"
+        notes = [{"task": "T1", "note": ""}, {"task": "T1", "note": long_note}]
+        notes += [{"task": "T1", "note": f"Check case {i:02d}."} for i in range(12)]
+        notes += [{"task": "T2", "note": "Keep this other task's note."}]
+        c, children, _ = self.review_plan({"verdict": "pass", "reasons": [], "task_notes": notes})
+        expected = [long_note[:bootstrap.NOTE_CAP]] + [f"Check case {i:02d}." for i in range(9)]
+        suffix = c._task("T1")["section"][len(children[0]["section"]):]
+        self.assertIn("REVIEWER NOTES (handle and test these):", suffix)
+        self.assertEqual([line[2:] for line in suffix.splitlines() if line.startswith("- ")], expected)
+        self.assertNotIn("DISCARDED_TAIL", suffix)
+        other = c._task("T2")["section"][len(children[1]["section"]):]
+        self.assertEqual([line[2:] for line in other.splitlines() if line.startswith("- ")],
+                         [notes[-1]["note"]])
+
+    def test_R44_first_ten_applicable_notes_include_early_plan_wide_note(self):
+        """R44: select the first ten applicable notes before grouping them by scope."""
+        wide = "Keep this early plan-wide note."
+        local = [f"Check T1 case {i:02d}." for i in range(1, 12)]
+        notes = [{"task": "UNKNOWN", "note": wide}]
+        notes += [{"task": "T1", "note": note} for note in local]
+        c, children, _ = self.review_plan({"verdict": "pass", "reasons": [], "task_notes": notes})
+        suffix = c._task("T1")["section"][len(children[0]["section"]):]
+        actual = [line[2:] for line in suffix.splitlines() if line.startswith("- ")]
+        self.assertCountEqual(actual, [wide] + local[:9])
+        self.assertNotIn(local[9], suffix)
+        self.assertNotIn(local[10], suffix)
+        other = c._task("T2")["section"][len(children[1]["section"]):]
+        self.assertEqual([line[2:] for line in other.splitlines() if line.startswith("- ")], [wide])
+
+    def test_R44_reviewer_sees_complete_plan_and_tasks_json(self):
+        """R44: neither the plan file nor tasks JSON may be silently truncated."""
+        children = [self.task(id="T1", section="x" * 70000),
+                    self.task(id="LAST_TASK", section="y" * 700 + "END_OF_LAST_SECTION")]
+        plan_text = "# Implementation plan\n" + "\n".join(t["section"] for t in children)
+        tasks_json = json.dumps(children)
+        self.assertGreater(len(plan_text), 60000)
+        self.assertGreater(len(tasks_json), 20000)
+        self.assertLess(len(plan_text) + len(tasks_json), 200000)
+        c, _, _ = self.review_plan({"verdict": "pass", "reasons": []}, children)
+        prompt = c.team.reviewer.prompts[0]
+        plan_prompt, tasks_prompt = prompt.split("\nPLAN:\n", 1)[1].split("\nTASKS JSON:\n", 1)
+        with self.subTest(check="complete plan file"):
+            self.assertTrue(plan_prompt == plan_text, "reviewer must receive the entire plan file")
+        with self.subTest(check="last task id"):
+            self.assertIn('"id": "LAST_TASK"', tasks_prompt[-2000:])
+        with self.subTest(check="end of last section"):
+            self.assertIn("END_OF_LAST_SECTION", tasks_prompt[-2000:])
+        with self.subTest(check="complete tasks JSON"):
+            self.assertTrue(tasks_prompt.startswith(tasks_json + "\n"),
+                            "reviewer must receive the entire tasks JSON")
+        self.assertEqual(c._task("P1")["status"], "done")
+
+    def test_R44_plan_review_max_is_200000(self):
+        self.assertEqual(getattr(bootstrap, "PLAN_REVIEW_MAX", None), 200000)
+
+    def test_R44_combined_oversize_plan_rejected_before_review(self):
+        """R44: individually smaller inputs exceeding the combined limit skip review."""
+        children = [self.task(section="x" * 110000)]
+        plan_text = "# Implementation plan\n" + children[0]["section"]
+        tasks_json = json.dumps(children)
+        self.assertLess(len(plan_text), 200000)
+        self.assertLess(len(tasks_json), 200000)
+        self.assertGreater(len(plan_text) + len(tasks_json), 200000)
+
+        def planner(prompt, cwd):
+            (cwd / "plan.md").write_text(plan_text, encoding="utf-8")
+            return json.dumps({"tasks": children}), 1
+
+        c = self.init(self.plan_task(), agents={"planner": planner})
+        with patch.object(c.team.reviewer, "run", wraps=c.team.reviewer.run) as review:
+            self.assertEqual(c.step(), "worked")
+        with self.subTest(check="no review"):
+            review.assert_not_called()
+        with self.subTest(check="rejection guidance"):
+            notes = c._task("P1")["notes"]
+            self.assertEqual(len(notes), 1)
+            self.assertTrue(notes[0].startswith("plan rejected: plan too large for review"), notes)
+            self.assertIn("split this plan task", notes[0])
+        with self.subTest(check="plan stays pending without children"):
+            self.assertEqual(c._task("P1")["status"], "todo")
+            self.assertEqual(c._task("P1")["plan_rejects"], 1)
+            self.assertEqual([t["id"] for t in c._queue()["tasks"]], ["P1"])
+
+    def assert_no_task_notes(self, answer):
+        c, children, _ = self.review_plan(answer)
+        self.assertEqual(c._task("P1")["status"], "done")
+        for child in children:
+            self.assertEqual(c._task(child["id"])["section"], child["section"])
+            self.assertEqual(c._task(child["id"])["status"], "todo")
+
+    def test_R44_missing_task_notes_preserves_sections(self):
+        self.assert_no_task_notes({"verdict": "pass", "reasons": []})
+
+    def test_R44_null_task_notes_preserves_sections(self):
+        self.assert_no_task_notes({"verdict": "pass", "reasons": [], "task_notes": None})
+
+    def test_R44_fail_keeps_rejection_reasons_and_discards_plan(self):
+        reasons = ["No task covers required input validation.", "T2 depends on an absent task."]
+        c, _, _ = self.review_plan({"verdict": "fail", "reasons": reasons,
+                                    "task_notes": [{"task": "T1", "note": "Advisory detail."}]})
+        self.assertEqual(c._task("P1")["status"], "todo")
+        self.assertEqual(c._task("P1")["plan_rejects"], 1)
+        self.assertEqual(c._task("P1")["notes"], ["plan review failed: " + "; ".join(reasons)])
+        self.assertEqual([t["id"] for t in c._queue()["tasks"]], ["P1"])
+        self.assertFalse((c.wt / "plan.md").exists())
+        self.assertNotIn("plan.md", self.branch_files())
+        self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+
+
+class R45PlanAttemptsTests(Harness):
+    def rejected_plan(self):
+        child = self.task(section="x" * 600)
+
+        def planner(prompt, cwd):
+            (cwd / "plan.md").write_text(
+                "# Implementation plan\n" + child["section"], encoding="utf-8")
+            return json.dumps({"tasks": [child]}), 1
+
+        return self.init(
+            {"id": "P1", "kind": "plan", "title": "Plan", "section": "Plan",
+             "plan_file": "plan.md", "status": "todo"},
+            agents={"planner": planner,
+                    "reviewer": lambda prompt, cwd: (
+                        '{"verdict":"fail","reasons":["Task contradicts an existing rule."]}', 1)},
+        )
+
+    def test_R45_plan_attempts_is_three(self):
+        self.assertEqual(getattr(bootstrap, "PLAN_ATTEMPTS", None), 3)
+
+    def test_R45_plan_retries_twice_then_blocks_on_third_rejection(self):
+        c = self.rejected_plan()
+        for attempt in range(1, 4):
+            with self.subTest(attempt=attempt):
+                self.assertEqual(c.step(), "worked")
+                self.assertEqual(len(c.team.planner.prompts), attempt)
+                self.assertEqual(len(c.team.reviewer.prompts), attempt)
+                task = c._task("P1")
+                self.assertEqual(task["plan_rejects"], attempt)
+                self.assertEqual(task["status"], "todo" if attempt < 3 else "blocked")
+                questions = list(c._read("questions.json", {}).values())
+                if attempt < 3:
+                    self.assertEqual(questions, [])
+                else:
+                    self.assertEqual(len(questions), 1)
+                    self.assertEqual(questions[0]["kind"], "blocked")
+                    self.assertEqual(questions[0]["task"], "P1")
+                    self.assertEqual(questions[0]["status"], "open")
+
+    def test_R45_planner_prompt_requires_rule_and_decision_self_check(self):
+        c = self.rejected_plan()
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(c.team.planner.prompts), 1)
+        prompt = " ".join(c.team.planner.prompts[0].split())
+        for phrase in ("docs/specs/bootstrap-conductor.md", "docs/DECISIONS.md",
+                       "rejected as blocking"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, prompt)
+
+    def test_R45_test_writer_still_blocks_after_two_rejections(self):
+        def writer(prompt, cwd):
+            (cwd / "stray.txt").write_text("outside test_files\n", encoding="utf-8")
+            return '{"files":["stray.txt"]}', 1
+
+        c = self.init(agents={"test_writer": writer})
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(c._task("T1")["test_rejects"], 1)
+        self.assertEqual(c._task("T1")["status"], "todo")
+        self.assertEqual(c._read("questions.json", {}), {})
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(c.team.test_writer.prompts), 2)
+        self.assertEqual(c._task("T1")["test_rejects"], 2)
+        self.assertEqual(c._task("T1")["status"], "blocked")
+        questions = list(c._read("questions.json", {}).values())
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0]["kind"], "blocked")
+        self.assertEqual(questions[0]["task"], "T1")
+        self.assertEqual(questions[0]["status"], "open")
+
+
+class R47PlannerMemoryTests(Harness):
+    heading = "YOUR EARLIER ATTEMPTS WERE REJECTED FOR (fix ALL of these; none may come back):"
+
+    def planner_prompt(self, notes):
+        child = self.task(section="x" * 600)
+
+        def planner(prompt, cwd):
+            (cwd / "plan.md").write_text("# Plan\n" + child["section"], encoding="utf-8")
+            return json.dumps({"tasks": [child]}), 1
+
+        c = self.init(
+            {"id": "P1", "kind": "plan", "title": "Plan", "section": "Plan",
+             "plan_file": "plan.md", "status": "todo"},
+            agents={"planner": planner},
+        )
+        c._update("P1", notes=notes)
+        self.assertEqual(c._task("P1")["notes"], notes)
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(c.team.planner.prompts), 1)
+        return c.team.planner.prompts[0]
+
+    def assert_memory(self, prompt, kept, omitted=()):
+        self.assertEqual(prompt.count(self.heading), 1)
+        position = prompt.index(self.heading) + len(self.heading)
+        for note in kept:
+            with self.subTest(kept=note[:80]):
+                self.assertIn(note, prompt[position:])
+                position = prompt.index(note, position) + len(note)
+        for note in omitted:
+            with self.subTest(omitted=note[:80]):
+                self.assertNotIn(note, prompt)
+
+    def test_R47_memory_limits(self):
+        for name, expected in (("PLAN_MEMORY_NOTES", 10), ("PLAN_MEMORY_CHARS", 12000)):
+            with self.subTest(constant=name):
+                self.assertEqual(getattr(bootstrap, name, None), expected)
+
+    def test_R47_all_rejections_are_shown_oldest_first_without_other_notes(self):
+        rejections = ["plan rejected: task A lacks interfaces.",
+                      "plan review failed: task B contradicts a decision.",
+                      "plan rejected: task C has a thin section.",
+                      "plan review failed: task D depends on a later task."]
+        other = ["reopened plan task after discussion",
+                 "Ben: the plan rejected yesterday needs another attempt",
+                 "git error: unable to commit plan.md"]
+        notes = [rejections[0], other[0], rejections[1], rejections[2],
+                 other[1], rejections[3], other[2]]
+        self.assert_memory(self.planner_prompt(notes), rejections, other)
+
+    def test_R47_only_last_ten_of_twelve_rejections_are_shown(self):
+        notes = [f"plan rejected: unique issue [{i:02d}]." for i in range(12)]
+        self.assert_memory(self.planner_prompt(notes), notes[-10:], notes[:-10])
+
+    def test_R47_character_limit_drops_oldest_whole_notes_and_keeps_newest(self):
+        notes = [f"plan review failed: issue [{i:02d}] ".ljust(1900, chr(65 + i))
+                 for i in range(8)]
+        self.assertGreater(sum(map(len, notes[-7:])), 12000)
+        self.assertLess(sum(map(len, notes[-6:])), 12000)
+        self.assert_memory(self.planner_prompt(notes), notes[-6:], notes[:-6])
+
+    def test_R47_single_newest_rejection_is_kept_in_full(self):
+        note = "plan rejected: newest issue ".ljust(2000, "x")
+        self.assert_memory(self.planner_prompt([note]), [note])
+
+    def test_R47_other_notes_alone_do_not_add_memory_heading(self):
+        notes = ["reopened plan task for another attempt", "Ben: please revise the plan",
+                 "git error: plan.md could not be committed"]
+        prompt = self.planner_prompt(notes)
+        self.assertNotIn("YOUR EARLIER ATTEMPTS WERE REJECTED FOR", prompt)
+        for note in notes:
+            self.assertNotIn(note, prompt)
+
+    def test_R47_empty_notes_do_not_add_memory_heading(self):
+        prompt = self.planner_prompt([])
+        self.assertNotIn("YOUR EARLIER ATTEMPTS WERE REJECTED FOR", prompt)

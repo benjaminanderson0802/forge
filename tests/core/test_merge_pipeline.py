@@ -458,7 +458,7 @@ class UnapprovedMergePushTests(Pipeline):
 
         def planner(prompt, cwd):
             (cwd / "plan.md").write_text("plan\n", encoding="utf-8")
-            return json.dumps({"tasks": [self.task(id="T5")]}), 1
+            return json.dumps({"tasks": [self.task(id="T5", section="s" * 600)]}), 1  # R41: sections >= 600 chars
 
         self.agents["planner"] = planner
         c = self.conductor()

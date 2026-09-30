@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -38,6 +38,13 @@ ROLES = {"ci": "ci", "forge-manager": "manager", "forge-executor": "executor",
 NOWIN = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 TASK_FIELDS = ("id", "title", "section", "files_in_scope", "test_files", "test_cmd")
 NOTE_CAP, NOTES_KEEP, BODY_CAP = 2000, 30, 20000  # R19
+MIN_SECTION_CHARS = 600  # R41: a task's section is its builder's only instructions
+PLAN_REVIEW_MAX = 200_000  # R44: the plan reviewer sees the whole plan, up to this size
+PLAN_ATTEMPTS = 3  # R45: a plan task is blocked after this many rejections
+PLAN_MEMORY_NOTES, PLAN_MEMORY_CHARS = 10, 12000  # R47
+LIMIT_RE = re.compile(r"(session|usage|rate)[ _-]?limit|limit (reached|exceeded)|quota exceeded|too many requests",
+                      re.I)  # R48
+HOLD_MINUTES = 30  # R48
 SUBJECT_CAP, CLOSED_KEEP, SENT_IDS_KEEP = 300, 50, 500  # R26, R28
 MUTATION_NA = "not applicable: merge commit adds no builder lines"
 
@@ -92,6 +99,9 @@ S_TESTS = _obj({"files": _STRS, "summary": _STR}, ["files"])
 S_BUILD = _obj({"status": {"type": "string", "enum": ["done", "blocked"]}, "summary": _STR, "tried": _STRS,
                 "error": _STR, "capability": _STR, "meanwhile": _STR}, ["status"])
 S_REVIEW = _obj({"verdict": {"type": "string", "enum": ["pass", "fail"]}, "reasons": _STRS}, ["verdict", "reasons"])
+S_PLAN_REVIEW = _obj({"verdict": {"type": "string", "enum": ["pass", "fail"]}, "reasons": _STRS,
+                      "task_notes": {"type": "array", "items": _obj({"task": _STR, "note": _STR}, ["task", "note"])}},
+                     ["verdict", "reasons"])  # R44
 S_TROUBLE = _obj({"kind": {"type": "string", "enum": ["fix", "dead_end", "suggestion"]}, "notes": _STR,
                   "alternative": _STR}, ["kind", "notes"])
 S_DRIFT = _obj({"status": {"type": "string", "enum": ["ok", "replan"]}, "reasons": _STRS}, ["status"])
@@ -133,6 +143,13 @@ class NotReady(Exception):
     def __init__(self, names: dict[str, str]):
         self.names = dict(names)
         super().__init__("; ".join(f"{n}: {why}" for n, why in sorted(self.names.items())))
+
+
+class Stopped(Capped):
+    """R42: KILL or PAUSED appeared during an agent run (Ben stopped Forge). Undone like a cap, not tampering."""
+
+
+STOP_FILES = ("KILL", "PAUSED")
 
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
@@ -346,7 +363,7 @@ class Conductor:
     def _call(self, role: str, prompt: str, schema: dict | None, cwd: Path | None = None, needs=None):
         agent = getattr(self.team, role)
         provider = getattr(agent, "provider", None)
-        if provider and self.meter.over(provider, self.limits):  # R37: checked before every launch
+        if provider and (self.meter.over(provider, self.limits) or self._on_hold(provider)):  # R37/R48: before every launch
             raise Capped(provider)
         self._launch_gate(provider, needs)
         prompt = prompt + self._prompt_blocks(role)
@@ -355,6 +372,7 @@ class Conductor:
     def _guarded_run(self, label: str, agent, prompt: str, cwd: Path | None, schema: dict | None):
         """R14/R15 guarded agent run: run record, fingerprint before and after, KILL on tamper, metering."""
         role = label
+        provider = getattr(agent, "provider", None)
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + role + "-" + uuid.uuid4().hex[:6]
         d = self.state / "runs" / run_id
         d.mkdir(parents=True, exist_ok=True)
@@ -378,6 +396,11 @@ class Conductor:
             changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
         except Exception as e:  # noqa: BLE001 - R15: a check that can't complete counts as tampering
             changed = [f"state could not be fingerprinted after the run: {type(e).__name__}: {e}"]
+        if changed and all(k in STOP_FILES and k not in before for k in changed):  # R42: a stop, not tampering
+            if r.tokens:
+                self.meter.add(r.provider or "unknown", r.tokens)
+            self._log(f"stop requested during {role} run {run_id} ({', '.join(changed)}); run discarded")
+            raise Stopped(", ".join(changed))
         if changed:
             (self.state / "KILL").write_text("state tampered during an agent run\n")
             try:
@@ -390,6 +413,14 @@ class Conductor:
             raise Tampered(", ".join(changed))
         if r.tokens:
             self.meter.add(r.provider or "unknown", r.tokens)
+        if not r.ok and provider and LIMIT_RE.search(str(r.error or "")):  # R48: a pause, not a failed attempt
+            until = (self.clock() + timedelta(minutes=HOLD_MINUTES)).isoformat()
+            holds = self._read("holds.json", {})
+            holds = holds if isinstance(holds, dict) else {}
+            holds[provider] = until
+            self._write("holds.json", holds)
+            self._log(f"limit hit for {provider}; holding until {until}")
+            raise Capped(provider)
         (d / "output.json").write_bytes(json.dumps({"ok": r.ok, "error": r.error, "text": r.text, "data": r.data,
                                                     "tokens": r.tokens, "provider": r.provider},
                                                    indent=2).encode("utf-8"))
@@ -429,7 +460,15 @@ class Conductor:
 
     def _capped(self) -> bool:
         providers = {getattr(getattr(self.team, f), "provider", None) for f in Team.__dataclass_fields__}
-        return any(p and self.meter.over(p, self.limits) for p in providers)
+        return any(p and (self.meter.over(p, self.limits) or self._on_hold(p)) for p in providers)
+
+    def _on_hold(self, provider: str) -> bool:
+        """R48: a provider is on hold after hitting its own usage limit, until the recorded time."""
+        try:
+            until = (self._read("holds.json", {}) or {}).get(provider)
+            return bool(until) and self.clock() < datetime.fromisoformat(str(until))
+        except (ValueError, TypeError, AttributeError):
+            return False
 
     # ------------------------------------------------------------------ readiness (D-030)
     @property
@@ -1058,7 +1097,7 @@ class Conductor:
         except Tampered:
             return "killed"
         except Capped:
-            return "capped"
+            return self._held()
         except (RuntimeError, OSError) as e:  # R15 fail-closed preconditions: a stage-like error
             self._log(f"readiness refresh error: {e!r}"[:500])
             return "error"
@@ -1072,7 +1111,7 @@ class Conductor:
         except Tampered:
             return "killed"
         except Capped:
-            return "capped"
+            return self._held()
         except (RuntimeError, OSError) as e:
             self._log(f"capability routing error: {e!r}"[:500])
             return "error"
@@ -1089,7 +1128,7 @@ class Conductor:
                 try:
                     self._drift_check()
                 except Capped:
-                    return "capped"
+                    return self._held()
                 except NotReady:
                     return "not_ready"
                 except Tampered:
@@ -1104,7 +1143,7 @@ class Conductor:
                     self._ensure_worktree(q["layer"])
                     self._finalizer().run(tid)
                 except Capped:
-                    return "capped"
+                    return self._held()
                 except NotReady:  # the merge reviewer's gate; the record stays where it was
                     return "not_ready"
                 except Tampered:
@@ -1124,8 +1163,8 @@ class Conductor:
                     self._build_stage(t["id"])
             except Tampered:
                 return "killed"
-            except Capped:  # R37: the attempt was undone by its stage; retried when the cap resets
-                return "capped"
+            except Capped:  # R37/R42: the attempt was undone by its stage; retried when the cap resets
+                return self._held()
             except NotReady:  # D-030: undone exactly like Capped; retried once evidence is usable
                 return "not_ready"
             except (RuntimeError, OSError) as e:  # R8: git or filesystem trouble is a failed attempt
@@ -1153,6 +1192,14 @@ class Conductor:
                 return "error"
             return "gate"
         return "not_ready" if self._waiting else "idle"
+
+    def _held(self) -> str:
+        """R42: why an undone attempt stopped: Ben's stop, a pause, or a token cap."""
+        if (self.state / "KILL").exists():
+            return "killed"
+        if (self.state / "PAUSED").exists():
+            return "paused"
+        return "capped"
 
     def run(self, max_steps: int | None = None, idle_sleep_s: int = 60, heartbeat: Path | None = None,
             sleep: Callable[[float], None] = time.sleep) -> str:
@@ -1785,6 +1832,40 @@ class Conductor:
                                                         "output": str(output)[-4000:]})
                 raise
 
+    def _attach_review_notes(self, tasks: list, notes, plan_file: str) -> list:
+        """R44: the plan reviewer's non-blocking notes are appended to the tasks they affect (and the plan file)."""
+        if not isinstance(notes, list):
+            return tasks
+        ids = {str(x.get("id")) for x in tasks}
+        clean: list[tuple[str, str]] = []  # (task id or "" for plan-wide, note), in the reviewer's order
+        for n in notes:
+            if not isinstance(n, dict):
+                continue
+            text = str(n.get("note") or "").strip()[:NOTE_CAP]
+            if text:
+                task = str(n.get("task") or "")
+                clean.append((task if task in ids else "", text))
+        if not clean:
+            return tasks
+        out = []
+        for x in tasks:
+            x = dict(x)
+            mine_or_wide = [(k, m) for k, m in clean if k in ("", str(x.get("id")))][:10]  # the first 10, in order
+            mine = [m for k, m in mine_or_wide if k]
+            wide = [m for k, m in mine_or_wide if not k]
+            if mine:
+                x["section"] = str(x["section"]) + "\n\nREVIEWER NOTES (handle and test these):\n" + \
+                    "\n".join(f"- {m}" for m in mine)
+            if wide:
+                x["section"] = str(x["section"]) + "\n\nPLAN-WIDE REVIEWER NOTES:\n" + \
+                    "\n".join(f"- {m}" for m in wide)
+            out.append(x)
+        lines = [f"- {k or '(plan-wide)'}: {m}" for k, m in clean]
+        f = self.wt / plan_file
+        f.write_text(f.read_text(encoding="utf-8").rstrip("\n") + "\n\n## Reviewer notes\n\n" + "\n".join(lines) +
+                     "\n", encoding="utf-8")
+        return out
+
     def _troubleshoot(self, tid: str, reason: str, output: str) -> None:
         t = self._task(tid)
         self._reset_wt()
@@ -1816,10 +1897,15 @@ class Conductor:
         design = self.wt / "docs" / "specs" / "layer-1-design.md"
         text = design.read_text(encoding="utf-8") if design.exists() else "(no design file)"
         listing = "\n".join(f"- {t['id']} [{t['status']}] {t['title']}" for t in q["tasks"])
-        r = self._call("drift_keeper", role_text(self.repo, "drift_keeper") + "\n\nIs this work still on course for "
-                                       "the design? Say replan only if it is drifting.\n\nTASKS:\n" + listing +
-                       "\n\nDESIGN:\n" + text[:40000] +
-                       "\nAnswer with JSON: {\"status\": \"ok\" | \"replan\", \"reasons\": [...]}", S_DRIFT)
+        try:
+            r = self._call("drift_keeper", role_text(self.repo, "drift_keeper") + "\n\nIs this work still on course "
+                                           "for the design? Say replan only if it is drifting.\n\nTASKS:\n" + listing +
+                           "\n\nDESIGN:\n" + text[:40000] +
+                           "\nAnswer with JSON: {\"status\": \"ok\" | \"replan\", \"reasons\": [...]}", S_DRIFT)
+        except Capped:  # R42: a stopped run leaves no edits behind
+            if self.wt.exists():
+                self._reset_wt()
+            raise
         status = (r.data or {}).get("status") if r.ok else None
         q = self._queue()
         if status not in ("ok", "replan"):  # R6: unusable result, retry; escalate after 3
@@ -1848,12 +1934,27 @@ class Conductor:
         self._reset_wt()
         plan_file = _norm(t["plan_file"])
         try:
+            prior = [str(n) for n in t.get("notes", [])
+                     if str(n).startswith(("plan rejected", "plan review failed"))][-PLAN_MEMORY_NOTES:]  # R47
+            while prior and sum(len(n) for n in prior) > PLAN_MEMORY_CHARS:
+                prior = prior[1:]
             r = self._call("planner", role_text(self.repo, "planner") + "\n\nWrite the implementation plan to " + plan_file +
                            " (and no other file), then return its tasks.\n\n" + self._task_prompt(t) +
                            "\nEach task needs: id, title, section, files_in_scope, test_files, test_cmd.\n"
                            "Each task may also list \"needs\": capability names from the capability map (git, github, "
                            "claude, codex, gmail, docker, n8n, ollama, python_libs, browser, or a new name) that its "
                            "Builder needs beyond git and its own AI.\n"
+                           "IMPORTANT (R41): each task's section is the ONLY instruction the test writer and the "
+                           "builder will see. Make it complete and self-contained: what to build, exact interfaces "
+                           "and signatures, behaviour, edge cases, dependencies on earlier tasks, and the acceptance "
+                           f"criteria the tests must check (at least {MIN_SECTION_CHARS} characters). Every task must "
+                           "be fully doable by a builder that may change ONLY its files_in_scope: no steps for Ben, "
+                           "the conductor, or files outside that scope.\n"
+                           "Before answering (R45), check every task against the numbered rules in "
+                           "docs/specs/bootstrap-conductor.md and the decisions in docs/DECISIONS.md: any contradiction "
+                           "with them will be rejected as blocking.\n" +
+                           ("\nYOUR EARLIER ATTEMPTS WERE REJECTED FOR (fix ALL of these; none may come back):\n" +
+                            "\n".join(prior) + "\n" if prior else "") +
                            "Answer with JSON: {\"tasks\": [...]}", S_PLAN)
         except (Capped, NotReady):
             self._reset_wt()
@@ -1872,19 +1973,36 @@ class Conductor:
         elif any(validate_task(dict(x, kind="build")) for x in tasks):
             bad = next(validate_task(dict(x, kind="build")) for x in tasks if validate_task(dict(x, kind="build")))
             reason = "plan rejected: unsafe test_cmd" if "test_cmd" in bad else f"plan rejected: {bad}"
+        elif any(len(str(x.get("section", ""))) < MIN_SECTION_CHARS for x in tasks):  # R41
+            thin = [f"{x.get('id')} ({len(str(x.get('section', '')))} chars)" for x in tasks
+                    if len(str(x.get("section", ""))) < MIN_SECTION_CHARS]
+            reason = ("plan rejected: task section too thin (a task's section is its builder's only instructions; "
+                      f"need at least {MIN_SECTION_CHARS} characters): " + ", ".join(thin))
         else:
             existing = {x["id"] for x in self._queue()["tasks"]}
             if any(x["id"] in existing for x in tasks):
                 reason = "plan rejected: task ids clash with existing tasks"
         if not reason:
             plan_text = (self.wt / plan_file).read_text(encoding="utf-8")
+            size = len(plan_text) + len(json.dumps(tasks))
+            if size > PLAN_REVIEW_MAX:  # R44: the reviewer must see the whole plan
+                reason = f"plan rejected: plan too large for review ({size} characters); split this plan task"
+        if not reason:
             try:
                 rv = self._call("reviewer", role_text(self.repo, "reviewer") + "\n\nCheck this plan against the task and "
-                                            "design: complete, testable, no placeholders, no drift.\n\n" +
-                                self._task_prompt(t) + "\nPLAN:\n" + plan_text[:60000] + "\nTASKS JSON:\n" +
-                                json.dumps(tasks)[:20000] +
-                                "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}",
-                                S_REVIEW)
+                                            "design: complete, testable, no placeholders, no drift.\n"
+                                            "Fail ONLY for blocking problems (R44): a requirement of this plan task "
+                                            "that no task covers; a task that contradicts docs/DECISIONS.md or the "
+                                            "design; a task that can't be done within its files_in_scope; wrong "
+                                            "ordering or dependencies between tasks; placeholders or thin sections. "
+                                            "Edge cases, extra tests and implementation details are NOT reasons to "
+                                            "fail: put each in task_notes against the task id it affects, and they "
+                                            "will be added to that task's instructions.\n\n" +
+                                self._task_prompt(t) + "\nPLAN:\n" + plan_text + "\nTASKS JSON:\n" +
+                                json.dumps(tasks) +
+                                "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...], "
+                                "\"task_notes\": [{\"task\": \"<task id>\", \"note\": \"...\"}]}",
+                                S_PLAN_REVIEW)
             except (Capped, NotReady):
                 self._reset_wt()
                 raise
@@ -1894,9 +2012,10 @@ class Conductor:
             self._reset_wt()
             rejects = t.get("plan_rejects", 0) + 1
             self._update(tid, notes=t["notes"] + [reason], plan_rejects=rejects)
-            if rejects >= 2:
+            if rejects >= PLAN_ATTEMPTS:  # R45
                 self._block(tid, reason)
             return
+        tasks = self._attach_review_notes(tasks, (rv.data or {}).get("task_notes"), plan_file)  # R44
         self._commit([plan_file], f"{tid}: plan")
         q = self._queue()
         for x in q["tasks"]:
@@ -2322,6 +2441,8 @@ def _guarded_smoke(c: Conductor, workdir: Path, force: bool = False) -> list[str
         try:
             problems = smoke(c.team, workdir, lambda role, prompt, schema, cwd: c._call(role, prompt, schema, cwd=cwd),
                              warn=c._log)
+        except Stopped as e:  # R42
+            problems = [f"stopped during the smoke test ({e})"]
         except Capped as e:  # R37
             problems = [f"token cap reached during the smoke test ({e})"]
         except NotReady as e:  # D-030

@@ -315,3 +315,95 @@ The first run with real agents and real email hit four faults no fake-based test
   - **If PAUSED is set:** the conductor only waits. It reads the inbox every minute (answers can clear the pause), writes its heartbeat, and runs no smoke test and no agents.
   - **When the pause clears:** it goes on to the smoke test (if stale) and then the loop.
   - **If KILL appears** while waiting, it exits.
+
+## First-cycle amendment (2026-09-30)
+
+- **R41 Plans carry complete tasks, and retries learn.** In the first live cycle the 1B plan was rejected twice for the same reason: its tasks carried short labels, not the instructions the test writer and builder need. Now:
+  - **The planner is told** that each task's `section` is the only instruction the test writer and builder will see. It must be complete and self-contained: what to build, exact interfaces, behaviour, edge cases, dependencies on earlier tasks, and the acceptance criteria the tests must check. Each task must also be fully doable by a builder that may change only its `files_in_scope`: no steps for Ben, the conductor, or files outside that scope.
+  - **Thin tasks are rejected by plain code** before any review. The plan is rejected if a task's `section` is shorter than `MIN_SECTION_CHARS` (600), with a reason naming the task.
+  - **A retry sees why the last attempt failed.** Each planner attempt after the first includes the rejection reasons from earlier attempts (the task's last 3 notes, capped).
+
+## Live-use amendment (2026-09-30)
+
+- **R42 Stopping Forge during an agent run is a stop, not tampering.** Ben's "Stop Forge" shortcut (or a STOP email handled by another start) writes `KILL` into `state/` while an agent may be running. Before this rule, the after-run fingerprint saw the new file and raised a false tamper alarm. Now:
+  - **A stop:** if the only differences between the before-run and after-run fingerprints are `KILL` and/or `PAUSED` **appearing** (absent before, present after), the run is a stop. `_call` meters the run's tokens, logs `stop requested during <role> run <run_id>`, and raises `Stopped`. No tamper alert is sent and no halt question is created.
+  - **`Stopped` is a subclass of `Capped`.** So every stage undoes the attempt exactly as it does for a cap (R37/R38): worktree reset, claim released, nothing counted as a failure, and the run's result is discarded.
+  - **`step()`**, on a `Capped` (including `Stopped`) from a stage or the drift check, returns `"killed"` if `KILL` exists, else `"paused"` if `PAUSED` exists, else `"capped"`.
+  - **The smoke test:** a `Stopped` gives the problem `stopped during the smoke test`, not "token cap reached".
+  - **Still tampering:** any other changed file, or `KILL`/`PAUSED` being **removed** or **changed** (present before the run), is still tampering (R9). An agent can never un-stop Forge.
+## Live-use amendment (2026-09-30, token metering)
+
+- **R43 The token caps count what a run really costs: cached input is weighted at one tenth.** In the first live cycle, a single planner run was metered at about 4.6 million Claude tokens. Nearly all of it was cache reads of the same context, which both providers bill at about a tenth of fresh input. Counting them in full would cap Forge for the rest of the day after two plans. The caps (`claude_daily_token_cap`, `codex_daily_token_cap`) are unchanged. What is counted:
+  - **Claude** (`parse_claude`):
+
+    `input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens // 10`
+  - **Codex** (`parse_codex`, per `turn.completed`):
+
+    `(input_tokens - cached_input_tokens) + cached_input_tokens // 10 + output_tokens + reasoning_output_tokens`
+
+    `cached_input_tokens` is clamped to `0..input_tokens`; missing fields count as 0.
+  - **A usage field that can't be read as a finite non-negative number** counts as 0 everywhere: non-numeric text, negative, infinite or NaN, true/false, or missing. Numbers and numeric strings ("1000") are read normally. So a bad field can never cancel real usage, and a bad cached count counts all input as fresh.
+  - Everything else about metering is unchanged (R6/R37).
+
+## Live-use amendment (2026-09-30, plan review)
+
+- **R44 The plan reviewer blocks only for blocking problems; its detailed notes travel with the tasks.** In the first live cycle, every plan was rejected for reasonable edge-case details: a new set each attempt. Two rejections block a plan task, so planning stalled although the plans were sound. Now:
+  - **The plan review uses the schema `S_PLAN_REVIEW`:**
+    - `verdict`: `pass` or `fail`;
+    - `reasons`: a list of strings;
+    - `task_notes`: optional, a list of `{task, note}`.
+  - **The reviewer is told to fail ONLY for blocking problems:**
+    - a requirement of this plan task that no task covers;
+    - a task that contradicts `docs/DECISIONS.md` or the design;
+    - a task that can't be done within its `files_in_scope`;
+    - wrong ordering or dependencies between tasks;
+    - placeholders or thin sections.
+
+    Edge cases, extra tests and implementation details go in `task_notes` against the task they affect. Those are not a reason to fail.
+  - **On a pass:**
+    - Each note whose `task` matches a returned task id is appended to that task's `section`, under the heading `REVIEWER NOTES (handle and test these):`, one `- ` line per note.
+    - Notes whose `task` matches no returned task are appended to every task under `PLAN-WIDE REVIEWER NOTES:`.
+    - Empty notes are dropped. Each note is capped at `NOTE_CAP` characters, and each task gets at most 10 notes (the first 10).
+    - The notes are also appended to the plan file under `## Reviewer notes` in the same plan commit.
+  - **On a fail:** unchanged (the reasons become the rejection note, R41).
+  - **The reviewer sees the whole plan.** In the first cycle the tasks JSON was cut at 20,000 characters, so the reviewer rightly rejected a "truncated" plan. Now the plan file and the tasks JSON are passed in full. If their combined length exceeds `PLAN_REVIEW_MAX` (200,000 characters), code rejects the plan before any review, with `plan rejected: plan too large for review (<n> characters); split this plan task`.
+  - **Build reviews** (`S_REVIEW` after a build) are unchanged.
+
+## Live-use amendment (2026-09-30, plan attempts)
+
+- **R45 Plans get three attempts, and the planner checks itself against the rules first.** Under R44, plan reviews converged to a single blocking reason per attempt. Each attempt fixed the last reason, but a new contradiction with an existing rule surfaced each time. With only two attempts, plan tasks still blocked. Now:
+  - **`PLAN_ATTEMPTS = 3`:** a plan task is blocked after its third rejection, not its second. Test-writer rejections are unchanged (2).
+  - **The planner is told** to check every task against the numbered rules in `docs/specs/bootstrap-conductor.md` and the decisions in `docs/DECISIONS.md` before answering. The prompt says that any contradiction with them will be rejected as blocking.
+
+## Live-use amendment (2026-09-30, metering failed runs)
+
+- **R46 A Claude run that times out, is killed, or returns unreadable output is still metered.** Before this rule, such runs reported 0 tokens. Their real use never reached the caps. On 2026-09-30 about 30% of the day's Claude use came from timed-out or killed runs. Now:
+  - **Session id:** `ClaudeAgent.run` starts every run with `--session-id <uuid4>`, and keeps that id.
+  - **Metering from the log:** if the run times out, or its output can't be parsed (`parse_claude` returns 0 tokens with `ok` false), tokens are read from Claude Code's session log instead. The log is `<projects_dir>/*/<session-id>.jsonl`, where `projects_dir` defaults to `~/.claude/projects`.
+  - **How the log is counted:** every line whose `message` has an `id` and a `usage`, each message id counted once. The R43 formula applies:
+
+    `input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens // 10`
+
+    Unreadable lines are skipped. A missing log counts as 0.
+  - **The result:** the returned `AgentResult` keeps its failure (`ok` false, the same error) but carries those tokens, so `_call` meters them as usual (R6).
+  - **Codex** reports usage only on a completed turn and keeps no session log under `--ephemeral`. A timed-out Codex run stays unmetered: a known gap, noted in STATUS.
+
+## Live-use amendment (2026-09-30, planner memory)
+
+- **R47 The planner sees every earlier rejection of its plan task, not just the last three notes.** P1B2's attempts regressed: problems fixed two attempts earlier came back, because only the last 3 notes mentioning "plan" were shown, and reopen notes pushed real rejections out. Now:
+  - **The planner prompt** includes every note of the task that starts with `plan rejected` or `plan review failed`, oldest first, under `YOUR EARLIER ATTEMPTS WERE REJECTED FOR (fix ALL of these; none may come back):`.
+  - **Limits:** at most the last `PLAN_MEMORY_NOTES` (10) such notes, and at most `PLAN_MEMORY_CHARS` (12,000) characters in total. When over, the oldest notes are dropped first.
+  - **Other notes** are not shown under that heading: reopen notes, Ben's replies, git errors.
+  - **Notes are kept longer:** the task's notes list keeps its last `NOTES_KEEP` (30) entries as before (R19), so 10 rejections are always available.
+
+## Live-use amendment (2026-09-30, provider limits)
+
+- **R48 A provider's own usage limit is a pause, not a failed attempt.** At 10:55 UTC on 2026-09-30, Ben's Claude plan hit its session limit ("You've hit your session limit · resets 6am"). Every planner call then failed within seconds. The conductor counted each one as a plan rejection, so P1D and P1E used up all 3 attempts and were blocked in under a minute. Now:
+  - **Detection:** after an agent run, `_call` checks for a provider limit. If the result failed and its error matches `LIMIT_RE`, the run is a limit hit. `LIMIT_RE` is case-insensitive: `(session|usage|rate)[ _-]?limit`, `limit (reached|exceeded)`, `quota exceeded` or `too many requests`.
+  - **On a limit hit:**
+    - The run's tokens are metered.
+    - `state/holds.json` records `{provider: <now + HOLD_MINUTES (30)>}` in ISO form.
+    - `limit hit for <provider>; holding until <time>` is logged.
+    - `Capped(provider)` is raised, so the stage undoes the attempt exactly as for a token cap (R37): nothing is counted as a failure or a rejection.
+  - **While a hold is active** (`now < until`): the provider counts as capped, both in `_capped()` and in `_call`'s pre-launch check (R37). No agent of that provider is launched. An expired or unreadable hold entry is ignored.
+  - **The token cap check (R37)** is unchanged.
