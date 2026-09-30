@@ -1925,6 +1925,54 @@ class R42StopDuringRunTests(Harness):
         with self.subTest(check="no tamper question or alert"):
             self.assert_no_stop_alert(c)
 
+    def test_R42_troubleshooter_tampering_does_not_reset_worktree(self):
+        """R42: tampered queue state cannot authorize a worktree reset or clean."""
+        def troubleshoot(prompt, cwd):
+            queue = json.loads((self.state / "queue.json").read_text(encoding="utf-8"))
+            queue["tasks"][0]["title"] = "tampered task title"
+            (self.state / "queue.json").write_text(json.dumps(queue), encoding="utf-8")
+            (cwd / "troubleshooter-stray.txt").write_text("retain this edit\n", encoding="utf-8")
+            return '{"kind":"fix","notes":"untrusted result"}', 1
+
+        c = self.init(agents={"troubleshooter": troubleshoot})
+        c._ensure_worktree(self.layer)
+        wt = c.wt  # Capture the trusted path before the queue is tampered with.
+        with self.assertRaises(bootstrap.Tampered):
+            c._troubleshoot("T1", "judge failed: task tests", "FAILED")
+        self.assertEqual(len(c.team.troubleshooter.prompts), 1)
+        self.assertTrue((self.state / "KILL").exists())
+        self.assertTrue((wt / "troubleshooter-stray.txt").is_file(),
+                        "tampering must not trigger reset or clean after the agent run")
+
+    def assert_drift_keeper_stop(self, flag, expected):
+        def drift_keeper(prompt, cwd):
+            (cwd / "drift-stray.txt").write_text("unfinished edit\n", encoding="utf-8")
+            (self.state / flag).write_text("owner requested stop\n", encoding="utf-8")
+            return '{"status":"ok"}', 1
+
+        c = self.init(agents={"drift_keeper": drift_keeper})
+        c._ensure_worktree(self.layer)
+        queue = c._queue()
+        queue["drift_due"] = True
+        c._save_queue(queue)
+        result = c.step()
+        self.assertEqual(len(c.team.drift_keeper.prompts), 1)
+        with self.subTest(check="step result"):
+            self.assertEqual(result, expected)
+        with self.subTest(check="drift still due"):
+            self.assertIs(c._queue().get("drift_due"), True)
+        with self.subTest(check="worktree clean"):
+            self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+            self.assertFalse((c.wt / "drift-stray.txt").exists())
+
+    def test_R42_step_drift_keeper_killed_resets_and_keeps_due(self):
+        """R42: a killed drift keeper discards edits and leaves the check due."""
+        self.assert_drift_keeper_stop("KILL", "killed")
+
+    def test_R42_step_drift_keeper_paused_resets_and_keeps_due(self):
+        """R42: a paused drift keeper discards edits and leaves the check due."""
+        self.assert_drift_keeper_stop("PAUSED", "paused")
+
     def test_R42_kill_plus_other_state_change_is_tampering(self):
         """R42: a new KILL cannot hide a simultaneous change to another state file."""
         def tamper(prompt, cwd):
