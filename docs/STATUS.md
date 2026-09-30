@@ -2,16 +2,20 @@
 
 > Forge updates this file after every cycle once Layer 1 runs. Until then, whoever finishes a piece of work updates it. Keep it short: where things stand now, not history (history is in git and the ledger).
 
-**Updated:** 2026-09-29 (evening)
+**Updated:** 2026-09-30 (07:50 UTC)
 
 ## Now
 
-- **First watched live cycle (D-035), 2026-09-29, 19:53-20:57 UTC. Forge was stopped afterwards, pending Ben.**
-  - **Safety held:** 3 emails, all legitimate (start, T1A3 blocked, P1B blocked). No self-reads, no errors. The live smoke test passed. Tokens used: about 4.2M Claude and 1.8M Codex.
-  - **The team worked as designed.** Codex wrote tests that failed before the feature existed. Claude built. Codex reviewed with real findings. The troubleshooter diagnosed the builder going in circles.
-  - **T1A3 (readiness) is blocked:** the ledger parked it after 6 attempts. Reviews kept demanding guaranteed cancellation of hung checks, which Python threads can't provide. Unparking is a human-only ledger action, and the attempt count stays at 6, so this needs Ben. The recommended design (the troubleshooter's option A) is in the last troubleshooter run record.
-  - **P1B (1B plan) is blocked:** the reviewer rejected the plan twice. Its main systemic point, which also applies to P1C-P1E: the plan tasks carry only short labels, not the full instructions from `docs/specs/layer-1-design.md`. The queue needs richer plan-task sections before planning resumes.
-- **Earlier today:** the live-run hardening (R17-R40, PR #9) and the incident record (`docs/incidents/2026-09-29-email-flood.md`).
+- **Building 24/7 (D-037, PR #14).** Ben's approval to build is standing: builders label and merge their own tested, Codex-reviewed changes. The hourly "Forge supervisor" scheduled task keeps building from `docs/SUPERVISOR.md`, whether or not a chat is open. Its log is `C:\Users\benja\Forge-work\supervisor-log.md`.
+- **Merged today:**
+  - **PR #12, R41:** plans carry complete tasks.
+  - **PR #15, R42:** Stop Forge during a run is a stop, not tampering.
+  - **PR #17, R43:** token caps count cached input at one tenth, the real cost. Before this, one plan run registered as about 4.6M tokens.
+  - **PR #16:** the 1B plan is split into P1B1 (judges), P1B2 (readiness) and P1B3 (role files, worktrees, merge). The whole-1B plan timed out at 30 minutes, and its review found 10 real gaps. Each part carries its share of those findings.
+- **Conductor:** restarted 07:43 UTC on the merged code, with the queue split applied.
+  - Queue: P1B1, P1B2, P1B3, P1C, P1D and P1E to plan.
+  - 1A readiness is done (T1A3R). T1A3 is kept as a blocked record.
+  - P1C's first plan was rejected by review with fair findings, which its next attempt carries.
 
 ## Known risks
 
@@ -25,14 +29,13 @@
 - **Signed in:** GitHub (command-line tool and token), Codex, Bitwarden (logged in, vault locked), and Claude Code (headless verified).
 - **Gmail:** app password verified for sending and reading. Stored in Windows Credential Manager (`forge-gmail`), with the record copy in Bitwarden.
 
-## Open items for Ben
+## Needs Ben (not build approvals; building continues around these)
 
-- **ChatGPT Dots evaluated (2026-09-30):** not adopted for now. Email stays Forge's channel. A Dot round-trip trial is part of 1E, and the criteria are in `docs/specs/layer-1-design.md`. Ben's included Dot can do research outside the trusted core.
+- Turn on **"Require this computer"** for the "Forge supervisor (hourly builder)" scheduled task in the Claude desktop app, so it can reach the PC.
+- Keep the PC awake. In PowerShell as admin: `powercfg /change standby-timeout-ac 0`
 
+## Open items
 
-- **T1A3 task definition was unsatisfiable** (fixed 2026-09-29, in this pull request). The task text included plan steps 5–7: the CI workflow (a protected file outside the builder's scope), the live gate on Ben's PC, and the layer PR. The reviewer rightly failed the builder for missing them, twice. The task is now Steps 1–4, and reviewers are told the judges already ran on the PC. Lesson: every task in a queue must be fully doable within its own `files_in_scope`.
-- **CI does not run the core unit tests.** `.github/workflows/core-checks.yml` has no unit-test step (T1A3 plan, Step 5). It is a protected file, so it needs a pull request and Ben's approval.
-- **Bug: Stop Forge during an agent run trips the tamper alarm.** The shortcut writes `state/bootstrap/KILL`, and `state/` is fingerprinted around every agent run. Forge still stops, but its email says "tampered". The fix (core, so it needs Ben) is for KILL and PAUSED appearing during a run to count as a stop, not as tampering. Until then, stop Forge between runs, or disable the task and end its process.
-
-
-- Approve the live-run-hardening pull request (one "y").
+- **ChatGPT Dots evaluated (2026-09-30):** not adopted for now. Email stays Forge's channel. A Dot round-trip trial is part of 1E, and the criteria are in `docs/specs/layer-1-design.md`.
+- **CI does not run the core unit tests.** `.github/workflows/core-checks.yml` has no unit-test step. Add one (supervisor, under D-037).
+- **Plan size:** a planner call has 30 minutes. If a part still times out, split it further rather than raising the timeout.
