@@ -342,4 +342,5 @@ The first run with real agents and real email hit four faults no fake-based test
     `(input_tokens - cached_input_tokens) + cached_input_tokens // 10 + output_tokens + reasoning_output_tokens`
 
     `cached_input_tokens` is clamped to `0..input_tokens`; missing fields count as 0.
+  - **A usage field that isn't a non-negative number** (text, negative, missing) counts as 0 everywhere, so a bad field can never cancel real usage. A bad cached count therefore counts all input as fresh.
   - Everything else about metering is unchanged (R6/R37).
