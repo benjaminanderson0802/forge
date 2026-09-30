@@ -166,5 +166,21 @@ class DrillActiveVsIdle(Harness):
         self.assertEqual(st["mode"]["state"], "idle")
 
 
+class DrillNumbering(unittest.TestCase):
+    """1C, 1D and 1E each added drills on their own branch; after the merge the numbers are unique and sequential."""
+
+    def test_drill_numbers_are_unique_and_sequential(self):
+        from drills import run_drills
+        nums = [n for n, _, _ in run_drills.DRILLS]
+        self.assertEqual(nums, list(range(1, len(nums) + 1)))
+        self.assertGreaterEqual(len(nums), 21)
+        run_drills.check_numbering()
+
+    def test_a_collision_is_refused(self):
+        from drills import run_drills
+        with self.assertRaises(ValueError):
+            run_drills.check_numbering([(1, "a", None), (2, "b", None), (2, "c", None)])
+
+
 if __name__ == "__main__":
     unittest.main()

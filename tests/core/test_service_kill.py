@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -248,9 +249,14 @@ class LimitWindowConductorTests(Harness):
             raise RuntimeError("HTTP 429: Too Many Requests")
 
         c = self.advance_to_build(agents={"test_writer": self.write_tests, "builder": builder})
+        t0 = c.clock()
         self.assertEqual(c.step(), "capped")
+        t1 = c.clock()
         self.assertEqual(c._task("T1").get("fail_signatures"), [])
-        self.assertIsNotNone(c.meter.held("claude"))
+        until = c.meter.held("claude")
+        self.assertIsNotNone(until)
+        # no reset time in the message: R48's 30 minutes (the one hold mechanism keeps R48's fallback)
+        self.assertTrue(t0 + timedelta(minutes=30) <= until <= t1 + timedelta(minutes=30), (t0, until, t1))
         self.assertTrue(c._capped())
         holds = json.loads((self.state / "holds.json").read_text(encoding="utf-8"))
         self.assertEqual(set(holds), {"claude"})

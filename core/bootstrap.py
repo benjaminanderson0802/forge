@@ -674,11 +674,7 @@ class Conductor:
         pending = [t for t in tasks if t["status"] == "tests_ok" and t.get("troubleshoot_pending")]
         rest = [t for t in tasks if t not in pending]
         for t in pending + rest:
-            role = self._stage_role(t)
-            unready = self.ready_for(role, t, cap_map)
-            if role == "builder":  # Codex review P1: never start a builder whose work the reviewer can't review
-                unready = {**self.ready_for("reviewer", cap_map=cap_map), **unready}
-            waiting = sorted(unready)
+            waiting = sorted(self._stage_unready(t, cap_map))
             if waiting or t.get("waiting_on"):
                 if t.get("waiting_on") != waiting:
                     self._update(t["id"], waiting_on=waiting)
@@ -686,6 +682,16 @@ class Conductor:
                 self._waiting = True
                 continue
             yield t
+
+    def _stage_unready(self, t: dict, cap_map: dict) -> dict[str, str]:
+        """What task t's next stage needs and lacks: its role's requirements and, for a build, the reviewer's
+        too (R54, Codex review P1: never start a builder whose work the reviewer can't review). The one predicate
+        for task selection and for the capability-email hold."""
+        role = self._stage_role(t)
+        unready = self.ready_for(role, t, cap_map)
+        if role == "builder":
+            unready = {**self.ready_for("reviewer", cap_map=cap_map), **unready}
+        return unready
 
     @staticmethod
     def _stage_role(t: dict) -> str:
@@ -883,7 +889,7 @@ class Conductor:
         if ftid is not None and not self._finalize_unready(m, ftid):
             return  # a finalization (T1B3e) whose next phase can run is progress too
         for t in q.get("tasks", []):
-            if t.get("status") in ("todo", "tests_ok") and not self.ready_for(self._stage_role(t), t, m):
+            if t.get("status") in ("todo", "tests_ok") and not self._stage_unready(t, m):
                 return
         order, diag, _ = self._cap_candidates(m)
         routing = self._read("cap_routing.json", {})

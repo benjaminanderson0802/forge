@@ -122,9 +122,13 @@ def request_stop(bootstrap_state: Path, reason: str) -> None:
     if kill.exists():
         return
     Path(bootstrap_state).mkdir(parents=True, exist_ok=True)
-    tmp = kill.with_name("KILL.tmp")
-    tmp.write_bytes((reason.strip()[:300] + "\n").encode("utf-8"))
-    os.replace(tmp, kill)
+    # KILL itself is the only file written in state/ (no KILL.tmp): an agent may be running, and R42 treats a run
+    # as a clean stop only when KILL/PAUSED are the sole changes. Exclusive create keeps an existing reason.
+    try:
+        with kill.open("xb") as f:
+            f.write((reason.strip()[:300] + "\n").encode("utf-8"))
+    except FileExistsError:
+        return
 
 
 # ------------------------------------------------------------------ health (T1D2)

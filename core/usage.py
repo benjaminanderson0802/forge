@@ -101,13 +101,13 @@ class Meter:
 _LIMIT = re.compile(r"hit your (?:\w+ )?limit|(?:session|usage|rate|weekly)[ _-]?limit|limit (?:reached|exceeded)"
                     r"|quota exceeded|too many requests", re.I)
 _RESET = re.compile(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b\s*(?:\(([^)]+)\))?", re.I)
-LIMIT_FALLBACK = timedelta(hours=1)
+LIMIT_FALLBACK = timedelta(minutes=30)  # R48's hold length when no reset time can be read
 
 
 def limit_hold_until(text: str | None, now: datetime) -> datetime | None:
     """R48/R50: if an agent's error says its provider's usage limit is used up, when to try again; otherwise None.
     Reads "resets 6am (America/Chicago)" when it can (zoneinfo needs a tz database, which Windows may lack);
-    otherwise one hour. Always between 5 minutes and 24 hours from now."""
+    otherwise 30 minutes (R48). Always between 5 minutes and 24 hours from now."""
     if not text or not _LIMIT.search(text):
         return None
     until = now + LIMIT_FALLBACK

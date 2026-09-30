@@ -77,8 +77,8 @@ class LimitWindowTests(unittest.TestCase):
         try:
             from zoneinfo import ZoneInfo
             ZoneInfo("America/Chicago")
-        except Exception:  # noqa: BLE001 - no tz database (Windows without tzdata): the 1-hour fallback
-            self.assertEqual(until, NOW + timedelta(hours=1))
+        except Exception:  # noqa: BLE001 - no tz database (Windows without tzdata): the 30-minute fallback
+            self.assertEqual(until, NOW + timedelta(minutes=30))
             return
         self.assertEqual(until, datetime(2026, 10, 1, 11, 0, tzinfo=timezone.utc))  # 6am CDT tomorrow
 
@@ -88,14 +88,14 @@ class LimitWindowTests(unittest.TestCase):
             from zoneinfo import ZoneInfo
             ZoneInfo("America/Chicago")
         except Exception:  # noqa: BLE001
-            self.assertEqual(until, NOW + timedelta(hours=1))
+            self.assertEqual(until, NOW + timedelta(minutes=30))
             return
         self.assertEqual(until, datetime(2026, 9, 30, 22, 30, tzinfo=timezone.utc))
 
-    def test_limit_without_a_readable_reset_holds_one_hour(self):
+    def test_limit_without_a_readable_reset_holds_30_minutes(self):
         self.assertEqual(limit_hold_until("You've hit your usage limit. Try again later.", NOW),
-                         NOW + timedelta(hours=1))
-        self.assertEqual(limit_hold_until("session limit, resets 6am (Not/AZone)", NOW), NOW + timedelta(hours=1))
+                         NOW + timedelta(minutes=30))
+        self.assertEqual(limit_hold_until("session limit, resets 6am (Not/AZone)", NOW), NOW + timedelta(minutes=30))
 
     def test_ordinary_failures_are_not_limit_windows(self):
         for text in ("", None, "Codex run failed (exit 1): schema invalid", "agent timed out after 1800s",

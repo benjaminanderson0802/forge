@@ -81,6 +81,19 @@ class BuilderWaitsForTheReviewer(Harness):
         self.assertIn("codex", c._task("T1")["waiting_on"])
         self.assertNotIn(Ledger(self.state).contracts().get("T1", {}).get("status"), ("claimed", "submitted"))
 
+    def test_capability_email_goes_out_when_the_only_build_waits_for_the_reviewer(self):
+        """The capability-email hold uses the same predicate as task selection: a build task whose reviewer is
+        down is not runnable progress, so Ben hears about it instead of the item staying held forever."""
+        c = self.advance_to_build(agents={"test_writer": self.write_tests, "builder": self.build_feature})
+        c.limits["cap_trouble_max"] = 0  # no Troubleshooter job for codex: only Ben can fix it
+        c.probes["codex"] = FakeAgent(DOWN, provider="codex")
+        c._write("readiness_force.json", ["codex"])
+        for _ in range(3):
+            self.assertEqual(c.step(), "not_ready")
+        self.assertEqual(c.team.builder.prompts, [])
+        cap_mails = [s for s, b in self.mails if "codex" in (s + b).lower() and "Q-capability" in s]
+        self.assertEqual(len(cap_mails), 1, [s for s, _ in self.mails])
+
 
 class FinalizationAwaitingReview(Pipeline):
     """T1's merge candidate was judged and awaits the merge reviewer when Codex goes down."""

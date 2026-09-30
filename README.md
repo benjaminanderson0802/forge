@@ -13,7 +13,7 @@ has to pass through it, and nothing Forge does can change it without you.
 | `core/protect.py` | Protected paths Forge may never change: `core/`, `drills/`, `tests/acceptance/`, `charter/`, `spec/`, `.github/`, `roles.json`, `CODEOWNERS`. |
 | `core/runner.py` | Takes an agent through one attempt: claim, run, put back any protected file it touched (ledger included), record what changed and what it claimed, submit. `resume` recovers after a crash without redoing finished work. |
 | `core/cli.py` | `verify`, `apply`, `protect`, `run-acceptance`, `status`, `approve-spec`, `resume`. |
-| `drills/run_drills.py` | Sabotage drills 1–10. Each plants a failure and checks the core catches it. |
+| `drills/run_drills.py` | Sabotage drills 1–21 (1–10 trusted core, 11–21 Layer 1 gates). Each plants a failure and checks the core catches it. |
 | `.github/workflows/core-checks.yml` | Runs on every pull request: protected-path check, ledger verify, drills, acceptance tests. |
 | `charter/authority.md` | Draft Authority Charter (you fill in budgets). |
 | `roles.json` | Maps identities to roles. |

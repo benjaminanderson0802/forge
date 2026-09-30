@@ -1,4 +1,5 @@
-"""Sabotage drills for the trusted core (drills 1-10 from the Forge plan).
+"""Sabotage drills: the trusted core (drills 1-10 from the Forge plan) and the Layer 1 gates (11-13: 1C,
+14-16: 1D, 17-21: 1E). Drill numbers are unique and sequential; check_numbering() enforces it.
 
 Each drill plants a failure in a fresh, throwaway ledger and checks that
 the core catches it. Run:  python drills/run_drills.py
@@ -770,7 +771,15 @@ DRILLS = [
 ]
 
 
+def check_numbering(drills=None) -> None:
+    """Drill numbers are 1..N, each once, in order (layers merged from separate branches must not collide)."""
+    nums = [n for n, _, _ in (DRILLS if drills is None else drills)]
+    if nums != list(range(1, len(nums) + 1)):
+        raise ValueError(f"drill numbers must be 1..{len(nums)}, unique and in order: {nums}")
+
+
 def main() -> int:
+    check_numbering()
     results, ok = [], True
     for num, name, fn in DRILLS:
         try:
@@ -782,7 +791,7 @@ def main() -> int:
             results.append({"drill": num, "name": name, "status": "Failing", "detail": repr(e)})
             print(f"FAIL  drill {num}: {name}\n      {e!r}")
             traceback.print_exc()
-    (ROOT / "drills" / "results.json").write_text(json.dumps(results, indent=2))
+    (ROOT / "drills" / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     print("\nALL DRILLS PASS" if ok else "\nDRILLS FAILING")
     return 0 if ok else 1
 

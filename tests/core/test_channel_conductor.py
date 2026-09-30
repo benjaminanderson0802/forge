@@ -343,6 +343,30 @@ class StopDuringAgentRun(Harness):
         self.assertNotIn("TAMPER", log)
         self.assertEqual(c.run(max_steps=2, sleep=lambda s: None), "killed")
 
+    def test_stop_shortcut_during_a_builder_run_is_a_clean_stop(self):
+        """The Stop Forge shortcut (python -m core.service stop) writes only KILL into state/, never a temp file
+        beside it, so the after-run fingerprint sees a stop and not tampering (R42/R49)."""
+        from unittest.mock import patch
+        from core import service
+
+        def builder(prompt, cwd):
+            self.build_feature(prompt, cwd)
+            with patch.object(service.os, "replace", side_effect=AssertionError("KILL must be written in place")):
+                service.request_stop(self.state, "Stop Forge shortcut")
+            return '{"status":"done"}', 1
+
+        c = self.advance_to_build(agents={"test_writer": self.write_tests, "builder": builder})
+        before = c._task("T1")
+        self.assertEqual(c.step(), "killed")
+        self.assertIn("Stop Forge shortcut", (self.state / "KILL").read_text(encoding="utf-8"))
+        self.assertFalse((self.state / "KILL.tmp").exists())
+        self.assertEqual(c._task("T1"), before)
+        self.assertEqual(c._ledger().contracts()["T1"]["status"], "open")
+        qs = json.loads((self.state / "questions.json").read_text()) if (self.state / "questions.json").exists() else {}
+        self.assertEqual([q for q in qs.values() if q.get("kind") == "tamper"], [])
+        self.assertEqual(self.mails, [])
+        self.assertNotIn("TAMPER", (self.state / "errors.log").read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
