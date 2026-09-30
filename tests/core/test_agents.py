@@ -408,6 +408,48 @@ class R46FailedRunMeteringTests(unittest.TestCase):
                 self.write_log(session_id, self.usage_rows(), folder)
                 self.assertEqual(agents.claude_log_tokens(session_id, self.projects_dir), 161)
 
+    def malformed_log_rows(self):
+        return [
+            ("list-id", {"message": {"id": ["bad-id"], "usage": {"input_tokens": 10}}}),
+            ("dict-id", {"message": {"id": {"bad": "id"}, "usage": {"input_tokens": 10}}}),
+            ("number-id", {"message": {"id": 42, "usage": {"input_tokens": 10}}}),
+            ("list-record", ["bad-record"]),
+            ("string-record", "bad-record"),
+            ("list-message", {"message": ["bad-message"]}),
+            ("string-message", {"message": "bad-message"}),
+            ("number-message", {"message": 42}),
+            ("null-message", {"message": None}),
+        ]
+
+    def test_log_reader_skips_malformed_records_and_counts_valid_records(self):
+        from core import agents
+        from uuid import uuid4
+        for name, malformed in self.malformed_log_rows():
+            with self.subTest(record=name):
+                session_id = str(uuid4())
+                rows = self.usage_rows()
+                # Encode explicitly so a string record is valid JSON, not a broken line.
+                rows.insert(1, json.dumps(malformed))
+                self.write_log(session_id, rows)
+                self.assertEqual(agents.claude_log_tokens(session_id, self.projects_dir), 161)
+
+    def test_timeout_with_malformed_records_returns_failed_result_and_valid_tokens(self):
+        for name, malformed in self.malformed_log_rows():
+            with self.subTest(record=name):
+                def timeout(args, cwd, stdin_text, timeout_s):
+                    rows = self.usage_rows()
+                    rows.insert(1, json.dumps(malformed))
+                    self.write_log(self.session_id(args), rows)
+                    raise TimeoutError("agent timed out after 17s")
+
+                self.launch_mock.side_effect = timeout
+                result = ClaudeAgent(projects_dir=self.projects_dir).run("hello", self.cwd)
+                self.assertIsInstance(result, AgentResult)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.error, "agent timed out after 17s")
+                self.assertEqual(result.provider, "claude")
+                self.assertEqual(result.tokens, 161)
+
     def test_log_reader_unknown_session_returns_zero(self):
         from core import agents
         from uuid import uuid4
