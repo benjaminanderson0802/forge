@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from core import readiness
+from core import readiness, service
 from core.finalize import ApprovedMerges, Finalizer, Hooks, Journal, safe_push
 from core.ledger import Ledger, Rejected
 from core.mutation import changed_lines, run_mutation
@@ -1155,7 +1155,7 @@ class Conductor:
         return "not_ready" if self._waiting else "idle"
 
     def run(self, max_steps: int | None = None, idle_sleep_s: int = 60, heartbeat: Path | None = None,
-            sleep: Callable[[float], None] = time.sleep) -> str:
+            sleep: Callable[[float], None] = time.sleep, on_step: Callable[[str], None] | None = None) -> str:
         """Loop forever (or max_steps). Nothing ends the loop except the kill switch: errors are logged,
         Ben is told once after 3 in a row, and the loop backs off (R12, R13)."""
         n, status, errors, told = 0, "idle", 0, False
@@ -1168,8 +1168,13 @@ class Conductor:
                 status = "error"
                 self._log(f"step crashed: {e!r}")
             n += 1
-            if status == "killed":
-                return status
+            if status == "killed" or (self.state / "KILL").exists():  # T1D2: a stop pressed mid-step ends the loop
+                return "killed"
+            if on_step:  # T1D2: the always-on service (core.service): status, pacing; never fatal
+                try:
+                    on_step(status)
+                except Exception as e:  # noqa: BLE001
+                    self._log(f"on_step hook failed: {e!r}"[:500])
             if status == "error":
                 errors += 1
                 if errors >= 3 and not told:
@@ -2258,8 +2263,10 @@ def main(argv: list[str]) -> int:
         return 0
     if lock is None:
         return 0  # another conductor holds the lock; the watchdog calls us harmlessly
+    health = None
     try:
         if a.cmd == "run":
+            health = service.Health(forge / "state" / "service", limits).start()  # T1D2: heartbeat and stall exit
             if (c.state / "KILL").exists():  # R32: while stopped, only retry a pending halt alert
                 c._retry_halts()
                 return 0
@@ -2295,8 +2302,10 @@ def main(argv: list[str]) -> int:
                        "The conductor is running in the background. You'll hear from it only when something "
                        "needs you, when a layer is ready for approval, or if it hits trouble.\n\n"
                        "To stop everything: reply STOP to any Forge email.")
-        print(c.run(heartbeat=c.state / "conductor.heartbeat"))
+        print(service.Service(c, forge / "state" / "service", limits, health=health).serve())  # T1D2
     finally:
+        if health:
+            health.stop()
         lock.close()
     return 0
 
