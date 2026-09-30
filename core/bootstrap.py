@@ -910,8 +910,10 @@ class Conductor:
                   "\nRECENT FAILURES:\n" + "\n".join(t["notes"][-6:]) +
                   "\n\nLAST JUDGE OUTPUT:\n" + output[-4000:] +
                   "\nAnswer with JSON: {\"kind\": \"fix\" | \"dead_end\", \"notes\": \"...\", \"alternative\": \"...\"}")
-        r = self._call("troubleshooter", prompt, S_TROUBLE)
-        self._reset_wt()
+        try:
+            r = self._call("troubleshooter", prompt, S_TROUBLE)
+        finally:  # R42: a stopped or capped run leaves no edits behind
+            self._reset_wt()
         notes = t.get("trouble_notes", [])
         if r.ok:
             d = r.data or {}
