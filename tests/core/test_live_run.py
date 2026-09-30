@@ -1332,7 +1332,7 @@ class R37PerLaunchCapTests(Harness):
         def planner(prompt, cwd):
             (cwd / "plan.md").write_text("Implement feature value 42 with acceptance tests.\n", encoding="utf-8")
             c.meter.add("codex", self.cap + 1)
-            return json.dumps({"tasks": [self.task(id="T2")]}), 1
+            return json.dumps({"tasks": [self.task(id="T2", section="Implement the feature module in feat.py and expose a public module-level VALUE constant set to the integer 42. Consumers must be able to import feat and read feat.VALUE without calling an initializer or providing configuration. Importing the module must be deterministic and must not print output, read environment variables, write files, or make network requests. Keep the implementation independent of the current working directory and ensure repeated imports preserve the same value and type. Add acceptance coverage in tests/core/test_feat.py that imports the module, verifies VALUE equals 42, and checks that it is an integer rather than a string or boolean. Cover a fresh import and a repeated import so accidental initialization side effects are caught. Acceptance is complete when the scoped unittest command passes and the module exposes the documented interface without additional dependencies.")]}), 1
 
         c = self.capped_conductor(self.task(kind="plan", plan_file="plan.md"), agents={"planner": planner})
         before = c._task("T1")
