@@ -194,8 +194,8 @@ def parse_claude(out: str, schema: dict | None) -> AgentResult:
     if not isinstance(data, dict):
         return AgentResult(out[-500:], 0, False, "unreadable output from Claude Code", None, "claude")
     u = data.get("usage") or {}
-    tokens = sum(int(u.get(k) or 0) for k in
-                 ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens")) \
+        + int(u.get("cache_read_input_tokens") or 0) // 10  # R43: cache reads cost about a tenth
     text = str(data.get("result") or "")
     if data.get("is_error"):
         return AgentResult(text, tokens, False, text or "Claude Code reported an error", None, "claude")
@@ -211,7 +211,10 @@ def parse_codex(code: int, events_out: str, last_message: str, schema: dict | No
             continue
         if ev.get("type") == "turn.completed":
             u = ev.get("usage") or {}
-            tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "output_tokens", "reasoning_output_tokens"))
+            inp = int(u.get("input_tokens") or 0)
+            cached = min(max(int(u.get("cached_input_tokens") or 0), 0), max(inp, 0))  # R43: clamped to 0..input
+            tokens = (inp - cached) + cached // 10 + int(u.get("output_tokens") or 0) \
+                + int(u.get("reasoning_output_tokens") or 0)
             done = True
     if code != 0 or not done or not last_message.strip():
         why = _codex_error(events_out)
