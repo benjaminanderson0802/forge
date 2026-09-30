@@ -95,7 +95,8 @@ class Pipeline(Harness):
         self.teams.append(self.team)
         c = cls(self.repo, self.work, self.state, self.team, self.c.limits, owner_email="ben@example.com",
                 mailer=lambda s, b: self.mails.append((s, b)), inbox=lambda: self.messages, gh=self.gh,
-                judge_cmds=list(judge_cmds or []), push=True)
+                judge_cmds=list(judge_cmds or []), push=True,
+                checks=self.checks, probes=self.probes)  # T1B2b: healthy readiness fakes, never the real ones
         if crash_at:
             c.crash_at = crash_at
         self.c = c

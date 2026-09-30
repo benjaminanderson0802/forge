@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from core import readiness
 from core.finalize import ApprovedMerges, Finalizer, Hooks, Journal, safe_push
 from core.ledger import Ledger, Rejected
 from core.mutation import changed_lines, run_mutation
@@ -89,13 +90,14 @@ def _obj(props: dict, required: list[str]) -> dict:
 # R17: full JSON Schemas; "required" is what the conductor needs, the rest is optional.
 S_TESTS = _obj({"files": _STRS, "summary": _STR}, ["files"])
 S_BUILD = _obj({"status": {"type": "string", "enum": ["done", "blocked"]}, "summary": _STR, "tried": _STRS,
-                "error": _STR}, ["status"])
+                "error": _STR, "capability": _STR, "meanwhile": _STR}, ["status"])
 S_REVIEW = _obj({"verdict": {"type": "string", "enum": ["pass", "fail"]}, "reasons": _STRS}, ["verdict", "reasons"])
 S_TROUBLE = _obj({"kind": {"type": "string", "enum": ["fix", "dead_end", "suggestion"]}, "notes": _STR,
                   "alternative": _STR}, ["kind", "notes"])
 S_DRIFT = _obj({"status": {"type": "string", "enum": ["ok", "replan"]}, "reasons": _STRS}, ["status"])
 S_PLAN = _obj({"tasks": {"type": "array", "items": _obj(
-    {"id": _STR, "title": _STR, "section": _STR, "files_in_scope": _STRS, "test_files": _STRS, "test_cmd": _STR},
+    {"id": _STR, "title": _STR, "section": _STR, "files_in_scope": _STRS, "test_files": _STRS, "test_cmd": _STR,
+     "needs": {"type": "array", "items": {"type": "string"}}},
     list(TASK_FIELDS))}}, ["tasks"])
 
 
@@ -123,6 +125,14 @@ class Tampered(Exception):
 
 class Capped(Exception):
     """R37: the agent's provider is at its daily token cap; nothing was launched."""
+
+
+class NotReady(Exception):
+    """D-030: a capability the agent needs lacks usable evidence; nothing was written or launched."""
+
+    def __init__(self, names: dict[str, str]):
+        self.names = dict(names)
+        super().__init__("; ".join(f"{n}: {why}" for n, why in sorted(self.names.items())))
 
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
@@ -157,6 +167,11 @@ def validate_task(t: dict) -> str | None:
     """R1: returns a problem description, or None if the task is safe to run."""
     if not isinstance(t.get("id"), str) or not ID_RE.match(t["id"]):
         return f"bad id {t.get('id')!r}"
+    if "needs" in t:  # D-030: optional capability names the builder needs
+        nd = t["needs"]
+        if not isinstance(nd, list) or len(nd) > 10 or not all(
+                isinstance(x, str) and readiness.NAME_RE.match(x) for x in nd):
+            return "bad needs"
     if t.get("kind", "build") == "plan":
         pf = _norm(str(t.get("plan_file", "")))
         return None if pf and ".." not in pf and not re.match(r"^([A-Za-z]:|/)", pf) else "bad plan_file"
@@ -181,7 +196,8 @@ class Conductor:
     def __init__(self, repo: Path, work: Path, state: Path, team: Team, limits: dict, *,
                  owner_email: str, mailer: Callable[[str, str], None], inbox: Callable[[], list[dict]],
                  gh: Callable[[list[str]], tuple[int, str]], clock: Callable[[], datetime] | None = None,
-                 judge_cmds: list[str] | None = None, push: bool = True):
+                 judge_cmds: list[str] | None = None, push: bool = True,
+                 checks: dict | None = None, probes: dict | None = None):
         self.repo, self.work, self.state = Path(repo), Path(work), Path(state)
         self.team, self.limits = team, limits
         self.owner = owner_email.strip().lower()
@@ -191,6 +207,11 @@ class Conductor:
         self.push = push
         self.meter = Meter(self.state, clock=self.clock)
         self.state.mkdir(parents=True, exist_ok=True)
+        # D-030: readiness always runs; None means the real checks and AI probes (there is no "off" mode).
+        self.checks = dict(real_checks() if checks is None else checks)
+        self.probes = dict(real_probes(limits) if probes is None else probes)
+        self.diagnose_probe = None  # None: readiness' own hidden probe (docker ps for n8n); tests inject fakes
+        self.diagnose_which = None
 
     # ------------------------------------------------------------------ files
     def _read(self, name: str, default):
@@ -266,6 +287,7 @@ class Conductor:
         t.setdefault("review_feedback", [])
         t.setdefault("trouble_notes", [])
         t.setdefault("troubleshoots", 0)
+        t.setdefault("needs", [])
         return t
 
     def _ensure_worktree(self, layer: str) -> None:
@@ -321,11 +343,18 @@ class Conductor:
             raise RuntimeError(f"push {status}: {out[:300]}")
 
     # ------------------------------------------------------------------ agents
-    def _call(self, role: str, prompt: str, schema: dict | None, cwd: Path | None = None):
+    def _call(self, role: str, prompt: str, schema: dict | None, cwd: Path | None = None, needs=None):
         agent = getattr(self.team, role)
         provider = getattr(agent, "provider", None)
         if provider and self.meter.over(provider, self.limits):  # R37: checked before every launch
             raise Capped(provider)
+        self._launch_gate(provider, needs)
+        prompt = prompt + self._prompt_blocks(role)
+        return self._guarded_run(role, agent, prompt, cwd, schema)
+
+    def _guarded_run(self, label: str, agent, prompt: str, cwd: Path | None, schema: dict | None):
+        """R14/R15 guarded agent run: run record, fingerprint before and after, KILL on tamper, metering."""
+        role = label
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + role + "-" + uuid.uuid4().hex[:6]
         d = self.state / "runs" / run_id
         d.mkdir(parents=True, exist_ok=True)
@@ -402,8 +431,413 @@ class Conductor:
         providers = {getattr(getattr(self.team, f), "provider", None) for f in Team.__dataclass_fields__}
         return any(p and self.meter.over(p, self.limits) for p in providers)
 
+    # ------------------------------------------------------------------ readiness (D-030)
+    @property
+    def _map_path(self) -> Path:
+        return self.state / "capabilities.json"
+
+    def _cap_map(self) -> dict:
+        return readiness.read_map(self._map_path)
+
+    @staticmethod
+    def _age_s(entry, now: datetime) -> float | None:
+        """Age of an entry's checked_at in seconds, or None when it is missing, invalid or naive."""
+        raw = entry.get("checked_at") if isinstance(entry, dict) else None
+        if not isinstance(raw, str):
+            return None
+        try:
+            at = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if at.tzinfo is None or at.utcoffset() is None:
+            return None
+        return (now - at).total_seconds()
+
+    def _reusable_ok(self, name: str, entry, now: datetime) -> bool:
+        ttl = readiness.ok_ttl_s(name, self.limits)
+        age = self._age_s(entry, now)
+        return ttl > 0 and readiness.broken(entry, now, ttl) is None and age is not None and 0 <= age < ttl
+
+    def _refresh_readiness(self, names=None, force=frozenset()) -> dict:
+        """Run the plain checks and (guarded, cap-aware) AI probes, write the capability map and return it.
+        names limits the refresh to those capabilities; force bypasses every cache for the names in it."""
+        if (self.state / "KILL").exists():
+            return self._cap_map()
+        old = self._cap_map()
+        now = self.clock()
+        force = set(force or ())
+        wanted = None if names is None else set(names)
+        pending = self._read("readiness_force.json", [])
+        pending = [n for n in pending if isinstance(n, str)] if isinstance(pending, list) else []
+        if pending:  # T1B2d: names Ben replied about are re-checked without any cache
+            force |= {n for n in pending if wanted is None or n in wanted}
+            left = [n for n in pending if not (wanted is None or n in wanted)]
+            if left:
+                self._write("readiness_force.json", left)
+            else:
+                (self.state / "readiness_force.json").unlink(missing_ok=True)
+        new = dict(old)  # a targeted refresh keeps every other entry as it was
+
+        todo = {}
+        for name, fn in self.checks.items():
+            if wanted is not None and name not in wanted:
+                continue
+            if name not in force and self._reusable_ok(name, old.get(name), now):
+                continue  # gmail/browser: the permitted per-check cache
+            todo[name] = fn
+        if todo:
+            new.update(readiness.evaluate(todo, float(self.limits.get("check_timeout_s", 60)), now))
+
+        for name, agent in self.probes.items():
+            if wanted is not None and name not in wanted:
+                continue
+            prev = old.get(name)
+            if name not in force:
+                if self._reusable_ok(name, prev, now):
+                    continue
+                age = self._age_s(prev, now)
+                if isinstance(prev, dict) and prev.get("ok") is False and age is not None \
+                        and 0 <= age < readiness.fail_retry_s(name, self.limits):
+                    continue
+            if self.meter.over(getattr(agent, "provider", None) or name, self.limits):
+                continue  # R37: a capped provider is never probed; the old entry (if any) stays
+            probe_dir = self.work / "_probe"
+            probe_dir.mkdir(parents=True, exist_ok=True)
+            r = self._guarded_run(f"probe-{name}", agent, readiness.PROBE_PROMPT, probe_dir, None)
+            ok, detail = readiness.probe_ok(r)
+            new[name] = {"ok": bool(ok), "detail": str(detail)[:readiness.DETAIL_MAX], "checked_at": now.isoformat()}
+
+        result = {k: v for k, v in new.items() if k in self.checks or k in self.probes}
+        readiness.write_map(self._map_path, result)
+        return result
+
+    def session_start(self) -> dict:
+        """D-030: readiness before every build session. Launches nothing while stopped, paused or capped."""
+        if (self.state / "KILL").exists() or (self.state / "PAUSED").exists() or self._capped():
+            return {}
+        m = self._refresh_readiness()
+        try:
+            self._route_capabilities(m)
+        except Capped:
+            pass  # the job waits for the cap to reset; nothing was launched
+        self._capability_mail_check()
+        return self._cap_map()
+
+    def _requirements(self, role: str, task: dict | None = None) -> set[str]:
+        provider = getattr(getattr(self.team, role), "provider", None)
+        return readiness.requirements(provider, (task.get("needs") or []) if role == "builder" and task else None)
+
+    def _unready(self, names, cap_map: dict | None = None) -> dict[str, str]:
+        m = self._cap_map() if cap_map is None else cap_map
+        now = self.clock()
+        out = {}
+        for n in sorted(names):
+            why = readiness.broken(m.get(n), now, readiness.max_age_for(n, self.limits))
+            if why is not None:
+                out[n] = why
+        return out
+
+    def ready_for(self, role: str, task: dict | None = None, cap_map: dict | None = None) -> dict[str, str]:
+        """{name: reason} for every capability this role (and task, for the builder) needs but lacks usable
+        evidence for. Empty means ready. The one readiness predicate (D-030)."""
+        return self._unready(self._requirements(role, task), cap_map)
+
+    def _launch_gate(self, provider: str | None, needs=None) -> None:
+        """Before anything is written or launched: every needed capability has usable evidence, or NotReady."""
+        req = readiness.requirements(provider, list(needs or []))
+        unready = self._unready(req)
+        known = set(self.checks) | set(self.probes)
+        again = {n for n, why in unready.items()
+                 if why.startswith("stale evidence") or (why == "no evidence" and n in known)}
+        if again:
+            self._refresh_readiness(names=again)  # never probes a capped provider
+            unready = self._unready(req)
+            if provider and self.meter.over(provider, self.limits):  # a metered probe may have used the budget
+                raise Capped(provider)
+        if unready:
+            raise NotReady(unready)
+
+    def _active_finalization(self, q: dict) -> str | None:
+        """The first active (never blocked) merge-journal record, in queue order."""
+        active = {r["tid"] for r in Journal(self.state).active()}
+        return next((t["id"] for t in q["tasks"] if t["id"] in active), None) or min(active, default=None)
+
+    def _finalize_unready(self, cap_map: dict) -> dict[str, str]:
+        """A finalization works in git and, with push on, pushes to GitHub. A merge reviewer it may need is
+        gated by _call itself."""
+        return self._unready({"git"} | ({"github"} if self.push else set()), cap_map)
+
+    def _gate_ready(self, cap_map: dict) -> dict[str, str]:
+        return self._unready({"git", "github"}, cap_map)
+
+    def _pick_tasks(self, q: dict, cap_map: dict):
+        """Runnable tasks in the order they should run: pending troubleshooting first (troubleshooter's
+        requirements only), then todo/tests_ok tasks in queue order. Unready tasks record waiting_on and are
+        skipped; self._waiting says whether anything was skipped for readiness."""
+        tasks = [t for t in q["tasks"] if t["status"] in ("todo", "tests_ok")]
+        pending = [t for t in tasks if t["status"] == "tests_ok" and t.get("troubleshoot_pending")]
+        rest = [t for t in tasks if t not in pending]
+        for t in pending + rest:
+            unready = self.ready_for(self._stage_role(t), t, cap_map)
+            waiting = sorted(unready)
+            if waiting or t.get("waiting_on"):
+                if t.get("waiting_on") != waiting:
+                    self._update(t["id"], waiting_on=waiting)
+            if waiting:
+                self._waiting = True
+                continue
+            yield t
+
+    @staticmethod
+    def _stage_role(t: dict) -> str:
+        """The role that runs a task's next stage."""
+        if t["status"] == "tests_ok" and t.get("troubleshoot_pending"):
+            return "troubleshooter"
+        if t.get("kind") == "plan":
+            return "planner"
+        return "test_writer" if t["status"] == "todo" else "builder"
+
+    # ------------------------------------------------------------------ capability routing (T1B2d, D-030)
+    def _role_providers(self) -> set[str]:
+        return {p for p in (getattr(getattr(self.team, f), "provider", None) for f in Team.__dataclass_fields__) if p}
+
+    def _open_cap_items(self) -> dict:
+        return {k: v for k, v in self._read("questions.json", {}).items()
+                if v.get("kind") == "capability" and v.get("status") == "open"}
+
+    def _diagnose(self, name: str, cap_map: dict) -> dict:
+        kw = {}
+        if self.diagnose_probe is not None:
+            kw["probe"] = self.diagnose_probe
+        if self.diagnose_which is not None:
+            kw["which"] = self.diagnose_which
+        return readiness.diagnose(name, cap_map.get(name), cap_map, **kw)
+
+    def _trouble_available(self, cap_map: dict) -> bool:
+        provider = getattr(self.team.troubleshooter, "provider", None)
+        return not self.ready_for("troubleshooter", cap_map=cap_map) and not (
+            provider and self.meter.over(provider, self.limits))
+
+    def _cap_candidates(self, cap_map: dict) -> tuple[list[str], dict, dict]:
+        """(ordered candidates, diagnoses, active tasks). Dependents of another candidate are left out."""
+        now = self.clock()
+        tasks = [t for t in self._queue().get("tasks", []) if t.get("status") not in ("done", "blocked")]
+        roles_need = {"git"} | self._role_providers()
+        required = set(roles_need)
+        for t in tasks:
+            required.update(n for n in (t.get("needs") or []) if isinstance(n, str))
+        cands = {n for n, e in cap_map.items() if readiness.broken(e, now, readiness.max_age_for(n, self.limits))}
+        cands |= {n for n in required if n not in cap_map}
+        diag = {n: self._diagnose(n, cap_map) for n in cands}
+        cands = {n for n in cands if diag[n].get("depends_on") not in cands}
+        waiting = set(roles_need)
+        for t in tasks:
+            waiting.update(t.get("waiting_on") or [])
+            waiting.update(t.get("needs") or [])
+        order = sorted(cands, key=lambda n: (n != "git", n not in waiting, n))
+        return order, diag, {t["id"]: t for t in tasks}
+
+    def _cap_item_text(self, name: str, entry, d: dict, task_ids: list[str], waiting_desc: str) -> tuple[str, str]:
+        condition = d.get("condition", "error")
+        subject = f"Forge needs {name} fixed ({condition})"
+        detail = entry.get("detail") if isinstance(entry, dict) else None
+        detail = str(detail) if detail else ("no readiness evidence yet" if entry is None else "no detail recorded")
+        fix = str(d.get("fix", ""))
+        if fix.startswith("PowerShell: "):
+            how = "Paste this into PowerShell:\n" + fix[len("PowerShell: "):]
+        elif fix.startswith("Win + R: "):
+            how = "Press Win + R and paste:\n" + fix[len("Win + R: "):]
+        else:
+            how = fix  # an instruction, not a command (for example: reply with "not needed")
+        parts = [f"Forge's readiness check says {name} is not usable.", f"Detail: {detail}", how]
+        if d.get("then"):
+            parts.append(f"Then: {d['then']}")
+        parts.append(f"Waiting on it: {waiting_desc}")
+        parts.append(f"If you don't answer, Forge keeps skipping work that needs {name} and re-checks it every cycle.")
+        if condition == "no_check":
+            parts.append(f"Forge has no automatic check for {name}. If the work doesn't really need it, reply to "
+                         "this email with the first line: not needed\nAny other reply is kept for the "
+                         "Troubleshooter; only a passing check closes this item.")
+        return subject, "\n\n".join(parts)
+
+    def _file_cap_item(self, name: str, cap_map: dict, d: dict, tasks: dict) -> None:
+        """Exactly one open capability item per name; updated in place when the condition changes."""
+        task_ids = sorted(tid for tid, t in tasks.items() if name in (t.get("needs") or []))
+        roles = sorted(r for r in Team.__dataclass_fields__ if name in self._requirements(r))
+        stage_waits = sorted(tid for tid, t in tasks.items()
+                             if name in self._requirements(self._stage_role(t), t))
+        waiting_desc = "; ".join(x for x in (
+            ("roles: " + ", ".join(roles)) if roles else "",
+            ("tasks: " + ", ".join(sorted(set(task_ids) | set(stage_waits)))) if (task_ids or stage_waits) else "",
+        ) if x) or "nothing right now"
+        subject, body = self._cap_item_text(name, cap_map.get(name), d, task_ids, waiting_desc)
+        for qid, q in self._open_cap_items().items():
+            if q.get("capability") == name:
+                if q.get("condition") != d.get("condition") or q.get("tasks") != task_ids:
+                    qs = self._read("questions.json", {})
+                    qs[qid].update(condition=d.get("condition"), tasks=task_ids,
+                                   subject=subject[:SUBJECT_CAP], body=body[:BODY_CAP])
+                    self._write("questions.json", qs)
+                return
+        self._ask("capability", subject, body, hold=True, capability=name, condition=d.get("condition"),
+                  tasks=task_ids)
+
+    def _route_capabilities(self, cap_map: dict) -> str | None:
+        """Route every broken or missing capability: at most one Troubleshooter job per step, everything else
+        to Ben's queue (held unless _capability_mail_check releases it). Returns "worked" after a job."""
+        now = self.clock()
+        routing = self._read("cap_routing.json", {})
+        routing = routing if isinstance(routing, dict) else {}
+        # 2. resolved: usable evidence closes the item and resets routing state
+        self._resolve_caps(cap_map, routing)
+        order, diag, tasks = self._cap_candidates(cap_map)
+        if not order:
+            return None
+        max_rounds = int(self.limits.get("cap_trouble_max", 3))
+        retry_s = float(self.limits.get("cap_retry_h", 1)) * 3600
+        available = self._trouble_available(cap_map)
+
+        def job_possible_now(n: str) -> bool:
+            st = routing.get(n) or {}
+            last = self._age_s({"checked_at": st.get("last_job")}, now) if st.get("last_job") else None
+            return available and bool(diag[n].get("troubleshoot")) and int(st.get("rounds", 0)) < max_rounds \
+                and (last is None or last >= retry_s)
+
+        job = next((n for n in order if job_possible_now(n)), None)
+        for n in order:  # everything that can't get a job, now or later, goes to Ben
+            st = routing.get(n) or {}
+            if not (available and diag[n].get("troubleshoot") and int(st.get("rounds", 0)) < max_rounds):
+                self._file_cap_item(n, cap_map, diag[n], tasks)
+        if job is None:
+            return None
+        self._cap_job(job, cap_map, diag[job], tasks, routing)
+        return "worked"
+
+    def _resolve_caps(self, cap_map: dict, routing: dict) -> None:
+        now = self.clock()
+        usable = {n for n, e in cap_map.items()
+                  if readiness.broken(e, now, readiness.max_age_for(n, self.limits)) is None}
+        qs = self._read("questions.json", {})
+        changed = False
+        for q in qs.values():
+            if q.get("kind") == "capability" and q.get("status") == "open" and q.get("capability") in usable:
+                q["status"], q["closed_at"] = "resolved", now.isoformat()
+                q["closed_seq"] = self._read("q_seq.json", {}).get("n", 0)
+                changed = True
+        if changed:
+            self._write("questions.json", _prune_questions(qs))
+        gone = [n for n in routing if n in usable]
+        if gone:
+            for n in gone:
+                del routing[n]
+            self._write("cap_routing.json", routing)
+
+    def _cap_job(self, name: str, cap_map: dict, d: dict, tasks: dict, routing: dict) -> None:
+        entry = cap_map.get(name)
+        detail = entry.get("detail") if isinstance(entry, dict) else None
+        waiting = sorted(tid for tid, t in tasks.items() if name in (t.get("needs") or []))
+        prompt = (f"You are the TROUBLESHOOTER. CAPABILITY FIX JOB: {name}\n\n"
+                  f"Forge's plain-code readiness check says the capability {name} is not usable, and work waits "
+                  "on it. Make it work, then say what you did.\n\n"
+                  f"Detail: {detail if detail else 'no readiness evidence yet'}\n"
+                  f"Diagnosed condition: {d.get('condition')}\n"
+                  f"Suggested fix line: {d.get('fix')}\n" +
+                  (f"Then: {d.get('then')}\n" if d.get("then") else "") +
+                  f"Tasks waiting on it: {', '.join(waiting) or 'none named'}\n\n"
+                  "RULES:\n"
+                  "- Free, vetted tools only (D-032): a known publisher, not on the do-not-install list, no account "
+                  "needed.\n"
+                  "- No paid services and no new accounts; anything like that is Ben's call.\n"
+                  "- Never read, print or log secrets (passwords, tokens, keys).\n"
+                  "- Nothing visible on Ben's screen: no windows, no taking over his mouse or keyboard.\n"
+                  "- Work in this folder; never touch Forge's state files.\n\n"
+                  "Answer with JSON: {\"kind\": \"fix\" | \"dead_end\" | \"suggestion\", \"notes\": \"...\", "
+                  "\"alternative\": \"...\"}")
+        folder = self.work / "_capfix"
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            r = self._call("troubleshooter", prompt, S_TROUBLE, cwd=folder)  # Capped and Tampered propagate
+        except NotReady:
+            r = None
+        st = dict(routing.get(name) or {})
+        st["rounds"] = int(st.get("rounds", 0)) + 1
+        st["last_job"] = self.clock().isoformat()
+        routing[name] = st
+        self._write("cap_routing.json", routing)
+        if r is not None and r.ok and (r.data or {}).get("kind") == "dead_end":
+            with (self.state / "dead_ends.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"capability": name, "notes": (r.data or {}).get("notes", ""),
+                                    "alternative": (r.data or {}).get("alternative", "")}) + "\n")
+        m = self._refresh_readiness(names={name}, force={name})
+        self._resolve_caps(m, self._read("cap_routing.json", {}))
+
+    def _capability_mail_check(self) -> None:
+        """D-023: an instant email only when Ben alone can unblock all progress; otherwise items stay held."""
+        items = self._open_cap_items()
+        if not items:
+            return
+        m = self._cap_map()
+        q = self._queue()
+        if q.get("drift_due") and not self.ready_for("drift_keeper", cap_map=m):
+            return
+        if self._active_finalization(q) is not None and not self._finalize_unready(m):
+            return  # a finalization (T1B3e) that can run is progress too
+        for t in q.get("tasks", []):
+            if t.get("status") in ("todo", "tests_ok") and not self.ready_for(self._stage_role(t), t, m):
+                return
+        order, diag, _ = self._cap_candidates(m)
+        routing = self._read("cap_routing.json", {})
+        if not self.ready_for("troubleshooter", cap_map=m):  # usable now, or once its provider's cap resets
+            max_rounds = int(self.limits.get("cap_trouble_max", 3))
+            if any(diag[n].get("troubleshoot") and int((routing.get(n) or {}).get("rounds", 0)) < max_rounds
+                   for n in order):
+                return  # a Troubleshooter job is still possible, now or later
+        for qid, it in items.items():
+            if it.get("hold") or it.get("delivered") is False:
+                qs = self._read("questions.json", {})
+                qs[qid]["hold"] = False
+                self._write("questions.json", qs)
+                self._deliver(qid)
+
+    MAP_BLOCK_CAP, DEAD_BLOCK_CAP, DEAD_LINES = 4000, 20000, 50
+
+    def _map_block(self) -> str:
+        head = "CAPABILITY MAP (plain-code readiness check; blocker claims that contradict it are rejected):"
+        m, now = self._cap_map(), self.clock()
+        if not m:
+            return head + "\n(no readiness evidence yet)"
+        lines = []
+        for name in sorted(m):
+            e = m[name]
+            why = readiness.broken(e, now, readiness.max_age_for(name, self.limits))
+            detail = e.get("detail", "") if isinstance(e, dict) else ""
+            at = e.get("checked_at", "?") if isinstance(e, dict) else "?"
+            state = "OK" if why is None else f"BROKEN ({why})"
+            lines.append(f"- {name}: {state} - {detail} (checked {at})")
+        text = head + "\n" + "\n".join(lines)
+        if len(text) > self.MAP_BLOCK_CAP:
+            text = text[:self.MAP_BLOCK_CAP - 4].rstrip() + "\n..."
+        return text
+
+    def _dead_block(self) -> str:
+        lines = self._dead_ends()[-self.DEAD_LINES:]
+        while lines and len("\n".join(lines)) > self.DEAD_BLOCK_CAP:
+            lines = lines[1:]  # drop the oldest first
+        if not lines:
+            return ""
+        return "KNOWN DEAD ENDS:\n" + "\n".join(lines)[-self.DEAD_BLOCK_CAP:]
+
+    def _prompt_blocks(self, role: str) -> str:
+        """Appended to every prompt (never prepended): the capability map; dead ends for builder/troubleshooter."""
+        out = "\n\n" + self._map_block() + "\n"
+        if role in ("builder", "troubleshooter"):
+            dead = self._dead_block()
+            if dead:
+                out += "\n" + dead + "\n"
+        return out
+
     # ------------------------------------------------------------------ email
-    def _ask(self, kind: str, subject: str, body: str, halt: bool = False, **extra) -> str:
+    def _ask(self, kind: str, subject: str, body: str, halt: bool = False, hold: bool = False, **extra) -> str:
         qs = self._read("questions.json", {})
         seq = self._read("q_seq.json", {"n": len(qs)})
         seq["n"] = int(seq.get("n", 0)) + 1
@@ -414,8 +848,11 @@ class Conductor:
                    "body": str(body)[:BODY_CAP], "delivered": False, **extra}  # R28
         if halt:
             qs[qid]["halt"] = True  # R32: retried on watchdog starts while KILL is set
+        if hold:
+            qs[qid]["hold"] = True  # T1B2d: stored, not sent (the digest or an instant-email check sends it)
         self._write("questions.json", _prune_questions(qs))
-        self._deliver(qid, halt=halt)
+        if not hold:
+            self._deliver(qid, halt=halt)
         return qid
 
     def _send(self, subject: str, body: str, halt: bool = False) -> bool:
@@ -503,7 +940,7 @@ class Conductor:
 
     def _handle_inbox(self) -> None:
         for qid, q in self._read("questions.json", {}).items():
-            if q.get("delivered") is False:
+            if q.get("delivered") is False and not q.get("hold"):
                 self._deliver(qid)
         try:
             messages = self.inbox() or []
@@ -568,6 +1005,9 @@ class Conductor:
             self._save_queue(qd)
         elif q["kind"] == "merge":  # the only thing that retries a blocked merge record
             Journal(self.state).unblock(qid, body.strip()[:NOTE_CAP])
+        elif q["kind"] == "capability":
+            if not self._answer_capability(qs, q, reply, body):
+                return
         elif q["kind"] == "replan":
             qd = self._queue()
             qd["notes"] = ([str(x)[:NOTE_CAP] for x in qd.get("notes", [])] + [f"Ben: {body.strip()}"[:NOTE_CAP]])[-NOTES_KEEP:]
@@ -578,6 +1018,27 @@ class Conductor:
         q["closed_seq"] = self._read("q_seq.json", {}).get("n", 0)
         q["closed_at"] = self.clock().isoformat()
         self._write("questions.json", _prune_questions(qs))
+
+    def _answer_capability(self, qs: dict, q: dict, reply: str, body: str) -> bool:
+        """A reply never makes a capability ready. It is kept and forces a re-check; only a first line of
+        exactly "not needed" drops the need from the item's tasks and closes it. Returns True to close."""
+        name = str(q.get("capability", ""))
+        q["replies"] = ([str(x)[:NOTE_CAP] for x in q.get("replies", [])] + [body.strip()[:NOTE_CAP]])[-NOTES_KEEP:]
+        first = reply.strip().rstrip(".!?,;: ").strip().lower()
+        if first == "not needed" and name and name != "git" and name not in self._role_providers():
+            ids = set(q.get("tasks") or [])
+            qd = self._queue()
+            for t in qd["tasks"]:
+                if t["id"] in ids and name in (t.get("needs") or []):
+                    t["needs"] = [n for n in t["needs"] if n != name]
+            self._save_queue(qd)
+            return True
+        force = self._read("readiness_force.json", [])
+        force = [n for n in force if isinstance(n, str)] if isinstance(force, list) else []
+        if name and name not in force:
+            self._write("readiness_force.json", force + [name])
+        self._write("questions.json", _prune_questions(qs))
+        return False
 
     # ------------------------------------------------------------------ main step
     def step(self) -> str:
@@ -590,71 +1051,108 @@ class Conductor:
             return "paused"
         if self._capped():
             return "capped"
+        # D-030 / T1B3e order: readiness first (every cycle, before any launch), then crash recovery of the
+        # ledger, the merge journal and the worktrees, then capability routing, then work.
+        try:
+            fresh = self._refresh_readiness()
+        except Tampered:
+            return "killed"
+        except Capped:
+            return "capped"
+        except (RuntimeError, OSError) as e:  # R15 fail-closed preconditions: a stage-like error
+            self._log(f"readiness refresh error: {e!r}"[:500])
+            return "error"
         try:
             self._reconcile_merges()
         except (RuntimeError, OSError, Rejected) as e:
             self._log(f"reconcile error: {e!r}")
             return "error"
+        try:
+            routed = self._route_capabilities(fresh)
+        except Tampered:
+            return "killed"
+        except Capped:
+            return "capped"
+        except (RuntimeError, OSError) as e:
+            self._log(f"capability routing error: {e!r}"[:500])
+            return "error"
+        if routed == "worked":
+            return "worked"
+        self._capability_mail_check()
         q = self._queue()
+        cap_map = self._cap_map()
+        self._waiting = False
         if q.get("drift_due"):
-            try:
-                self._drift_check()
-            except Capped:
-                return "capped"
-            except Tampered:
-                return "killed"
-            return "worked"
-        active = {r["tid"] for r in Journal(self.state).active()}
-        tid = next((t["id"] for t in q["tasks"] if t["id"] in active), None) or min(active, default=None)
-        if tid is not None:  # a started finalization comes before any new work; blocked records never run
-            try:
-                self._ensure_worktree(q["layer"])
-                self._finalizer().run(tid)
-            except Capped:
-                return "capped"
-            except Tampered:
-                return "killed"
-            except (RuntimeError, OSError, Rejected) as e:  # R13; never a failed attempt
-                self._log(f"finalize error on {tid}: {e!r}")
-                return "error"
-            return "worked"
-        for t in q["tasks"]:
-            if t["status"] in ("todo", "tests_ok"):
+            if self.ready_for("drift_keeper", cap_map=cap_map):
+                self._waiting = True  # the gate stays closed while drift_due is set
+            else:
                 try:
-                    self._ensure_worktree(q["layer"])
-                    if t["kind"] == "plan":
-                        self._plan_stage(t["id"])
-                    elif t["status"] == "todo":
-                        self._tests_stage(t["id"])
-                    else:
-                        self._build_stage(t["id"])
+                    self._drift_check()
+                except Capped:
+                    return "capped"
+                except NotReady:
+                    return "not_ready"
                 except Tampered:
                     return "killed"
-                except Capped:  # R37: the attempt was undone by its stage; retried when the cap resets
-                    return "capped"
-                except (RuntimeError, OSError) as e:  # R8: git or filesystem trouble is a failed attempt
-                    self._log(f"stage error on {t['id']}: {e!r}")
-                    try:
-                        cur = self._task(t["id"])
-                        self._update(t["id"], notes=cur["notes"] + [f"git error: {e}"[:300]])
-                        if cur["status"] == "tests_ok":
-                            self._after_failure(t["id"], f"git error: {e}"[:300], "git-error", "")
-                    except Exception as e2:  # noqa: BLE001
-                        self._log(f"could not record stage error: {e2!r}")
-                    return "error"  # R13: run() backs off on this
                 return "worked"
+        tid = self._active_finalization(q)
+        if tid is not None:  # a started finalization comes before any new work; blocked records never run
+            if self._finalize_unready(cap_map):  # D-030: it pushes, so it waits like any launch
+                self._waiting = True
+            else:
+                try:
+                    self._ensure_worktree(q["layer"])
+                    self._finalizer().run(tid)
+                except Capped:
+                    return "capped"
+                except NotReady:  # the merge reviewer's gate; the record stays where it was
+                    return "not_ready"
+                except Tampered:
+                    return "killed"
+                except (RuntimeError, OSError, Rejected) as e:  # R13; never a failed attempt
+                    self._log(f"finalize error on {tid}: {e!r}")
+                    return "error"
+                return "worked"
+        for t in self._pick_tasks(q, cap_map):
+            try:
+                self._ensure_worktree(q["layer"])
+                if t["kind"] == "plan":
+                    self._plan_stage(t["id"])
+                elif t["status"] == "todo":
+                    self._tests_stage(t["id"])
+                else:
+                    self._build_stage(t["id"])
+            except Tampered:
+                return "killed"
+            except Capped:  # R37: the attempt was undone by its stage; retried when the cap resets
+                return "capped"
+            except NotReady:  # D-030: undone exactly like Capped; retried once evidence is usable
+                return "not_ready"
+            except (RuntimeError, OSError) as e:  # R8: git or filesystem trouble is a failed attempt
+                self._log(f"stage error on {t['id']}: {e!r}")
+                try:
+                    cur = self._task(t["id"])
+                    self._update(t["id"], notes=cur["notes"] + [f"git error: {e}"[:300]])
+                    if cur["status"] == "tests_ok":
+                        self._after_failure(t["id"], f"git error: {e}"[:300], "git-error", "")
+                except Exception as e2:  # noqa: BLE001
+                    self._log(f"could not record stage error: {e2!r}")
+                return "error"  # R13: run() backs off on this
+            return "worked"
         tasks = q["tasks"]
         qs = self._read("questions.json", {})
         if tasks and all(t["status"] == "done" for t in tasks) and not q.get("drift_due") \
                 and not any(v["kind"] == "gate" for v in qs.values()) \
                 and not any(r.get("status") in ("active", "blocked") for r in Journal(self.state).all()):
+            if self._gate_ready(cap_map):  # the gate needs git and github
+                return "not_ready"
             try:
                 self._gate()
             except (RuntimeError, OSError) as e:  # e.g. a refused push: no pull request is opened
                 self._log(f"gate error: {e!r}")
                 return "error"
             return "gate"
-        return "idle"
+        return "not_ready" if self._waiting else "idle"
 
     def run(self, max_steps: int | None = None, idle_sleep_s: int = 60, heartbeat: Path | None = None,
             sleep: Callable[[float], None] = time.sleep) -> str:
@@ -684,7 +1182,7 @@ class Conductor:
                 sleep(min(idle_sleep_s * errors, 1800))
                 continue
             errors, told = 0, False
-            if status in ("idle", "paused", "capped", "gate"):
+            if status in ("idle", "paused", "capped", "gate", "not_ready"):
                 sleep(idle_sleep_s)
         return status
 
@@ -817,7 +1315,7 @@ class Conductor:
                   self._task_prompt(t) + "\nAnswer with JSON: {\"files\": [...], \"summary\": \"...\"}")
         try:
             r = self._call("test_writer", prompt, S_TESTS)
-        except Capped:
+        except (Capped, NotReady):
             self._reset_wt()
             raise
         changed = self._changed()
@@ -899,15 +1397,14 @@ class Conductor:
             prompt += "\nREVIEW FEEDBACK:\n" + "\n".join(f"- {x}" for x in t["review_feedback"]) + "\n"
         if t.get("trouble_notes"):
             prompt += "\nTROUBLESHOOTER NOTES:\n" + "\n".join(t["trouble_notes"]) + "\n"
-        dead = self._dead_ends()
-        if dead:
-            prompt += "\nKNOWN DEAD ENDS:\n" + "\n".join(dead) + "\n"
         prompt += ("\nAnswer with JSON: {\"status\": \"done\" | \"blocked\", \"summary\": \"...\"}. "
-                   "A blocked answer must also include \"tried\" (at least 2 different routes you actually tried) "
-                   "and \"error\" (the real error output); without them it is rejected as an easy way out.")
+                   "A blocked answer must also include all four of: \"tried\" (at least 2 different routes you "
+                   "actually tried), \"error\" (the real error output), \"capability\" (the capability-map name you "
+                   "need, or a new short name) and \"meanwhile\" (what you will work on instead); without all four "
+                   "it is rejected as an easy way out.")
         try:
-            r = self._call("builder", prompt, S_BUILD, cwd=twt)
-        except Capped:  # R37: release the claim and undo, no failure recorded
+            r = self._call("builder", prompt, S_BUILD, cwd=twt, needs=t.get("needs") or [])
+        except (Capped, NotReady):  # R37: release the claim and undo, no failure recorded
             self._apply(f"{tag}-release", "release", cid, "forge-core")
             self._reset_to(twt, base)
             raise
@@ -922,7 +1419,7 @@ class Conductor:
         out_of_scope = [f for f in changed if not any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])]
 
         def fail(reason: str, sig: str, output: str = "", submitted: bool = False,
-                 payload: dict | None = None) -> None:
+                 payload: dict | None = None, handoff: bool = False) -> None:
             self._reset_to(twt, base)
             if submitted:
                 self._apply(f"{tag}-fail", "fail", cid, "forge-auditor", payload)
@@ -930,19 +1427,28 @@ class Conductor:
                 self._apply(f"{tag}-release", "release", cid, "forge-core")
             if self._ledger().contracts().get(cid, {}).get("status") == "failed":
                 self._apply(f"{tag}-reopen", "reopen", cid, "forge-manager")
-            self._after_failure(tid, reason, sig, output)
+            self._after_failure(tid, reason, sig, output, handoff=handoff)
 
         if not r.ok:
             return fail(f"builder output unusable: {r.error}", f"builder-error:{r.error}")
         if (r.data or {}).get("status") == "blocked":
             d = r.data or {}
             summary = d.get("summary") or "no detail"
-            tried, err = d.get("tried"), d.get("error")
-            if not (isinstance(tried, list) and len(tried) >= 2 and isinstance(err, str) and err.strip()):
-                with (self.state / "easy_outs.jsonl").open("a", encoding="utf-8") as f:
-                    f.write(json.dumps({"task": tid, "kind": "easy_out", "summary": summary}) + "\n")
-                return fail("blocker rejected: no evidence (easy out)", "easy-out")
-            return fail(f"blocker: {summary} (tried: {'; '.join(map(str, tried))}; error: {err})", f"blocker:{summary}")
+            rejected = self._check_blocker(t, d, tag, cid, twt, base)  # Capped/NotReady: undone, re-raised
+            if rejected:  # D-031: every rejection is an easy-out, logged against the builder
+                self._record_easy_out(tid, tag, cid, rejected, d, summary)
+                return fail(rejected, "easy-out")
+            tried, err, cap = d.get("tried"), d.get("error"), d["capability"]
+            cur = self._task(tid)
+            needs = list(cur.get("needs") or [])
+            if cap not in needs:  # gating holds the builder; routing fixes it or asks Ben (even with no check)
+                needs.append(cap)
+            self._update(tid, needs=needs, notes=cur["notes"] + [
+                f"blocker accepted: needs {cap}; meanwhile: {d['meanwhile'].strip()}"])
+            # handoff: the first accepted blocker goes to the Troubleshooter now, not after a second failure the
+            # readiness gate would never let happen
+            return fail(f"blocker: {summary} (tried: {'; '.join(map(str, tried))}; error: {err})", f"blocker:{summary}",
+                        output=str(err), handoff=True)
         if violations:  # D-025 / drill 7: an attempt that touched its own tests can never pass
             return fail("touched test files (reverted): " + ", ".join(violations),
                         "touched tests: " + ",".join(violations))
@@ -984,7 +1490,7 @@ class Conductor:
                             self._mutation_evidence(mres) +
                             "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW,
                             cwd=twt)  # the task worktree is at exactly S
-        except Capped:  # R37: undo the submitted run like a failed judge, but record no failure
+        except (Capped, NotReady):  # R37: undo the submitted run like a failed judge, but record no failure
             self._apply(f"{tag}-capped", "fail", cid, "forge-auditor")
             if self._ledger().contracts().get(cid, {}).get("status") == "failed":
                 self._apply(f"{tag}-reopen", "reopen", cid, "forge-manager")
@@ -1190,11 +1696,77 @@ class Conductor:
                 f"\nscore: {mres.score:.2f} (mutation_min {float(self.limits.get('mutation_min', 0.8)):.2f})"
                 f"\ncomplete: {'yes' if mres.complete else 'no'}\n" + self._survivor_listing(mres) + "\n")
 
+    def _check_blocker(self, t: dict, d: dict, tag: str, cid: str, twt: Path, base: str) -> str | None:
+        """D-031: None when a blocked claim is accepted, else the rejection reason. Checked in order: evidence,
+        the capability map, then the reviewer. A capped or unready reviewer undoes the attempt and re-raises."""
+        tried, err, cap, meanwhile = d.get("tried"), d.get("error"), d.get("capability"), d.get("meanwhile")
+        routes = {x.strip() for x in tried if isinstance(x, str) and x.strip()} if isinstance(tried, list) else set()
+        if not (len(routes) >= 2 and isinstance(err, str) and err.strip() and isinstance(cap, str)
+                and readiness.NAME_RE.match(cap) and isinstance(meanwhile, str) and meanwhile.strip()):
+            return "blocker rejected: no evidence (easy out)"
+        m = self._cap_map()
+        entry = m.get(cap)
+        if readiness.broken(entry, self.clock(), readiness.max_age_for(cap, self.limits)) is None:
+            return (f"blocker rejected: contradicts capability map ({cap} is ok: {entry.get('detail', '')}, "
+                    f"checked {entry.get('checked_at')})")
+        if entry is not None:
+            shown = json.dumps(entry, sort_keys=True)
+        elif cap in self.checks or cap in self.probes:
+            shown = "no evidence yet"
+        else:
+            shown = "no automatic check exists"
+        claim = {k: d.get(k) for k in ("summary", "tried", "error", "capability", "meanwhile")}
+        try:
+            rv = self._call("reviewer", role_text(self.repo, "reviewer") + "\n\nThe builder claims it is BLOCKED and cannot "
+                                        "finish this task. Check the claim, not the code: fail claims without real "
+                                        "attempts. Pass only if it shows at least 2 genuinely different routes that were "
+                                        "actually tried, a real error, and a need that truly can't be met with what "
+                                        "Forge has.\n\n" + self._task_prompt(t) +
+                            "\nBLOCKER CLAIM:\n" + json.dumps(claim, indent=2)[:8000] +
+                            f"\n\nCAPABILITY MAP ENTRY for {cap}: {shown}\n\nTHE ATTEMPT'S CHANGES:\n" +
+                            self._attempt_diff(twt, base)[:40000] +
+                            "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW,
+                            cwd=twt)  # the attempt's work is in the task worktree, never the layer checkout
+        except (Capped, NotReady):  # R37: undone like a capped builder; no failure, no easy-out
+            self._apply(f"{tag}-release", "release", cid, "forge-core")
+            self._reset_to(twt, base)
+            raise
+        if not rv.ok or (rv.data or {}).get("verdict") != "pass":
+            reasons = [str(x) for x in ((rv.data or {}).get("reasons") or [rv.error or "no reasons given"])]
+            return "blocker rejected by reviewer: " + "; ".join(reasons)
+        return None
+
+    def _attempt_diff(self, twt: Path, base: str) -> str:
+        """The attempt's uncommitted work in the task worktree: tracked changes as a diff, new files with their
+        (capped) text."""
+        out = _git(twt, "diff", base, check=False)
+        for f in self._changed(cwd=twt):
+            p = twt / f
+            if p.is_file() and not _git(twt, "ls-files", "--", f, check=False):
+                try:
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    text = "(unreadable)"
+                out += f"\n--- new file: {f}\n{text[:4000]}"
+        return out or "(no changes)"
+
+    def _record_easy_out(self, tid: str, tag: str, cid: str, reason: str, d: dict, summary: str) -> None:
+        """D-031: a rejected blocker claim, logged against the builder and reported to the ledger before the
+        claim is released."""
+        cap = d.get("capability") if isinstance(d.get("capability"), str) else None
+        with (self.state / "easy_outs.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"task": tid, "agent": "builder", "kind": "easy_out", "reason": reason,
+                                "capability": cap, "summary": str(summary)[:NOTE_CAP],
+                                "at": self.clock().isoformat()}) + "\n")
+        self._apply(f"{tag}-report", "run_report", cid, "forge-core", {
+            "run_id": tag, "claim": "blocked", "commit": None, "changed": [], "violations": [], "out_of_scope": [],
+            "easy_out": {"reason": reason, "capability": cap}})
+
     def _is_ancestor(self, sha: str) -> bool:
         return subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], cwd=str(self.wt),
                               capture_output=True, **NOWIN).returncode == 0
 
-    def _after_failure(self, tid: str, reason: str, sig: str, output: str) -> None:
+    def _after_failure(self, tid: str, reason: str, sig: str, output: str, handoff: bool = False) -> None:
         t = self._task(tid)
         sigs = t["fail_signatures"] + [sig]
         fails = t.get("fails_since", 0) + 1
@@ -1205,10 +1777,10 @@ class Conductor:
             if fails >= 2:
                 self._block(tid, reason)
             return
-        if zero_progress or fails >= 2:
+        if zero_progress or fails >= 2 or handoff:
             try:
                 self._troubleshoot(tid, reason, output)
-            except Capped:  # R38: kept, and run before the next builder attempt
+            except (Capped, NotReady):  # R38: kept, and run before the next builder attempt
                 self._update(tid, troubleshoot_pending={"reason": str(reason)[:NOTE_CAP],
                                                         "output": str(output)[-4000:]})
                 raise
@@ -1279,8 +1851,11 @@ class Conductor:
             r = self._call("planner", role_text(self.repo, "planner") + "\n\nWrite the implementation plan to " + plan_file +
                            " (and no other file), then return its tasks.\n\n" + self._task_prompt(t) +
                            "\nEach task needs: id, title, section, files_in_scope, test_files, test_cmd.\n"
+                           "Each task may also list \"needs\": capability names from the capability map (git, github, "
+                           "claude, codex, gmail, docker, n8n, ollama, python_libs, browser, or a new name) that its "
+                           "Builder needs beyond git and its own AI.\n"
                            "Answer with JSON: {\"tasks\": [...]}", S_PLAN)
-        except Capped:
+        except (Capped, NotReady):
             self._reset_wt()
             raise
         changed = self._changed()
@@ -1310,7 +1885,7 @@ class Conductor:
                                 json.dumps(tasks)[:20000] +
                                 "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}",
                                 S_REVIEW)
-            except Capped:
+            except (Capped, NotReady):
                 self._reset_wt()
                 raise
             if not rv.ok or (rv.data or {}).get("verdict") != "pass":
@@ -1330,6 +1905,8 @@ class Conductor:
         for x in tasks:
             nt = self._new_task({k: x[k] for k in TASK_FIELDS})
             nt["kind"], nt["status"] = "build", "todo"
+            if isinstance(x.get("needs"), list):
+                nt["needs"] = list(x["needs"])
             q["tasks"].append(nt)
         self._save_queue(q)
         self._push()
@@ -1483,6 +2060,16 @@ def gh_cli(repo: Path) -> Callable[[list[str]], tuple[int, str]]:
                            errors="replace", stdin=subprocess.DEVNULL, **NOWIN)
         return p.returncode, p.stdout + p.stderr
     return run
+
+
+def real_checks() -> dict:
+    """The real plain-code readiness checks (D-030). AI probes are separate: see real_probes."""
+    return dict(readiness.PLAIN_CHECKS)
+
+
+def real_probes(limits: dict) -> dict:
+    """The real AI probe agents; constructing them launches nothing."""
+    return readiness.probe_agents(limits)
 
 
 def real_team(limits: dict) -> Team:
@@ -1640,6 +2227,14 @@ def main(argv: list[str]) -> int:
         q = json.loads((state / "queue.json").read_text(encoding="utf-8")) if (state / "queue.json").exists() else {}
         for t in q.get("tasks", []):
             print(f"{t['status']:9} {t['id']:6} {t['title']}")
+        try:
+            qs = json.loads((state / "questions.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            qs = {}
+        for qid, v in (qs.items() if isinstance(qs, dict) else []):
+            if isinstance(v, dict) and v.get("kind") == "capability" and v.get("status") == "open":
+                sent = "held" if v.get("hold") else ("sent" if v.get("delivered") else "not sent yet")
+                print(f"capability {v.get('capability')}: {v.get('condition')} ({sent}) Q-{qid}")
         for f in ("KILL", "PAUSED"):
             if (state / f).exists():
                 print(f"{f} is set")
@@ -1679,6 +2274,12 @@ def main(argv: list[str]) -> int:
                 c._handle_inbox()
                 if (c.state / "KILL").exists():
                     return 0
+            try:
+                c.session_start()  # D-030: readiness before every session, before the smoke test
+            except Tampered:
+                return 0
+            except (RuntimeError, OSError) as e:
+                c._log(f"session readiness error: {e!r}"[:500])
         if a.cmd == "smoke" or _smoke_stale(c.state, c.clock()):
             problems = _guarded_smoke(c, Path(a.work), force=a.cmd == "smoke")
             if a.cmd == "smoke":
@@ -1723,6 +2324,8 @@ def _guarded_smoke(c: Conductor, workdir: Path, force: bool = False) -> list[str
                              warn=c._log)
         except Capped as e:  # R37
             problems = [f"token cap reached during the smoke test ({e})"]
+        except NotReady as e:  # D-030
+            problems = ["not ready: " + "; ".join(f"{n}: {why}" for n, why in sorted(e.names.items()))]
         except Tampered as e:
             problems = [f"state files changed during the smoke test (Forge halted): {e}"[:500]]
         except RuntimeError as e:  # fail-closed preconditions (R15)
