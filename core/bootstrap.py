@@ -84,7 +84,7 @@ def _obj(props: dict, required: list[str]) -> dict:
 # R17: full JSON Schemas; "required" is what the conductor needs, the rest is optional.
 S_TESTS = _obj({"files": _STRS, "summary": _STR}, ["files"])
 S_BUILD = _obj({"status": {"type": "string", "enum": ["done", "blocked"]}, "summary": _STR, "tried": _STRS,
-                "error": _STR}, ["status"])
+                "error": _STR, "capability": _STR, "meanwhile": _STR}, ["status"])
 S_REVIEW = _obj({"verdict": {"type": "string", "enum": ["pass", "fail"]}, "reasons": _STRS}, ["verdict", "reasons"])
 S_TROUBLE = _obj({"kind": {"type": "string", "enum": ["fix", "dead_end", "suggestion"]}, "notes": _STR,
                   "alternative": _STR}, ["kind", "notes"])
@@ -1234,8 +1234,10 @@ class Conductor:
         if t.get("trouble_notes"):
             prompt += "\nTROUBLESHOOTER NOTES:\n" + "\n".join(t["trouble_notes"]) + "\n"
         prompt += ("\nAnswer with JSON: {\"status\": \"done\" | \"blocked\", \"summary\": \"...\"}. "
-                   "A blocked answer must also include \"tried\" (at least 2 different routes you actually tried) "
-                   "and \"error\" (the real error output); without them it is rejected as an easy way out.")
+                   "A blocked answer must also include all four of: \"tried\" (at least 2 different routes you "
+                   "actually tried), \"error\" (the real error output), \"capability\" (the capability-map name you "
+                   "need, or a new short name) and \"meanwhile\" (what you will work on instead); without all four "
+                   "it is rejected as an easy way out.")
         try:
             r = self._call("builder", prompt, S_BUILD, needs=t.get("needs") or [])
         except (Capped, NotReady):  # R37: release the claim and undo, no failure recorded
@@ -1253,7 +1255,7 @@ class Conductor:
         changed = [f for f in changed if f not in tests]
         out_of_scope = [f for f in changed if not any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])]
 
-        def fail(reason: str, sig: str, output: str = "", submitted: bool = False) -> None:
+        def fail(reason: str, sig: str, output: str = "", submitted: bool = False, handoff: bool = False) -> None:
             _git(self.wt, "reset", "-q", "--hard", tests_commit)
             _git(self.wt, "clean", "-q", "-fd")
             if submitted:
@@ -1262,19 +1264,28 @@ class Conductor:
                 self._apply(f"{tag}-release", "release", cid, "forge-core")
             if self._ledger().contracts().get(cid, {}).get("status") == "failed":
                 self._apply(f"{tag}-reopen", "reopen", cid, "forge-manager")
-            self._after_failure(tid, reason, sig, output)
+            self._after_failure(tid, reason, sig, output, handoff=handoff)
 
         if not r.ok:
             return fail(f"builder output unusable: {r.error}", f"builder-error:{r.error}")
         if (r.data or {}).get("status") == "blocked":
             d = r.data or {}
             summary = d.get("summary") or "no detail"
-            tried, err = d.get("tried"), d.get("error")
-            if not (isinstance(tried, list) and len(tried) >= 2 and isinstance(err, str) and err.strip()):
-                with (self.state / "easy_outs.jsonl").open("a", encoding="utf-8") as f:
-                    f.write(json.dumps({"task": tid, "kind": "easy_out", "summary": summary}) + "\n")
-                return fail("blocker rejected: no evidence (easy out)", "easy-out")
-            return fail(f"blocker: {summary} (tried: {'; '.join(map(str, tried))}; error: {err})", f"blocker:{summary}")
+            rejected = self._check_blocker(t, d, tag, cid, tests_commit)  # Capped/NotReady: undone, re-raised
+            if rejected:  # D-031: every rejection is an easy-out, logged against the builder
+                self._record_easy_out(tid, tag, cid, rejected, d, summary)
+                return fail(rejected, "easy-out")
+            tried, err, cap = d.get("tried"), d.get("error"), d["capability"]
+            cur = self._task(tid)
+            needs = list(cur.get("needs") or [])
+            if cap not in needs:  # gating holds the builder; routing fixes it or asks Ben (even with no check)
+                needs.append(cap)
+            self._update(tid, needs=needs, notes=cur["notes"] + [
+                f"blocker accepted: needs {cap}; meanwhile: {d['meanwhile'].strip()}"])
+            # handoff: the first accepted blocker goes to the Troubleshooter now, not after a second failure the
+            # readiness gate would never let happen
+            return fail(f"blocker: {summary} (tried: {'; '.join(map(str, tried))}; error: {err})", f"blocker:{summary}",
+                        output=str(err), handoff=True)
         if violations:  # D-025 / drill 7: an attempt that touched its own tests can never pass
             return fail("touched test files (reverted): " + ", ".join(violations),
                         "touched tests: " + ",".join(violations))
@@ -1325,11 +1336,76 @@ class Conductor:
         q["drift_due"] = True  # the drift keeper runs as the next step, so it can be stopped like any agent
         self._save_queue(q)
 
+    def _check_blocker(self, t: dict, d: dict, tag: str, cid: str, tests_commit: str) -> str | None:
+        """D-031: None when a blocked claim is accepted, else the rejection reason. Checked in order: evidence,
+        the capability map, then the reviewer. A capped or unready reviewer undoes the attempt and re-raises."""
+        tried, err, cap, meanwhile = d.get("tried"), d.get("error"), d.get("capability"), d.get("meanwhile")
+        routes = {x.strip() for x in tried if isinstance(x, str) and x.strip()} if isinstance(tried, list) else set()
+        if not (len(routes) >= 2 and isinstance(err, str) and err.strip() and isinstance(cap, str)
+                and readiness.NAME_RE.match(cap) and isinstance(meanwhile, str) and meanwhile.strip()):
+            return "blocker rejected: no evidence (easy out)"
+        m = self._cap_map()
+        entry = m.get(cap)
+        if readiness.broken(entry, self.clock(), readiness.max_age_for(cap, self.limits)) is None:
+            return (f"blocker rejected: contradicts capability map ({cap} is ok: {entry.get('detail', '')}, "
+                    f"checked {entry.get('checked_at')})")
+        if entry is not None:
+            shown = json.dumps(entry, sort_keys=True)
+        elif cap in self.checks or cap in self.probes:
+            shown = "no evidence yet"
+        else:
+            shown = "no automatic check exists"
+        claim = {k: d.get(k) for k in ("summary", "tried", "error", "capability", "meanwhile")}
+        try:
+            rv = self._call("reviewer", "You are the REVIEWER (read-only). The builder claims it is BLOCKED and cannot "
+                                        "finish this task. Check the claim, not the code: fail claims without real "
+                                        "attempts. Pass only if it shows at least 2 genuinely different routes that were "
+                                        "actually tried, a real error, and a need that truly can't be met with what "
+                                        "Forge has.\n\n" + self._task_prompt(t) +
+                            "\nBLOCKER CLAIM:\n" + json.dumps(claim, indent=2)[:8000] +
+                            f"\n\nCAPABILITY MAP ENTRY for {cap}: {shown}\n\nTHE ATTEMPT'S CHANGES:\n" +
+                            self._attempt_diff(tests_commit)[:40000] +
+                            "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW)
+        except (Capped, NotReady):  # R37: undone like a capped builder; no failure, no easy-out
+            self._apply(f"{tag}-release", "release", cid, "forge-core")
+            _git(self.wt, "reset", "-q", "--hard", tests_commit)
+            _git(self.wt, "clean", "-q", "-fd")
+            raise
+        if not rv.ok or (rv.data or {}).get("verdict") != "pass":
+            reasons = [str(x) for x in ((rv.data or {}).get("reasons") or [rv.error or "no reasons given"])]
+            return "blocker rejected by reviewer: " + "; ".join(reasons)
+        return None
+
+    def _attempt_diff(self, tests_commit: str) -> str:
+        """The attempt's uncommitted work: tracked changes as a diff, new files with their (capped) text."""
+        out = _git(self.wt, "diff", tests_commit, check=False)
+        for f in self._changed():
+            p = self.wt / f
+            if p.is_file() and not _git(self.wt, "ls-files", "--", f, check=False):
+                try:
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    text = "(unreadable)"
+                out += f"\n--- new file: {f}\n{text[:4000]}"
+        return out or "(no changes)"
+
+    def _record_easy_out(self, tid: str, tag: str, cid: str, reason: str, d: dict, summary: str) -> None:
+        """D-031: a rejected blocker claim, logged against the builder and reported to the ledger before the
+        claim is released."""
+        cap = d.get("capability") if isinstance(d.get("capability"), str) else None
+        with (self.state / "easy_outs.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"task": tid, "agent": "builder", "kind": "easy_out", "reason": reason,
+                                "capability": cap, "summary": str(summary)[:NOTE_CAP],
+                                "at": self.clock().isoformat()}) + "\n")
+        self._apply(f"{tag}-report", "run_report", cid, "forge-core", {
+            "run_id": tag, "claim": "blocked", "commit": None, "changed": [], "violations": [], "out_of_scope": [],
+            "easy_out": {"reason": reason, "capability": cap}})
+
     def _is_ancestor(self, sha: str) -> bool:
         return subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], cwd=str(self.wt),
                               capture_output=True, **NOWIN).returncode == 0
 
-    def _after_failure(self, tid: str, reason: str, sig: str, output: str) -> None:
+    def _after_failure(self, tid: str, reason: str, sig: str, output: str, handoff: bool = False) -> None:
         t = self._task(tid)
         sigs = t["fail_signatures"] + [sig]
         fails = t.get("fails_since", 0) + 1
@@ -1340,7 +1416,7 @@ class Conductor:
             if fails >= 2:
                 self._block(tid, reason)
             return
-        if zero_progress or fails >= 2:
+        if zero_progress or fails >= 2 or handoff:
             try:
                 self._troubleshoot(tid, reason, output)
             except (Capped, NotReady):  # R38: kept, and run before the next builder attempt

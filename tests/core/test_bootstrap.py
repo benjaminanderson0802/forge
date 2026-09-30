@@ -273,7 +273,13 @@ class BootstrapTests(Harness):
 
     def test_builder_blocked_result_is_failed_attempt(self):
         """Spec: builder status blocked becomes a failed attempt and triggers troubleshooting rules."""
-        c=self.advance_to_build(agents={"test_writer":self.write_tests,"builder":lambda p,c: (json.dumps({"status":"blocked","summary":"cannot proceed","tried":["route a","route b"],"error":"boom"}),1)})
+        # T1B2e: a complete claim for a capability the map shows failing (docker is missing, which is not
+        # troubleshootable, so routing only files a held item and the build step still runs).
+        claim={"status":"blocked","summary":"cannot proceed","tried":["route a","route b"],"error":"boom",
+               "capability":"docker","meanwhile":"work on the parts that need no docker"}
+        checks=dict(HEALTHY_CHECKS,docker=lambda: (False,"docker not installed or not on PATH"))
+        c=self.init(agents={"test_writer":self.write_tests,"builder":lambda p,c: (json.dumps(claim),1)},checks=checks)
+        self.assertEqual(c.step(),"worked")
         c.step()
         task=json.loads((self.state/"queue.json").read_text())["tasks"][0]
         self.assertNotEqual(task["status"],"blocked")
