@@ -966,8 +966,7 @@ class Conductor:
                     continue
                 if m.get("outgoing") or (m.get("message_id") and str(m["message_id"]).strip() in own_ids):
                     continue  # R18/R26: Forge's own mail is never an answer
-                sender = re.findall(r"[\w.+-]+@[\w.-]+", str(m.get("from", "")).lower())
-                if self.owner not in sender:
+                if not self._from_owner(m.get("from", "")):
                     continue
                 subject, body = str(m.get("subject", "")), clean_reply(str(m.get("body", "")))
                 if is_stop(subject, body):
@@ -983,6 +982,13 @@ class Conductor:
             except Exception as e:  # noqa: BLE001 - R35: one bad message never blocks the rest
                 self._log(f"inbox message failed: {e!r}"[:500])
         self._take_channel_answers()  # 1E: answers from the status page (and any later channel)
+
+    def _from_owner(self, sender) -> bool:
+        """1E: exactly one address, and it is the owner's. The owner's address in a display name
+        ("ben@..." <someone@else>) or next to another address is someone else."""
+        from email.utils import getaddresses
+        addrs = [a.strip().lower() for _, a in getaddresses([str(sender or "")]) if a.strip()]
+        return len(addrs) == 1 and addrs[0] == self.owner
 
     def _answer(self, qid: str, body: str, code: str) -> None:
         qs = self._read("questions.json", {})

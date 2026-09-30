@@ -242,6 +242,22 @@ class Answers(ChannelHarness):
         self.assertEqual(self.qs()["blocked-1"]["status"], "answered")
         self.assertEqual(self.queue_lines(), [])
 
+    def test_owner_address_in_a_display_name_is_not_the_owner(self):
+        """From: "ben@example.com" <evil@x.example> is someone else: no STOP, no answer."""
+        c = self.conductor()
+        c._ask("gate", "layer-1 is ready", "report", pr="7")
+        code = self.qs()["gate-1"]["code"]
+        for frm in ('"ben@example.com" <evil@x.example>', "ben@example.com via <evil@x.example>",
+                    "evil@x.example, ben@example.com"):
+            self.messages[:] = [{"from": frm, "subject": f"[Forge Q-gate-1 {code}] y", "body": "y"},
+                                {"from": frm, "subject": "STOP", "body": "STOP"}]
+            c._handle_inbox()
+            self.assertFalse((self.state / "KILL").exists(), frm)
+            self.assertEqual(self.qs()["gate-1"]["status"], "open", frm)
+        self.messages[:] = [{"from": "Ben <BEN@example.com>", "subject": "STOP", "body": ""}]
+        c._handle_inbox()
+        self.assertTrue((self.state / "KILL").exists())
+
     def test_a_dropped_answer_is_checked_like_an_email_reply(self):
         c = self.conductor()
         c._ask("gate", "layer-1 is ready", "report", pr="7")
