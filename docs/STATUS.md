@@ -46,3 +46,15 @@
 - **ChatGPT Dots evaluated (2026-09-30):** not adopted for now. Email stays Forge's channel. A Dot round-trip trial is part of 1E, and the criteria are in `docs/specs/layer-1-design.md`.
 - **Codex runs that time out are not metered.** Codex keeps no session log under `--ephemeral` and reports usage only on a completed turn (see R46).
 - **Plan size:** a planner call has 30 minutes. If a part still times out, split it further rather than raising the timeout.
+
+## Layer 1 integrated (branch `layer-1`, 2026-09-30)
+
+One branch now holds all of Layer 1: `python -m unittest discover -s tests/core` passes (916 tests, 1 skipped) and `python drills/run_drills.py` passes drills 1–21.
+
+- **1B conductor pipeline:** role files, readiness gating and capability routing, blocker claims, judges with the weak/empty-implementation check and the mutation gate, task worktrees, crash-safe finalization (merge journal).
+- **R42–R48 (main):** stop during a run, cache weighting, plan reviewer notes, 3 plan attempts, metering failed Claude runs, planner memory, provider limit holds. Also D-037/D-038, the CI unit-test step and `docs/SUPERVISOR.md`.
+- **1C planning and drift:** coverage map, drift and stall rules, the read-only Manager, focus time. Drills 11–13.
+- **1D always-on service:** service loop, heartbeat, activity awareness, stop mid-cycle, limit holds, runs-per-day cap, watchdog. Spec R49–R53 (renumbered from 1D's R41–R45). Its stop and holds are one mechanism each with R42 and R48. Drills 14–16.
+- **1E Ben's channel:** `queue.jsonl`, instant vs digest, quiet hours, status page, drop-folder answers (spec E1–E5). Drills 17–21.
+- **Integration fixes (R54–R56):** a reviewer outage never costs an attempt (ledger `withdraw`), and builders wait for the reviewer; a finalization awaiting review no longer blocks other work or the capability email; line endings (CRLF role files, byte-exact restore). A Stop pressed during an agent run is a clean stop everywhere.
+- **Open:** a builder that is itself capped or stopped still uses the ledger's `release`, which counts an attempt (unchanged by design; only reviewer outages use `withdraw`). The Windows fixes were reproduced and checked on Linux with `core.autocrlf=true`; the suite still has to be run on Ben's PC.

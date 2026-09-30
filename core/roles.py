@@ -57,6 +57,7 @@ def role_text(repo: Path, role: str) -> str:
         text = path.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError, ValueError):
         return default
+    text = text.replace("\r\n", "\n").replace("\r", "\n")  # CRLF (Windows text mode, core.autocrlf) reads as LF
     text = text.rstrip()
     if not text or len(text) > MAX_CHARS:
         return default

@@ -21,6 +21,9 @@ Rules enforced:
     attempt, showing no protected-file changes and no out-of-scope edits
   * false claims: an executor that said "done" and then fails its audit is
     recorded, so the Learner gets clean data
+  * withdrawn attempts: the core may undo a claimed or submitted attempt
+    whose reviewer could not run; it is not counted, is not a false claim,
+    and its commit and run report are dropped
   * crash recovery: the event log is the truth and the other files are a
     cache of it. apply() writes ledger/head.json (the hash of the event it
     is about to append) before any cache file and appends the event last,
@@ -61,6 +64,9 @@ ACTIONS = {
     "run_report": ({"core"}, {"claimed", "submitted"}, None),
     # a run that died: back to open, and the lost attempt still counts
     "release":  ({"core", "manager"}, {"claimed"}, "open"),
+    # an attempt the core undid before any verdict because the reviewer it needs could not run (unready,
+    # capped or stopped): back to open, not counted, never a false claim; its submission and report are dropped
+    "withdraw": ({"core"}, {"claimed", "submitted"}, "open"),
     # only you can freeze (or re-freeze) the spec
     "approve_spec": ({"human"}, None, None),
 }
@@ -300,6 +306,10 @@ class Ledger:
                 c["attempts"] += 1
             if action == "release":
                 c["attempts"] += 1
+            if action == "withdraw":
+                c["commit"] = None
+                if reports.get(cid, {}).get("attempt") == c["attempts"]:
+                    del reports[cid]  # this attempt's report can never back a later pass
             if action == "usage":
                 t = payload.get("tokens")
                 if not isinstance(t, int) or t < 0:

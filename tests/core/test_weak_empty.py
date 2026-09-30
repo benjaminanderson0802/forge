@@ -96,6 +96,18 @@ class WeakEmptyTests(Harness):
         self.assertEqual((c.wt / "feat.py").read_bytes(), text.encode("utf-8"))
         self.assert_clean(c)
 
+    def test_b_restore_is_byte_exact_under_autocrlf(self):
+        """Integration fix C: with core.autocrlf=true (Git for Windows' default) a git checkout of the stubbed
+        module writes CRLF bytes. The restore must write back exactly the bytes it read, not git's checkout."""
+        c = self.init(agents={"test_writer": lambda p, cwd: write_test(cwd, STUB_PASSES)})
+        head = self.commit_on_layer(c, {"feat.py": MODULE})
+        git(c.wt, "config", "core.autocrlf", "true")  # the repo-wide setting a Windows install has
+        self.assertEqual(c.step(), "worked")
+        self.assertTrue(self.queue_task()["notes"][-1].startswith("tests rejected: weak"), self.queue_task()["notes"])
+        self.assertEqual((c.wt / "feat.py").read_bytes(), MODULE.encode("utf-8"))
+        self.assertEqual(git(c.wt, "rev-parse", "HEAD"), head)
+        self.assert_clean(c)
+
     def test_stale_bytecode_of_real_code_is_not_used_in_empty_run(self):
         """A same-size stub must not be shadowed by a cached .pyc of the real module."""
         c = self.init(agents={"test_writer": lambda p, cwd: write_test(cwd, STUB_PASSES)})
@@ -266,14 +278,14 @@ class WeakEmptyTests(Harness):
         c = self.init(agents={"test_writer": self.write_tests})
         self.commit_on_layer(c, {"feat.py": MODULE})
         head = git(c.wt, "rev-parse", "HEAD")
-        real_git = bootstrap._git
+        real_write = Path.write_bytes
 
-        def no_checkout(cwd, *args, **kw):
-            if args[:2] == ("checkout", "-q") and "HEAD" in args and "feat.py" in args:
-                return ""
-            return real_git(cwd, *args, **kw)
+        def no_restore(path, data):  # the restore writes the original bytes back (fix C); make that write fail
+            if path.name == "feat.py" and data == MODULE.encode("utf-8"):
+                return len(data)
+            return real_write(path, data)
 
-        with patch.object(bootstrap, "_git", side_effect=no_checkout):
+        with patch.object(Path, "write_bytes", no_restore):
             self.assertEqual(c.step(), "error")
         t = self.queue_task()
         self.assertEqual(t["status"], "todo")

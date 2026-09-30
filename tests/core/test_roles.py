@@ -72,6 +72,12 @@ class RoleTextTests(unittest.TestCase):
         self.path.write_bytes("You are the BUILDER.\nCustom rule é.\n\n  \n".encode("utf-8"))
         self.assertEqual(role_text(self.repo, "builder"), "You are the BUILDER.\nCustom rule é.")
 
+    def test_windows_line_endings_are_normalized(self):
+        """Integration fix C: on Windows a role file written in text mode (or checked out with
+        core.autocrlf=true) has CRLF line endings; its text must read exactly like the LF file."""
+        self.path.write_bytes(b"You are the BUILDER.\r\nRule one.\r\nOld Mac line.\rEnd.\r\n\r\n")
+        self.assertEqual(role_text(self.repo, "builder"), "You are the BUILDER.\nRule one.\nOld Mac line.\nEnd.")
+
     def test_defaults_for_every_file_problem(self):
         cases = {
             "missing": lambda: None,

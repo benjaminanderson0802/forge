@@ -649,10 +649,19 @@ class Conductor:
         active = {r["tid"] for r in Journal(self.state).active()}
         return next((t["id"] for t in q["tasks"] if t["id"] in active), None) or min(active, default=None)
 
-    def _finalize_unready(self, cap_map: dict) -> dict[str, str]:
-        """A finalization works in git and, with push on, pushes to GitHub. A merge reviewer it may need is
-        gated by _call itself."""
-        return self._unready({"git"} | ({"github"} if self.push else set()), cap_map)
+    REVIEW_PENDING = ("creating", "created", "judged")  # candidate states that still lead to the merge reviewer
+
+    def _finalize_unready(self, cap_map: dict, tid: str | None = None) -> dict[str, str]:
+        """What the finalization of tid needs for its next phase and lacks. It works in git and, with push on,
+        pushes to GitHub. Codex review P1: a merge candidate that still awaits review needs the reviewer too, so
+        while the reviewer is down it is not runnable progress (the capability email goes out, other work runs).
+        A reviewer needed only in a later phase is still gated by _call itself."""
+        unready = self._unready({"git"} | ({"github"} if self.push else set()), cap_map)
+        rec = Journal(self.state).load(tid) if tid is not None else None
+        cands = (rec or {}).get("candidates") or []
+        if (rec or {}).get("phase") == "candidate" and cands and cands[-1].get("state") in self.REVIEW_PENDING:
+            unready = {**self.ready_for("reviewer", cap_map=cap_map), **unready}
+        return unready
 
     def _gate_ready(self, cap_map: dict) -> dict[str, str]:
         return self._unready({"git", "github"}, cap_map)
@@ -665,7 +674,10 @@ class Conductor:
         pending = [t for t in tasks if t["status"] == "tests_ok" and t.get("troubleshoot_pending")]
         rest = [t for t in tasks if t not in pending]
         for t in pending + rest:
-            unready = self.ready_for(self._stage_role(t), t, cap_map)
+            role = self._stage_role(t)
+            unready = self.ready_for(role, t, cap_map)
+            if role == "builder":  # Codex review P1: never start a builder whose work the reviewer can't review
+                unready = {**self.ready_for("reviewer", cap_map=cap_map), **unready}
             waiting = sorted(unready)
             if waiting or t.get("waiting_on"):
                 if t.get("waiting_on") != waiting:
@@ -867,8 +879,9 @@ class Conductor:
         q = self._queue()
         if q.get("drift_due") and not self.ready_for("drift_keeper", cap_map=m):
             return
-        if self._active_finalization(q) is not None and not self._finalize_unready(m):
-            return  # a finalization (T1B3e) that can run is progress too
+        ftid = self._active_finalization(q)
+        if ftid is not None and not self._finalize_unready(m, ftid):
+            return  # a finalization (T1B3e) whose next phase can run is progress too
         for t in q.get("tasks", []):
             if t.get("status") in ("todo", "tests_ok") and not self.ready_for(self._stage_role(t), t, m):
                 return
@@ -1201,8 +1214,9 @@ class Conductor:
     def _work_can_run(self, q: dict) -> bool:
         if any(t.get("status") in ("todo", "tests_ok") for t in q.get("tasks", [])):
             return True
-        try:
-            return self._active_finalization(q) is not None
+        try:  # a finalization is runnable work only if its next phase's needs are ready (Codex review P1)
+            tid = self._active_finalization(q)
+            return tid is not None and not self._finalize_unready(self._cap_map(), tid)
         except (RuntimeError, OSError, ValueError, KeyError):
             return True  # unsure: no early digest
 
@@ -1323,7 +1337,7 @@ class Conductor:
                 return "worked"
         tid = self._active_finalization(q)
         if tid is not None:  # a started finalization comes before any new work; blocked records never run
-            if self._finalize_unready(cap_map):  # D-030: it pushes, so it waits like any launch
+            if self._finalize_unready(cap_map, tid):  # D-030: it waits like any launch; other work may run
                 self._waiting = True
             else:
                 try:
@@ -1502,13 +1516,14 @@ class Conductor:
         created_files: list[Path] = []
         created_dirs: list[Path] = []
         preexisting: dict[Path, bytes] = {}
-        stubbed: list[str] = []
+        originals: dict[Path, bytes] = {}  # the exact bytes of every stubbed module, written back afterwards
         try:
             for rel in to_stub:
                 f = self.wt / rel
-                stubbed.append(rel)
+                raw = f.read_bytes()
+                originals[f] = raw
                 try:
-                    text = empty_implementation(f.read_bytes().decode("utf-8"))
+                    text = empty_implementation(raw.decode("utf-8"))
                 except (SyntaxError, ValueError):  # unparsable (or undecodable): the empty module is an empty file
                     text = ""
                 f.write_bytes(text.encode("utf-8"))
@@ -1529,8 +1544,9 @@ class Conductor:
                 f.write_bytes(b"")
             code, out, timed_out = self._run_tests_on_stub(t)
         finally:
-            if stubbed:
-                _git(self.wt, "checkout", "-q", "HEAD", "--", *stubbed)
+            # Integration fix C: never git's checkout, which (core.autocrlf=true on Windows) writes CRLF bytes
+            for f, raw in originals.items():
+                f.write_bytes(raw)
             for f in created_files:
                 f.unlink(missing_ok=True)
             for f, raw in preexisting.items():
@@ -1769,10 +1785,10 @@ class Conductor:
                             self._mutation_evidence(mres) +
                             "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW,
                             cwd=twt)  # the task worktree is at exactly S
-        except (Capped, NotReady):  # R37: undo the submitted run like a failed judge, but record no failure
-            self._apply(f"{tag}-capped", "fail", cid, "forge-auditor")
-            if self._ledger().contracts().get(cid, {}).get("status") == "failed":
-                self._apply(f"{tag}-reopen", "reopen", cid, "forge-manager")
+        except (Capped, NotReady):  # R37 / Codex review P1: the reviewer could not run (unready, capped or
+            # stopped). Undo the submitted attempt without counting it: no ledger attempt, no false claim, no
+            # failure signature. A "fail" here would park contracts during a reviewer outage.
+            self._apply(f"{tag}-withdraw", "withdraw", cid, "forge-core")
             self._reset_to(twt, base)
             raise
         if not rv.ok:
@@ -2013,8 +2029,8 @@ class Conductor:
                             self._attempt_diff(twt, base)[:40000] +
                             "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW,
                             cwd=twt)  # the attempt's work is in the task worktree, never the layer checkout
-        except (Capped, NotReady):  # R37: undone like a capped builder; no failure, no easy-out
-            self._apply(f"{tag}-release", "release", cid, "forge-core")
+        except (Capped, NotReady):  # R37: undone, no failure, no easy-out, and not counted (the reviewer's outage)
+            self._apply(f"{tag}-withdraw", "withdraw", cid, "forge-core")
             self._reset_to(twt, base)
             raise
         if not rv.ok or (rv.data or {}).get("verdict") != "pass":
