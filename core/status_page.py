@@ -266,6 +266,13 @@ def make_server(state: Path, channel_dir: Path, limits: dict, host: str = "127.0
             except ValueError:
                 return self._send(400, "Bad request")
             if n < 0 or n > MAX_POST:
+                left = min(max(n, 0), 1_000_000)  # drain (bounded) so the client reads the 413, not a reset (Windows)
+                while left > 0:
+                    chunk = self.rfile.read(min(65536, left))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+                self.close_connection = True
                 return self._send(413, "Too large")
             form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace")).items()}
             if path == "/stop":  # D-024: one of the three equal ways to stop Forge
