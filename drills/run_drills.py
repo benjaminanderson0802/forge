@@ -358,6 +358,239 @@ def drill_10():
     return "finished work submitted without a retry; green work left for audit; dead claims released and counted; crash loop parked"
 
 
+# ---------------------------------------------------------------- Layer 1C drills (planning and drift)
+_TOY_SPEC = "# Toy spec\n\n## 1. Alpha\n\n- first alpha thing\n- second alpha thing\n\n## 2. Beta\n\n- the beta thing\n"
+_CROLES = {"forge-manager": "manager", "forge-executor": "executor", "forge-auditor": "auditor", "ci": "ci",
+           "forge-core": "core", "benjamin": "human"}
+
+
+def _passed(led: Ledger, cid: str) -> None:
+    """A contract taken through the real ledger rules to a pass."""
+    sha = "c" * 40
+    led.apply({"proposal_id": f"create-{cid}", "action": "create", "contract_id": cid, "payload": {
+        "title": cid, "spec_ref": cid, "acceptance": "python -m unittest x", "files_in_scope": ["x.py"],
+        "max_attempts": 3, "token_budget": 1000}}, "forge-manager")
+    led.apply({"proposal_id": f"{cid}-claim", "action": "claim", "contract_id": cid}, "forge-executor")
+    led.apply({"proposal_id": f"{cid}-rep", "action": "run_report", "contract_id": cid, "payload": {
+        "run_id": f"{cid}-r", "claim": "done", "commit": sha, "changed": ["x.py"], "violations": [],
+        "out_of_scope": []}}, "forge-core")
+    led.apply({"proposal_id": f"{cid}-sub", "action": "submit", "contract_id": cid, "payload": {"commit": sha}},
+              "forge-executor")
+    led.apply({"proposal_id": f"{cid}-ci", "action": "test_run", "contract_id": cid,
+               "payload": {"run_id": f"{cid}-ci", "commit": sha, "passed": True}}, "ci")
+    led.apply({"proposal_id": f"{cid}-pass", "action": "pass", "contract_id": cid, "payload": {"run_id": f"{cid}-ci"}},
+              "forge-auditor")
+
+
+def _git(cwd: Path, *args: str) -> str:
+    import subprocess
+    p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, encoding="utf-8",
+                       stdin=subprocess.DEVNULL)
+    assert p.returncode == 0, f"git {args}: {p.stderr}"
+    return p.stdout.strip()
+
+
+def _toy_conductor(root: Path, tasks: list[dict], agents: dict, manager=None, limits=None):
+    """A real conductor on a throwaway repo that holds the toy spec; every agent is a fake."""
+    from core.agents import FakeAgent
+    from core.bootstrap import Conductor, Team
+    repo, work, state = root / "repo", root / "work", root / "state"
+    for d in (repo, work, state):
+        d.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.name", "Forge Drill")
+    _git(repo, "config", "user.email", "drill@example.com")
+    (repo / "docs" / "specs").mkdir(parents=True)
+    (repo / "docs" / "specs" / "layer-1-design.md").write_bytes(_TOY_SPEC.encode())
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "spec")
+    ok = lambda: (True, "ok")  # noqa: E731
+    checks = {n: ok for n in ("git", "github", "gmail", "docker", "n8n", "ollama", "python_libs", "browser")}
+    probes = {p: FakeAgent(lambda pr, c: ("ok", 0), provider=p) for p in ("claude", "codex")}
+    default = {"test_writer": lambda p, c: ('{"files":[]}', 1), "builder": lambda p, c: ('{"status":"done"}', 1),
+               "reviewer": lambda p, c: ('{"verdict":"pass","reasons":[]}', 1),
+               "troubleshooter": lambda p, c: ('{"kind":"suggestion","notes":"n"}', 1),
+               "drift_keeper": lambda p, c: ('{"status":"ok","reasons":[]}', 1),
+               "planner": lambda p, c: ('{"tasks":[]}', 1)}
+    default.update(agents)
+    provider = {"test_writer": "codex", "reviewer": "codex"}
+    team = Team(**{k: FakeAgent(v, provider=provider.get(k, "claude")) for k, v in default.items()})
+    lim = {"claude_daily_token_cap": 10 ** 9, "codex_daily_token_cap": 10 ** 9}
+    lim.update(limits or {})
+    mails = []
+    c = Conductor(repo, work, state, team, lim, owner_email="ben@example.com",
+                  mailer=lambda s, b: mails.append((s, b)), inbox=lambda: [], gh=lambda a: (0, ""), judge_cmds=[],
+                  push=False, checks=checks, probes=probes,
+                  manager=FakeAgent(manager, provider="claude") if manager else None)
+    c.init_queue("layer-1", tasks)
+    return c, mails
+
+
+def _toy_task(tid: str, covers=None) -> dict:
+    m = f"m_{tid.lower()}"
+    t = {"id": tid, "kind": "build", "title": f"Build {tid}", "section": f"Make {m}.VALUE equal 1.",
+         "files_in_scope": [f"{m}.py"], "test_files": [f"tests/core/test_{tid.lower()}.py"],
+         "test_cmd": f"python -m unittest tests/core/test_{tid.lower()}.py"}
+    if covers is not None:
+        t["covers"] = covers
+    return t
+
+
+def _toy_writer(prompt, cwd):
+    import re as _re
+    f = _re.search(r"Write only these files: (\S+?)\. ", prompt).group(1)
+    mod = _re.search(r"Files you may change: (\S+)\.py", prompt).group(1)
+    (cwd / f).parent.mkdir(parents=True, exist_ok=True)
+    (cwd / f).write_bytes((f"import unittest\nimport {mod}\nclass T(unittest.TestCase):\n"
+                           f"    def test_value(self):\n        self.assertEqual({mod}.VALUE, 1)\n").encode())
+    return json.dumps({"files": [f]}), 1
+
+
+def _toy_builder(prompt, cwd):
+    import re as _re
+    mod = _re.search(r"Files you may change: (\S+)", prompt).group(1)
+    (cwd / mod).write_bytes(b"VALUE = 1\n")
+    return '{"status":"done"}', 1
+
+
+def drill_11():
+    """Coverage must rise: only ledger-verified work counts, partial work is never 'covered', history is no gain."""
+    from fractions import Fraction
+    from core import coverage, drift
+    d = Path(tempfile.mkdtemp(prefix="forge-drill-"))
+    try:
+        (d / "roles.json").write_text(json.dumps(_CROLES))
+        led = Ledger(d)
+        reqs = coverage.parse_requirements(_TOY_SPEC)
+        assert list(reqs) == ["1.1", "1.2", "2.1"], reqs
+        tasks = [{"id": f"A{i}", "kind": "build", "status": "done", "covers": ["1.1"]} for i in range(1, 5)]
+        tasks.append({"id": "Q", "kind": "build", "status": "done", "covers": ["1.2"]})  # queue says done, ledger never passed it
+        tasks.append({"id": "Z", "kind": "build", "status": "done", "covers": ["9.9"]})  # serves nothing in the spec
+        for cid in ("A1", "A2", "A3", "A4", "Z"):
+            _passed(led, cid)
+        verified = coverage.verified_done(tasks, led)
+        assert verified == {"A1", "A2", "A3", "A4", "Z"}, verified
+        score = lambda done: coverage.compute(reqs, tasks, done).score  # noqa: E731
+        st = drift.adopt([], set(), drift_due=False, active_s=0.0)
+        seen = []
+        for tid in ("A1", "A2", "A3"):
+            drift.record_merges(st, st["counted"] + [tid], verified, 0.0, score)
+            seen.append((coverage.compute(reqs, tasks, set(st["counted"]) & verified).status("1.1"), st["no_gain"]))
+        assert seen == [("partial", 0), ("partial", 0), ("partial", 0)], seen
+        drift.record_merges(st, st["counted"] + ["A4"], verified, 0.0, score)
+        assert coverage.compute(reqs, tasks, set(st["counted"]) & verified).status("1.1") == "covered"
+        for tid in ("Q", "Z"):  # the queue alone, and work that serves no requirement: no gain
+            drift.record_merges(st, st["counted"] + [tid], verified, 0.0, score)
+        assert st["no_gain"] == 2 and not drift.no_gain_due(st, 3), st
+        assert coverage.compute(reqs, tasks, verified).score == Fraction(1)
+        # a conductor adopting existing work: history is the baseline, never credit for the next merge
+        st2 = drift.adopt(["A1", "A2", "A3", "A4"], {"A1", "A2", "A3", "A4"}, drift_due=False, active_s=0.0)
+        ev = drift.record_merges(st2, ["A1", "A2", "A3", "A4", "Z"], verified, 0.0, score)
+        assert [(e["tid"], e["gain"]) for e in ev] == [("Z", False)], ev
+        assert st2["no_gain"] == 1
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return ("one requirement over 4 tasks rises a quarter per merge and is covered only at the 4th; queue-only "
+            "'done' and spec-less work gain nothing; adopted history is never credited to a new merge")
+
+
+def drill_12():
+    """Re-plan triggers: 3 merges without coverage gain, and 2 active hours without a merge, bring in the drift
+    keeper and then the Manager."""
+    from core import drift
+    root = Path(tempfile.mkdtemp(prefix="forge-drill-"))
+    try:
+        keeper_prompts, manager_prompts = [], []
+
+        def keeper(p, cwd):
+            keeper_prompts.append(p)
+            return '{"status":"ok","reasons":[]}', 1  # the keeper says ok: the stall rule still forces a re-plan
+
+        def manager(p, cwd):
+            manager_prompts.append(p)
+            t = _toy_task("M1", ["1.2"])
+            del t["kind"]
+            return json.dumps({"tasks": [t], "reasons": ["cover 1.2"]}), 1
+
+        tasks = [_toy_task("T1", ["1.1"]), _toy_task("T2"), _toy_task("T3", ["9.9"]), _toy_task("T4", [])]
+        c, _ = _toy_conductor(root / "a", tasks, {"test_writer": _toy_writer, "builder": _toy_builder,
+                                                  "drift_keeper": keeper}, manager=manager)
+        for _ in range(40):
+            if (drift.load(c.state) or {}).get("replan") or manager_prompts:
+                break
+            c.step()
+        st = drift.load(c.state)
+        assert st["history"][-3:] and [h["gain"] for h in st["history"]] == [True, False, False, False], st["history"]
+        assert "no coverage gain in 3 merges" in keeper_prompts[-1], "drift keeper was not brought in"
+        assert st["replan"]["trigger"] == "no coverage gain in 3 merges", st
+        assert c.step() == "worked" and len(manager_prompts) == 1
+        q = json.loads((c.state / "queue.json").read_text(encoding="utf-8"))
+        assert [t["id"] for t in q["tasks"]][-1] == "M1" and drift.load(c.state)["replan"] is None
+        # no merge in 2 active hours: the boundary merge is recorded first, the stall only without a merge
+        st = drift.adopt([], set(), drift_due=False, active_s=0.0)
+        drift.record_merges(st, ["X"], {"X"}, 7300.0, None)
+        assert not drift.idle_due(st, 7300.0, 7200), "a merge that crossed the window still stalled"
+        assert drift.idle_due(st, 7300.0 + 7200, 7200)
+        c2, _ = _toy_conductor(root / "b", [_toy_task("T1", ["1.1"])],
+                               {"test_writer": _toy_writer, "drift_keeper": keeper,
+                                "builder": lambda p, cwd: ('{"status":"done"}', 1)}, manager=manager)
+        c2.step()  # tests accepted; the builder never makes them pass
+        c2._activity().add(7200)
+        c2.step()
+        assert "no merge in 2 active hours" in keeper_prompts[-1], keeper_prompts[-1][-400:]
+        assert drift.load(c2.state)["replan"]["trigger"] == "no merge in 2 active hours"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return ("3 merges without gain -> drift keeper -> Manager re-plan appended (keeper's 'ok' overruled); "
+            "2 active hours without a merge -> drift keeper; a merge crossing the window resets it first")
+
+
+def drill_13():
+    """A fresh Manager sees the ledger and the spec only: nothing from notes, reviews, questions, dead ends or runs."""
+    from core import drift
+    root = Path(tempfile.mkdtemp(prefix="forge-drill-"))
+    canary = "CANARY-DRILL-13"
+    try:
+        seen = []
+
+        def manager(p, cwd):
+            seen.append((p, Path(cwd)))
+            (Path(cwd) / "written-by-manager.txt").write_bytes(b"x")  # a read-only role that writes is rejected
+            return json.dumps({"tasks": []}), 1
+
+        t = _toy_task("T1", ["1.1"])
+        t["section"] += f" {canary}"
+        c, _ = _toy_conductor(root, [t], {}, manager=manager)
+        c._apply("create-T1", "create", "T1", "forge-manager", {
+            "title": "Build T1", "spec_ref": "T1", "acceptance": t["test_cmd"], "files_in_scope": t["files_in_scope"],
+            "max_attempts": 6, "token_budget": 10 ** 9})
+        q = json.loads((c.state / "queue.json").read_text(encoding="utf-8"))
+        q["tasks"][0].update(notes=[canary], trouble_notes=[canary], review_feedback=[canary])
+        q["notes"] = [canary]
+        c._save_queue(q)
+        (c.state / "dead_ends.jsonl").write_bytes((json.dumps({"task": "T1", "notes": canary}) + "\n").encode())
+        c._ask("blocked", f"q {canary}", f"body {canary}", task="T1")
+        (c.state / "runs" / "old").mkdir(parents=True)
+        (c.state / "runs" / "old" / "prompt.md").write_bytes(canary.encode())
+        st = drift.load(c.state) or drift.adopt([], set(), False, 0.0)
+        drift.new_replan(st, ["off course"], "drift keeper")
+        drift.save(c.state, st)
+        assert c.step() == "worked"
+        assert len(seen) == 1, "the Manager did not run"
+        prompt, cwd = seen[0]
+        assert canary not in prompt, "the Manager saw something other than the ledger and the spec"
+        for part in ("LEDGER", "T1 [open]", "SPEC", "first alpha thing", "1.1 [open]", "off course"):
+            assert part in prompt, f"missing {part!r} in the Manager prompt"
+        assert cwd.resolve() != c.wt.resolve() and not cwd.exists(), "the Manager did not run in a throwaway checkout"
+        assert not (c.wt / "written-by-manager.txt").exists()
+        rp = drift.load(c.state)["replan"]
+        assert rp["attempts"] == 1 and any("read-only" in n for n in rp["notes"]), rp
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return ("the Manager prompt holds the ledger, spec and coverage and none of the planted notes, reviews, "
+            "questions, dead ends or run records; it runs in a throwaway checkout and a write is rejected")
+
+
 DRILLS = [
     (1, "False 'done' claim with failing test", drill_1),
     (2, "Agent edits tests or core files", drill_2),
@@ -369,6 +602,9 @@ DRILLS = [
     (8, "Agent edits files outside its contract", drill_8),
     (9, "False 'done' claim is recorded", drill_9),
     (10, "Runner crash at each step of an attempt", drill_10),
+    (11, "Coverage must rise", drill_11),
+    (12, "Re-plan triggers", drill_12),
+    (13, "A fresh Manager sees the ledger only", drill_13),
 ]
 
 
