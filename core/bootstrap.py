@@ -32,6 +32,7 @@ ROLES = {"ci": "ci", "forge-manager": "manager", "forge-executor": "executor",
 NOWIN = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 TASK_FIELDS = ("id", "title", "section", "files_in_scope", "test_files", "test_cmd")
 NOTE_CAP, NOTES_KEEP, BODY_CAP = 2000, 30, 20000  # R19
+MIN_SECTION_CHARS = 600  # R41: a task's section is its builder's only instructions
 SUBJECT_CAP, CLOSED_KEEP, SENT_IDS_KEEP = 300, 50, 500  # R26, R28
 
 
@@ -942,9 +943,17 @@ class Conductor:
         self._reset_wt()
         plan_file = _norm(t["plan_file"])
         try:
+            prior = [n for n in t.get("notes", []) if "plan" in n.lower()][-3:]
             r = self._call("planner", "You are the PLANNER. Write the implementation plan to " + plan_file +
                            " (and no other file), then return its tasks.\n\n" + self._task_prompt(t) +
                            "\nEach task needs: id, title, section, files_in_scope, test_files, test_cmd.\n"
+                           "IMPORTANT (R41): each task's section is the ONLY instruction the test writer and the "
+                           "builder will see. Make it complete and self-contained: what to build, exact interfaces "
+                           "and signatures, behaviour, edge cases, dependencies on earlier tasks, and the acceptance "
+                           f"criteria the tests must check (at least {MIN_SECTION_CHARS} characters). Every task must "
+                           "be fully doable by a builder that may change ONLY its files_in_scope: no steps for Ben, "
+                           "the conductor, or files outside that scope.\n" +
+                           ("\nYOUR EARLIER ATTEMPTS WERE REJECTED FOR:\n" + "\n".join(prior) + "\n" if prior else "") +
                            "Answer with JSON: {\"tasks\": [...]}", S_PLAN)
         except Capped:
             self._reset_wt()
@@ -963,6 +972,11 @@ class Conductor:
         elif any(validate_task(dict(x, kind="build")) for x in tasks):
             bad = next(validate_task(dict(x, kind="build")) for x in tasks if validate_task(dict(x, kind="build")))
             reason = "plan rejected: unsafe test_cmd" if "test_cmd" in bad else f"plan rejected: {bad}"
+        elif any(len(str(x.get("section", ""))) < MIN_SECTION_CHARS for x in tasks):  # R41
+            thin = [f"{x.get('id')} ({len(str(x.get('section', '')))} chars)" for x in tasks
+                    if len(str(x.get("section", ""))) < MIN_SECTION_CHARS]
+            reason = ("plan rejected: task section too thin (a task's section is its builder's only instructions; "
+                      f"need at least {MIN_SECTION_CHARS} characters): " + ", ".join(thin))
         else:
             existing = {x["id"] for x in self._queue()["tasks"]}
             if any(x["id"] in existing for x in tasks):

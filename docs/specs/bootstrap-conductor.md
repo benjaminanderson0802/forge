@@ -315,3 +315,10 @@ The first run with real agents and real email hit four faults no fake-based test
   - **If PAUSED is set:** the conductor only waits. It reads the inbox every minute (answers can clear the pause), writes its heartbeat, and runs no smoke test and no agents.
   - **When the pause clears:** it goes on to the smoke test (if stale) and then the loop.
   - **If KILL appears** while waiting, it exits.
+
+## First-cycle amendment (2026-09-30)
+
+- **R41 Plans carry complete tasks, and retries learn.** In the first live cycle the 1B plan was rejected twice for the same reason: its tasks carried short labels, not the instructions the test writer and builder need. Now:
+  - **The planner is told** that each task's `section` is the only instruction the test writer and builder will see. It must be complete and self-contained: what to build, exact interfaces, behaviour, edge cases, dependencies on earlier tasks, and the acceptance criteria the tests must check. Each task must also be fully doable by a builder that may change only its `files_in_scope`: no steps for Ben, the conductor, or files outside that scope.
+  - **Thin tasks are rejected by plain code** before any review. The plan is rejected if a task's `section` is shorter than `MIN_SECTION_CHARS` (600), with a reason naming the task.
+  - **A retry sees why the last attempt failed.** Each planner attempt after the first includes the rejection reasons from earlier attempts (the task's last 3 notes, capped).

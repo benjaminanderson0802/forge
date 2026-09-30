@@ -1332,7 +1332,7 @@ class R37PerLaunchCapTests(Harness):
         def planner(prompt, cwd):
             (cwd / "plan.md").write_text("Implement feature value 42 with acceptance tests.\n", encoding="utf-8")
             c.meter.add("codex", self.cap + 1)
-            return json.dumps({"tasks": [self.task(id="T2")]}), 1
+            return json.dumps({"tasks": [self.task(id="T2", section="Implement the feature module in feat.py and expose a public module-level VALUE constant set to the integer 42. Consumers must be able to import feat and read feat.VALUE without calling an initializer or providing configuration. Importing the module must be deterministic and must not print output, read environment variables, write files, or make network requests. Keep the implementation independent of the current working directory and ensure repeated imports preserve the same value and type. Add acceptance coverage in tests/core/test_feat.py that imports the module, verifies VALUE equals 42, and checks that it is an integer rather than a string or boolean. Cover a fresh import and a repeated import so accidental initialization side effects are caught. Acceptance is complete when the scoped unittest command passes and the module exposes the documented interface without additional dependencies.")]}), 1
 
         c = self.capped_conductor(self.task(kind="plan", plan_file="plan.md"), agents={"planner": planner})
         before = c._task("T1")
@@ -1674,3 +1674,97 @@ class R40PausedRunTests(Harness):
             self.assertEqual(bootstrap.main(["run"]), 0)
         self.assertEqual(len(observed), 2, "main must maintain a heartbeat while paused")
         self.assert_no_work()
+
+
+class R41CompletePlanTests(Harness):
+    def plan_task(self):
+        return {"id": "P1", "kind": "plan", "title": "Plan", "section": "Plan",
+                "plan_file": "plan.md", "status": "todo"}
+
+    def plan_writer(self, children):
+        def planner(prompt, cwd):
+            (cwd / "plan.md").write_text(
+                "# Implementation plan\n" + "\n".join(child["section"] for child in children),
+                encoding="utf-8")
+            return json.dumps({"tasks": children}), 1
+        return planner
+
+    def test_R41_planner_prompt_requires_complete_sections_and_minimum_is_600(self):
+        """R41: the planner is told sections are the agents' only complete instructions."""
+        c = self.init(self.plan_task(), agents={
+            "planner": self.plan_writer([self.task(section="x" * 600)]),
+        })
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(c.team.planner.prompts), 1)
+        prompt = " ".join(c.team.planner.prompts[0].lower().split())
+        with self.subTest(check="only instructions"):
+            self.assertRegex(prompt, r"section.{0,160}only (?:\w+ ){0,3}instructions?\b")
+        for phrase in ("complete", "files_in_scope", "test writer", "builder"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, prompt)
+        with self.subTest(check="minimum section length"):
+            self.assertEqual(getattr(bootstrap, "MIN_SECTION_CHARS", None), 600)
+
+    def test_R41_thin_section_rejected_before_review_and_plan_reset(self):
+        """R41: a 100-character child section is rejected by code and its plan discarded."""
+        child = self.task(id="THIN_CHILD", section="x" * 100)
+        c = self.init(self.plan_task(), agents={"planner": self.plan_writer([child])})
+        self.assertEqual(c.step(), "worked")
+        with self.subTest(check="review never launched"):
+            self.assertEqual(c.team.reviewer.prompts, [])
+        with self.subTest(check="rejection identifies thin child section"):
+            notes = c._task("P1")["notes"]
+            self.assertTrue(any(
+                child["id"] in note and "section" in note.lower()
+                and ("thin" in note.lower() or "short" in note.lower())
+                for note in notes), notes)
+        with self.subTest(check="no child queued"):
+            self.assertEqual([task["id"] for task in c._queue()["tasks"]], ["P1"])
+            self.assertEqual(c._task("P1")["status"], "todo")
+        with self.subTest(check="plan change reset"):
+            self.assertFalse((c.wt / "plan.md").exists())
+            self.assertNotIn("plan.md", self.branch_files())
+            self.assertEqual(bootstrap._git(c.wt, "status", "--porcelain"), "")
+
+    def test_R41_complete_sections_reach_review_and_children_are_queued(self):
+        """R41: sections at and above 600 characters reach review and pass into the queue."""
+        children = [self.task(id="T1", section="x" * 600),
+                    self.task(id="T2", section="y" * 700)]
+        c = self.init(self.plan_task(), agents={"planner": self.plan_writer(children)})
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(c.team.reviewer.prompts), 1)
+        self.assertEqual(c._task("P1")["status"], "done")
+        self.assertEqual(c._task("P1")["notes"], [])
+        self.assertEqual([task["id"] for task in c._queue()["tasks"]], ["P1", "T1", "T2"])
+        for child in children:
+            with self.subTest(child=child["id"]):
+                queued = c._task(child["id"])
+                self.assertEqual(queued["status"], "todo")
+                self.assertEqual(queued["kind"], "build")
+                self.assertEqual(queued["section"], child["section"])
+        self.assertIn("plan.md", self.branch_files())
+
+    def test_R41_retry_prompt_contains_first_thin_plan_rejection(self):
+        """R41: the second planner attempt sees the actual first thin-section rejection."""
+        attempts = []
+
+        def planner(prompt, cwd):
+            attempts.append(prompt)
+            child = self.task(id="RETRY_CHILD", section="x" * (100 if len(attempts) == 1 else 600))
+            return self.plan_writer([child])(prompt, cwd)
+
+        c = self.init(self.plan_task(), agents={"planner": planner})
+        self.assertEqual(c.step(), "worked")
+        notes = c._task("P1")["notes"]
+        self.assertTrue(notes, "the thin first plan must produce a rejection reason")
+        reason = notes[-1]
+        self.assertIn("RETRY_CHILD", reason)
+        self.assertIn("section", reason.lower())
+        self.assertRegex(reason.lower(), r"thin|short")
+        self.assertEqual(c.team.reviewer.prompts, [])
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(attempts), 2)
+        self.assertIn(reason, attempts[1])
+        self.assertEqual(len(c.team.reviewer.prompts), 1)
+        self.assertEqual(c._task("P1")["status"], "done")
+        self.assertEqual(c._task("RETRY_CHILD")["status"], "todo")
