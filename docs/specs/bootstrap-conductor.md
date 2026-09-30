@@ -331,3 +331,15 @@ The first run with real agents and real email hit four faults no fake-based test
   - **`step()`**, on a `Capped` (including `Stopped`) from a stage or the drift check, returns `"killed"` if `KILL` exists, else `"paused"` if `PAUSED` exists, else `"capped"`.
   - **The smoke test:** a `Stopped` gives the problem `stopped during the smoke test`, not "token cap reached".
   - **Still tampering:** any other changed file, or `KILL`/`PAUSED` being **removed** or **changed** (present before the run), is still tampering (R9). An agent can never un-stop Forge.
+## Live-use amendment (2026-09-30, token metering)
+
+- **R43 The token caps count what a run really costs: cached input is weighted at one tenth.** In the first live cycle, a single planner run was metered at about 4.6 million Claude tokens. Nearly all of it was cache reads of the same context, which both providers bill at about a tenth of fresh input. Counting them in full would cap Forge for the rest of the day after two plans. The caps (`claude_daily_token_cap`, `codex_daily_token_cap`) are unchanged. What is counted:
+  - **Claude** (`parse_claude`):
+
+    `input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens // 10`
+  - **Codex** (`parse_codex`, per `turn.completed`):
+
+    `(input_tokens - cached_input_tokens) + cached_input_tokens // 10 + output_tokens + reasoning_output_tokens`
+
+    `cached_input_tokens` is clamped to `0..input_tokens`; missing fields count as 0.
+  - Everything else about metering is unchanged (R6/R37).
