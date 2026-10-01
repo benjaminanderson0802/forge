@@ -138,7 +138,7 @@ class TreeKillTests(Harness):
     def setUp(self):
         super().setUp()
         self.c = self.make_conductor(limits={"claude_daily_token_cap": 10**9, "codex_daily_token_cap": 10**9,
-                                             "test_timeout_s": 2})
+                                             "test_timeout_s": 2, "judge_timeout_s": 2})  # R55: judges have their own limit
         self.dir = Path(self.tmp.name) / "cmd"
         self.dir.mkdir()
         (self.dir / "spawn.py").write_text(GRANDCHILD, encoding="utf-8")
@@ -187,7 +187,7 @@ class TreeKillTests(Harness):
         self.assertTrue(self.gone(int(self.pidfile.read_text())))
 
     def test_judge_honours_kill(self):
-        self.c.limits["test_timeout_s"] = 60
+        self.c.limits["test_timeout_s"] = self.c.limits["judge_timeout_s"] = 60  # R55
         threading.Timer(0.5, lambda: (self.state / "KILL").write_text("stop")).start()
         t0 = time.monotonic()
         with self.assertRaises(Stopped):
