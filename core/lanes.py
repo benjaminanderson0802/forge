@@ -352,8 +352,8 @@ class OwnFiles:
         with self.lock:
             try:
                 names = sorted(e.name for e in os.scandir(self.folder) if e.is_file())
-            except FileNotFoundError:
-                return out
+            except FileNotFoundError:  # a lost folder still has its registered files checked below
+                names = []
             except OSError as e:
                 raise AccountingError(f"{self.kind}/ can't be listed ({type(e).__name__})") from e
             for n in names:

@@ -919,3 +919,46 @@ class ReviewRound2(LaneHarness):
         self.assertEqual(rc, 2)
         self.assertIn("unique across lanes", out)
         self.assertFalse((self.repo / "state" / "lanes" / "p2" / "queue.json").exists())
+
+    def test_r2_fix2_read_only_commands_never_migrate(self):
+        boot = self.sroot / "bootstrap"
+        boot.mkdir(parents=True)
+        (boot / "meter.json").write_text(json.dumps({today(): {"claude": 5}}))
+        import io
+        from contextlib import redirect_stdout
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(service.main(["status"], forge=self.repo.parent), 0)
+        status_page.render(boot, CAPS, shared=self.shared)
+        rc, _ = self._main_cli(["status"])
+        self.assertEqual(rc, 0)
+        self.assertFalse((self.shared / "migrated.json").exists(), "a read-only command migrated")
+        self.assertFalse((self.shared / "meter").exists(), "a read-only command wrote shared accounting")
+
+
+class ReviewRound3(LaneHarness):
+    """R60 review round 3 (Codex): each test fails on the code before its fix."""
+
+    def test_r3_fix1_a_lost_mail_folder_never_resets_the_mail_budget(self):
+        import shutil
+        main, b = self.lane("main"), self.lane("b")
+        self.assertTrue(main._send("[Forge] x", "y"))
+        shutil.rmtree(self.shared / "mail")  # main's registered mail log is gone with its folder
+        self.assertFalse(b._send("[Forge] z", "y"), "a mail budget that can't be counted sends nothing")
+        self.assertEqual(self.mails["b"], [])
+        with self.assertRaises(lanes.AccountingError):
+            lanes.OwnFiles(self.shared, "mail", None, lanes.SharedLock(self.shared)).read_all()
+
+    def test_r3_fix2_run_history_that_cant_be_listed_fails_closed(self):
+        import os
+        from unittest.mock import patch
+        b = self.lane("b")
+        real = os.scandir
+
+        def scandir(path="."):
+            if Path(path).name == "runs":
+                raise PermissionError(13, "denied", str(path))
+            return real(path)
+
+        with patch("os.scandir", side_effect=scandir):
+            self.assertTrue(b.meter.over("claude", dict(CAPS, agent_runs_per_day=100)),
+                            "runs per day that can't be counted admit nothing")

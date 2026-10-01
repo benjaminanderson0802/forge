@@ -104,7 +104,7 @@ class Meter:
         if cap is not None and self.used_today(provider) >= cap:
             return True
         runs_cap = limits.get("agent_runs_per_day")  # T1D3: a hard bound on launches, whatever tokens say
-        if isinstance(runs_cap, int) and not isinstance(runs_cap, bool) and self.runs_today() >= runs_cap:
+        if isinstance(runs_cap, int) and not isinstance(runs_cap, bool) and self.runs_today(strict=True) >= runs_cap:
             return True
         return self.held(provider) is not None
 
@@ -156,14 +156,20 @@ class Meter:
         data[provider] = until.astimezone(timezone.utc).isoformat()
         self._replace(data, self._holds_path)
 
-    def runs_today(self) -> int:
+    def runs_today(self, strict: bool = False) -> int:
+        """Launches today over every lane's runs/ folder. A folder that doesn't exist counts 0 (a lane that never
+        ran); strict (admission, R60 review round 3): a folder that can't be listed raises, so the cap fails closed."""
         prefix = self.clock().astimezone(timezone.utc).strftime("%Y%m%d") + "T"
         n = 0
         for d in (self.runs_dirs() if self.runs_dirs is not None else [self.path.parent / "runs"]):
             try:
                 with os.scandir(d) as it:
                     n += sum(1 for e in it if e.name.startswith(prefix))
-            except OSError:
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                if strict:
+                    raise RuntimeError(f"runs folder {d} can't be listed ({type(e).__name__})") from e
                 continue
         return n
 
