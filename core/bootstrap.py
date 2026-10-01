@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Callable
 
 from core import channel
+from core.selffix import INTERNAL_KINDS as SF_INTERNAL_KINDS, SelfFixMixin, retry_request  # R66
 from core import coverage as cov_mod
 from core import drift as drift_mod
 from core import manager as manager_mod
@@ -334,7 +335,7 @@ def replace_retry(src: Path, dst: Path, tries: int = 6) -> None:
                 raise
             time.sleep(0.02 * (i + 1))
 
-class Conductor:
+class Conductor(SelfFixMixin):
     def __init__(self, repo: Path, work: Path, state: Path, team: Team, limits: dict, *,
                  owner_email: str, mailer: Callable[[str, str], None], inbox: Callable[[], list[dict]],
                  gh: Callable[[list[str]], tuple[int, str]], clock: Callable[[], datetime] | None = None,
@@ -1159,6 +1160,8 @@ class Conductor:
             ("tasks: " + ", ".join(sorted(set(task_ids) | set(stage_waits)))) if (task_ids or stage_waits) else "",
         ) if x) or "nothing right now"
         subject, body = self._cap_item_text(name, cap_map.get(name), d, task_ids, waiting_desc)
+        if self._self_fix:  # R66f: a ready fix kit for Ben
+            self._sf_cap_ready(name, cap_map.get(name), d)
         for qid, q in self._open_cap_items().items():
             if q.get("capability") == name:
                 if q.get("condition") != d.get("condition") or q.get("tasks") != task_ids:
@@ -1214,6 +1217,7 @@ class Conductor:
                 changed = True
         if changed:
             self._write("questions.json", _prune_questions(qs))
+        self._sf_caps_usable(usable)  # R66f: a usable capability fixes its blocker
         gone = [n for n in routing if n in usable]
         if gone:
             for n in gone:
@@ -1221,6 +1225,8 @@ class Conductor:
             self._write("cap_routing.json", routing)
 
     def _cap_job(self, name: str, cap_map: dict, d: dict, tasks: dict, routing: dict) -> None:
+        if self._self_fix:  # R66f: a blocker Forge is fixing
+            self._sf_cap_job(name, d)
         entry = cap_map.get(name)
         detail = entry.get("detail") if isinstance(entry, dict) else None
         waiting = sorted(tid for tid, t in tasks.items() if name in (t.get("needs") or []))
@@ -1261,6 +1267,8 @@ class Conductor:
 
     def _capability_mail_check(self) -> None:
         """D-023: an instant email only when Ben alone can unblock all progress; otherwise items stay held."""
+        if self._self_fix:  # R66f: the blocker email says it
+            return
         items = self._open_cap_items()
         if not items:
             return
@@ -1331,6 +1339,8 @@ class Conductor:
             body = f"{body}\n\nIf you don't answer: {extra.get('default') or channel.default_for(kind)}"
             if not halt and not hold and not channel.is_instant(kind):
                 hold, extra = True, dict(extra, digest=True)
+        if self._self_fix and kind in SF_INTERNAL_KINDS:  # R66: an internal item, never mailed as a question
+            hold, extra = True, {k: v for k, v in dict(extra, auto=True).items() if k != "digest"}
         qs = self._read("questions.json", {})
         seq = self._read("q_seq.json", {"n": len(qs)})
         seq["n"] = int(seq.get("n", 0)) + 1
@@ -1343,6 +1353,8 @@ class Conductor:
             qs[qid]["halt"] = True  # R32: retried on watchdog starts while KILL is set
         if hold:
             qs[qid]["hold"] = True  # T1B2d: stored, not sent (the digest or an instant-email check sends it)
+        if extra.get("auto"):
+            qs[qid]["delivered"] = True  # R66: nothing to send
         self._write("questions.json", _prune_questions(qs))
         if not hold:
             self._deliver(qid, halt=halt)
@@ -1535,6 +1547,9 @@ class Conductor:
         elif q["kind"] == "capability":
             if not self._answer_capability(qs, q, reply, body):
                 return
+        elif q["kind"] == "unpark":  # R66d: Ben's own email unparks a ledger contract
+            if not self._sf_unpark(q, reply):
+                return
         elif q["kind"] == "replan":
             qd = self._queue()
             qd["notes"] = ([str(x)[:NOTE_CAP] for x in qd.get("notes", [])] + [f"Ben: {body.strip()}"[:NOTE_CAP]])[-NOTES_KEEP:]
@@ -1610,6 +1625,8 @@ class Conductor:
                     for rest in answers[i + 1:]:
                         channel.drop_answer(self.channel_in, rest["qid"], rest["code"], rest["answer"], rest["source"])
                     return
+                if self._sf_take_retry(a):  # R66e: a retry from a fix kit
+                    continue
                 kind = str((self._read("questions.json", {}).get(a["qid"]) or {}).get("kind", ""))
                 if kind in channel.EMAIL_ONLY_KINDS:  # Live-run P1: approvals only by the owner's own email
                     self._log((f"refused a {kind} answer for Q-{a['qid']} from {a['source']}: "
@@ -1666,7 +1683,8 @@ class Conductor:
             included = set(st.get("included", []))
             fresh = [i["id"] for i in items if i["via"] == "digest" and i["id"] not in included]
             daily = local.hour >= int(self.limits["digest_hour"]) and st.get("sent_day") != today
-            if daily and not items and summary == st.get("summary", json.dumps([])):
+            extra = self._sf_digest_lines()  # R66g: blockers in the digest
+            if daily and not items and not extra and summary == st.get("summary", json.dumps([])):
                 st["sent_day"] = today  # nothing open, nothing changed: no email
                 self._write("digest.json", st)
                 return
@@ -1678,11 +1696,12 @@ class Conductor:
             subject, body = channel.build_digest(
                 qs, tasks, owner=self.owner, local_now=local, mail_used=self._mail_used(),
                 mail_caps=(int(self.limits.get("mail_per_hour", 6)), int(self.limits.get("mail_per_day", 30))),
-                page_url=self.page_url)
+                page_url=self.page_url, extra_lines=extra)
             if not self._send(subject, body):
                 return
             st["included"] = (list(st.get("included", [])) + [i["id"] for i in items if i["id"] not in included]
                               )[-self.DIGEST_IDS_KEEP:]
+            self._sf_digest_sent()
             st["summary"] = summary
             if daily:
                 st["sent_day"] = today
@@ -1705,6 +1724,7 @@ class Conductor:
         if acct is not None:
             return acct
         self._channel_tick()  # 1E: the daily digest (a no-op unless the channel policy is on)
+        self._blockers_tick()  # R66: migration, checks, retries, the gate watch and blocker email
         if (self.state / "PAUSED").exists():
             return "paused"
         if self._capped():
@@ -1907,6 +1927,8 @@ class Conductor:
         return next(t for t in self._queue()["tasks"] if t["id"] == tid)
 
     def _block(self, tid: str, why: str) -> None:
+        if self._self_fix:  # R66d: Forge reopens it itself; Ben gets a ready fix only when that runs out
+            return self._sf_block(tid, why)
         t = self._update(tid, status="blocked")
         self._ask("blocked", f"Task {tid} is blocked: {t['title']}",
                   f"Task {tid} ({t['title']}) is blocked.\n\nWhy: {why}\n\nNotes:\n" +
@@ -2731,12 +2753,17 @@ class Conductor:
         if status not in ("ok", "replan"):  # R6: unusable result, retry; escalate after 3
             q["drift_failures"] = q.get("drift_failures", 0) + 1
             self._save_queue(q)
-            if q["drift_failures"] >= 3:
+            if q["drift_failures"] >= 3 and self._self_fix:  # R66c: no pause; Forge carries on without it
+                q["drift_failures"], q["drift_due"] = 0, False
+                self._save_queue(q)
+                self._sf_drift_failed(r.error)
+            elif q["drift_failures"] >= 3:
                 (self.state / "PAUSED").write_text("drift keeper failed 3 times\n")
                 self._ask("replan", "Forge paused: the drift check keeps failing",
                           f"The drift keeper returned unusable output 3 times (last error: {r.error}).\n\n"
                           "Reply with guidance to resume.")
             return
+        self._sf_fix_kind("drift")  # R66c: a usable drift check fixes a drift blocker
         reasons = (r.data or {}).get("reasons") or []
         if isinstance(reasons, str):
             reasons = [reasons]
@@ -2756,6 +2783,8 @@ class Conductor:
         q = self._queue()
         q["drift_due"], q["drift_failures"] = False, 0
         self._save_queue(q, durable=True)
+        if replan and not use_manager and self._self_fix:  # R66c: never a pause
+            return self._sf_drift_no_manager(reasons, trigger)
         if replan and not use_manager:  # no Manager configured: pause and ask Ben, as before
             (self.state / "PAUSED").write_text("drift keeper asked for a re-plan\n")
             self._ask("replan", "Forge paused: the drift keeper wants a re-plan",
@@ -2881,6 +2910,10 @@ class Conductor:
         else:
             existing = {t["id"] for t in tasks} | set(led.contracts())
             new, problems = manager_mod.validate_proposal(r.data, reqs, existing)
+            proposed = (r.data or {}).get("tasks") if isinstance(r.data, dict) else None
+            if rp.get("max_tasks") and isinstance(proposed, list) and len(proposed) > int(rp["max_tasks"]):
+                problems = [f"replan rejected: too many tasks for a re-cut ({len(proposed)} > "  # R66c: re-cuts are small
+                            f"{int(rp['max_tasks'])})"] + problems
         if not problems:
             rv = self._call("reviewer", role_text(self.repo, "reviewer") + "\n\nCheck this RE-PLAN from the Manager "
                                         "against the spec and the coverage map: it must make coverage rise, be "
@@ -2923,6 +2956,7 @@ class Conductor:
     def _finish_replan(self, d: dict) -> None:
         d["replan"] = None
         d["auto_replans"] = int(d.get("auto_replans", 0)) + 1
+        self._sf_fix_kind("replan")  # R66c: an accepted re-plan fixes its blocker
         drift_mod.restart_window(d, self._activity().total())
         drift_mod.save(self.state, d)
 
@@ -2932,11 +2966,15 @@ class Conductor:
         rp["attempts"] = int(rp.get("attempts", 0)) + 1
         rp["notes"] = ([str(x)[:NOTE_CAP] for x in rp.get("notes") or []] + [str(x)[:NOTE_CAP] for x in problems])[-NOTES_KEEP:]
         if rp["attempts"] >= 2:
+            if self._self_fix and self._sf_recut(d):  # R66c: re-cut smaller instead of escalating
+                return
             return self._escalate_replan(d, "the Manager's proposals were rejected twice")
         drift_mod.save(self.state, d)
 
     def _escalate_replan(self, d: dict, why: str) -> None:
         """PAUSED and a replan question to Ben; the pending re-plan is cleared only after both exist."""
+        if self._self_fix:  # R66c: never a pause; a ready fix kit for Ben instead
+            return self._sf_escalate_replan(d, why)
         rp = d.get("replan") or {}
         (self.state / "PAUSED").write_text("a re-plan needs Ben\n")
         self._ask("replan", "Forge paused: a re-plan needs you",
@@ -3105,6 +3143,8 @@ class Conductor:
                            f"GitHub said:\n{(out or '')[:2000]}\n\nForge keeps retrying.")
             return
         pr = m.group(1)
+        if self._self_fix:  # R66b: D-037, Forge labels and merges it itself (auto-merge waits for CI)
+            return self._sf_gate(pr, out.strip(), report, q["layer"])
         self._ask("gate", f"{q['layer']} is ready: reply y to approve",
                   report + f"\n\nPull request: {out.strip()}\n\nReply y to approve and merge into main.", pr=pr)
 
@@ -3240,6 +3280,8 @@ class Conductor:
                     return "merge failed"
                 self._log(f"main sync: {layer} conflicts with main {main[:12]} in {', '.join(files)}; merge aborted, "
                           f"keeping the old base"[:500])
+                if self._self_fix:  # R66f: the troubleshooter resolves it in a scratch worktree
+                    return self._sf_sync_conflict(layer, wt, main, head, files, st)
                 qid = next((k for k, v in qs.items() if v.get("kind") == "merge" and v.get("sync")
                             and v.get("status") == "open"), None)
                 if qid is None:
@@ -3261,7 +3303,9 @@ class Conductor:
                     approved.add(m, {"kind": "main", "via": new})
             approved.add(new, {"kind": "main_sync", "base": head, "other": main, "parents": [head, main]})
             st.pop("conflict", None)
+            st.pop("resolve", None)  # R66f
             self._write("main_sync.json", st)
+            self._sf_fix_kind("sync")  # R66f
             stale = [v for v in qs.values() if v.get("kind") == "merge" and v.get("sync") and v.get("status") == "open"]
             for v in stale:  # a sync question that no longer applies is closed
                 v.update(status="answered", answer=f"resolved: synced cleanly at {new}", closed_at=now.isoformat())
@@ -3577,7 +3621,9 @@ def main(argv: list[str]) -> int:
     from core.agents import load_limits
     forge = Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["init", "run", "step", "status", "smoke"])
+    ap.add_argument("cmd", choices=["init", "run", "step", "status", "smoke", "retry"])
+    ap.add_argument("bid", nargs="?", help="retry: the blocker id from a fix kit (R66e)")
+    ap.add_argument("--not-needed", action="store_true", help="retry: the capability isn't needed")
     ap.add_argument("--layer")
     ap.add_argument("--spec", help="R61: the design this layer is built against (default: limits spec_file)")
     ap.add_argument("--tasks")
@@ -3593,6 +3639,13 @@ def main(argv: list[str]) -> int:
     limits = load_limits(forge)
     root = forge / "state"
     state, shared = lanes_mod.state_dir(root, a.lane), lanes_mod.shared_dir(root)
+    if a.cmd == "retry":  # R66e: Ben's one-line retry from a fix kit; writes nothing in the lane's state
+        if not a.bid:
+            print("usage: python -m core.bootstrap retry --lane LANE BLOCKER_ID")
+            return 2
+        code, msg = retry_request(root, a.lane, a.bid, a.not_needed, wait_s=600)
+        print(msg)
+        return code
     work = lanes_mod.work_dir(Path(a.work), a.lane)
     if a.cmd == "init" and not a.force:  # R60: init never silently replaces a lane's queue
         try:
@@ -3713,6 +3766,7 @@ def _start_session(c: Conductor, health, pause_s: float = 60) -> bool:
     c._handle_inbox()  # R31: a STOP is honoured before anything is launched
     if c._kill_set():
         return False
+    c._blockers_tick()  # R66h: the migration may clear a re-plan pause
     while (c.state / "PAUSED").exists():  # R40: while paused, only wait for Ben's answer
         (c.state / "conductor.heartbeat").write_text(f"{os.getpid()} {time.time()}")
         health.set_phase("paused")
