@@ -229,7 +229,8 @@ class Service:
         self.mode = mode(None, limits)
 
     def _killed(self) -> bool:
-        kill_set = getattr(self.c, "_kill_set", None)  # R60: the lane's KILL or the global one
+        kill_set = getattr(self.c, "_loop_must_end", None)  # R60: the lane's KILL or the global one, except
+        # for main's mailbox reader (main stopped alone while other lanes run)
         return bool(kill_set()) if callable(kill_set) else (Path(self.c.state) / "KILL").exists()
 
     def nap(self, seconds: float) -> None:
@@ -380,8 +381,10 @@ def watchdog(forge: Path, limits: dict, *, now: float | None = None,
     now = time.time() if now is None else now
     lock_free = lock_free or (lambda: _lock_free(st))
     run = run or _run_hidden
-    if (st / "KILL").exists() or (lanes.shared_dir(sroot) / "KILL").exists():
+    if (lanes.shared_dir(sroot) / "KILL").exists():
         return "stopped"
+    if (st / "KILL").exists() and not (lane == lanes.MAIN and len(lanes.listed(sroot)) > 1):
+        return "stopped"  # R60: main stopped alone stays up as the mailbox reader while other lanes exist
     hb = _read_json(root / "heartbeat.json", {})
     at = hb.get("at") if isinstance(hb, dict) else None
     if isinstance(at, (int, float)) and hb.get("phase") != "exited" and \

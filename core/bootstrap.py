@@ -324,8 +324,10 @@ class Conductor:
             self.shared.mkdir(parents=True, exist_ok=True)
             self.shared_lock = lanes_mod.SharedLock(self.shared)
             root = self.shared.parent
+            lanes_mod.migrate(root)  # R60: once; afterwards a missing shared meter is an error, never a reset
             self.meter = Meter(self.shared, clock=self.clock, lock=self.shared_lock,
-                               runs_dirs=lambda: lanes_mod.runs_dirs(root))
+                               runs_dirs=lambda: lanes_mod.runs_dirs(root), lane=lane)
+            self.mail_files = lanes_mod.OwnFiles(self.shared, "mail", lane, self.shared_lock)
             if lane != lanes_mod.MAIN:  # each lane has its own answer drop folder (never state/lanes/channel)
                 self.channel_dir = str(lanes_mod.channel_dir(root, lane))
         # D-030: readiness always runs; None means the real checks and AI probes (there is no "off" mode).
@@ -374,22 +376,95 @@ class Conductor:
         return self._read("queue.json", {"layer": "", "tasks": []})
 
     # ------------------------------------------------------------------ R60 lanes: shared files and stops
-    def _shared_read(self, name: str, default):
-        """A shared accumulate file (mail_log.json): in state/shared with lanes, else in this conductor's state."""
+    def _mail_log(self) -> dict:
+        """The mail log: this conductor's mail_log.json, or with lanes every lane's mail/<lane>.json merged (sends
+        and Message-IDs of all lanes; {} when the shared accounting can't be read: step() refuses work then)."""
         if self.shared is None:
-            return self._read(name, default)
-        with self.shared_lock:
-            data = lanes_mod.read_json(self.shared / name, default)
-        return data
+            return self._read("mail_log.json", {})
+        try:
+            files = self.mail_files.read_all()
+        except lanes_mod.AccountingError:
+            return {"sent": [], "ids": []}
+        return {"sent": [x for d in files.values() for x in d.get("sent", [])],
+                "ids": [x for d in files.values() for x in d.get("ids", [])]}
 
-    def _shared_update(self, name: str, fn: Callable, default):
-        """Read-modify-write of a shared accumulate file; with lanes, under the shared lock and replaced atomically."""
+    def _accounting_check(self) -> str | None:
+        """R60: before any work is admitted, the shared accounting must be readable and this lane's own files must be
+        exactly what it last wrote. Returns None when fine, else the step status: "killed" (tampering: KILL for
+        every lane and a halt question) or "not_ready" (unreadable or missing: nothing runs; Ben is asked once)."""
         if self.shared is None:
-            data = self._read(name, default)
-            result = fn(data)
-            self._write(name, data)
-            return result
-        return lanes_mod.update_json(self.shared / name, fn, default, self.shared_lock)
+            return None
+        try:
+            self.meter.verify()
+            self.mail_files.verify()
+            problem = lanes_mod.accounting_problem(self.shared)
+        except lanes_mod.AccountingTampered as e:
+            self._tamper_alarm("accounting check", "between runs", [str(e)])
+            return "killed"
+        except lanes_mod.AccountingError as e:
+            problem = str(e)
+        if problem is None:
+            return None
+        self._log(f"shared accounting can't be trusted; nothing is launched: {problem}"[:500])
+        qs = self._read("questions.json", {})
+        if not any(isinstance(q, dict) and q.get("kind") == "accounting" and q.get("status") == "open"
+                   for q in qs.values()):
+            self._ask("accounting", "Forge paused: its usage accounting can't be read",
+                      f"Forge's shared usage accounting (state/shared) can't be trusted:\n\n{problem}\n\n"
+                      "Nothing is launched until it is fixed, because the token, run and mail caps can't be "
+                      "checked. Only you can fix this: restore the file from a backup, or tell the builder what "
+                      "happened. Reply to this email when it's done.", halt=True)
+        return "not_ready"
+
+    def _mail_reader_only(self) -> bool:
+        """R60: main is stopped by its own KILL alone (not the global one) while other lanes exist. Main still reads
+        Ben's mailbox then, because it is the only reader: a STOP must still stop every lane, and answers to other
+        lanes' questions must still reach them. Nothing else runs."""
+        return (self.lane == lanes_mod.MAIN and self.shared is not None and (self.state / "KILL").exists()
+                and not (self.shared / "KILL").exists() and len(lanes_mod.listed(self.shared.parent)) > 1)
+
+    def _loop_must_end(self) -> bool:
+        """The run loop (and the service's sleep) ends on KILL, unless this conductor is main's mailbox reader."""
+        return self._kill_set() and not self._mail_reader_only()
+
+    def _mailbox_only(self) -> None:
+        """R60: main's mailbox while main itself is stopped. A STOP sets the global KILL; a reply to another lane's
+        question is routed to that lane; a reply to one of main's own questions waits in inbox_pending.json for
+        main's restart (R35). Nothing is sent and no question of main's is answered while main is stopped."""
+        try:
+            messages = self.inbox() or []
+        except Exception as e:  # noqa: BLE001 - email trouble never stops the conductor (R7)
+            self._log(f"inbox read failed: {e!r}")
+            return
+        names = lanes_mod.listed(self.shared.parent)
+        own_ids = set(self._mail_log().get("ids", []))
+        keep = []
+        for i, m in enumerate(messages):
+            try:
+                if not isinstance(m, dict):
+                    continue
+                if m.get("outgoing") or (m.get("message_id") and str(m["message_id"]).strip() in own_ids):
+                    continue
+                if not self._from_owner(m.get("from", "")):
+                    continue
+                subject, body = str(m.get("subject", "")), clean_reply(str(m.get("body", "")))
+                if is_stop(subject, body):
+                    self._stop_all("stopped by owner email\n")
+                    keep += [dict(x, body=clean_reply(str(x.get("body", "")))) for x in messages[i + 1:]
+                             if isinstance(x, dict)]
+                    break
+                mq = re.search(r"\[Forge Q-([\w-]+) ([\w-]{8})\]", subject)
+                lane = lanes_mod.qid_lane(mq.group(1), names) if mq else None
+                if lane:
+                    lanes_mod.route(self.state, lane, {"from": m.get("from", ""), "subject": subject, "body": body,
+                                                       "message_id": m.get("message_id", "")})
+                else:
+                    keep.append(dict(m, body=body))
+            except Exception as e:  # noqa: BLE001 - R35: one bad message never blocks the rest
+                self._log(f"inbox message failed: {e!r}"[:500])
+        if keep:
+            pending = self._read("inbox_pending.json", [])
+            self._write("inbox_pending.json", ((pending if isinstance(pending, list) else []) + keep)[-50:])
 
     def _kill_set(self) -> bool:
         """KILL in this lane's state, or the global KILL in state/shared that stops every lane."""
@@ -539,7 +614,7 @@ class Conductor:
         self._raise_if_stopped()  # R42/R49: checked before every launch, probes included
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + role + "-" + uuid.uuid4().hex[:6]
         d = self.state / "runs" / run_id
-        d.mkdir(parents=True, exist_ok=True)
+        self._admit(provider, d)  # R60: check-and-reserve, atomic across lanes
         (d / "prompt.md").write_bytes(prompt.encode("utf-8"))
         try:
             before = self._fingerprint()
@@ -550,10 +625,13 @@ class Conductor:
             raise RuntimeError("state file unreadable before agent run: " + ", ".join(unreadable))
         if not before.get(LOCK_NAME, "lock:0:").startswith("lock:0:"):  # R15: only an empty lock is trusted
             raise RuntimeError(f"state file {LOCK_NAME} is not empty before agent run")
-        try:  # R60: the shared accumulate files are checked for loss instead of fingerprinted
+        try:  # R60: other lanes' accounting files are checked for loss instead of fingerprinted
             acc_before = lanes_mod.accumulators(self.shared) if self.shared is not None else None
         except OSError as e:
             raise RuntimeError(f"shared state could not be read before agent run: {type(e).__name__}: {e}") from e
+        if acc_before is not None and lanes_mod.unreadable(acc_before):  # R15/R60: fail closed
+            raise lanes_mod.AccountingError("shared accounting unreadable before agent run: "
+                                            + ", ".join(lanes_mod.unreadable(acc_before)))
         # T1C4: a deadline (the builder's remaining focus time) is passed to agents that accept one; the run's
         # duration on the conductor clock is recorded as active time (never for readiness probes).
         extra = {"timeout_s": timeout_s} if timeout_s is not None and self._takes_timeout(agent) else {}
@@ -595,16 +673,7 @@ class Conductor:
             self._log(f"stop requested during {role} run {run_id} ({', '.join(changed)}); run discarded")
             raise Stopped(", ".join(changed))
         if changed:
-            (self.state / "KILL").write_text("state tampered during an agent run\n")
-            if self.shared is not None:  # R60: the lanes share caps and state; a tamper alarm stops them all
-                self._stop_all(f"state tampered during a {role} run in lane {self.lane}\n")
-            try:
-                self._log(f"TAMPER during {role} run {run_id}: {changed}")
-                self._ask("tamper", f"Forge stopped: a {role} agent changed Forge's own state files",
-                          "Files changed during the agent run:\n" + "\n".join(changed) +
-                          "\n\nForge is halted (KILL). Nothing from that run was recorded.", halt=True)
-            except Exception:  # noqa: BLE001 - the halt stands even if the report can't be written
-                pass
+            self._tamper_alarm(role, run_id, changed)
             raise Tampered(", ".join(changed))
         if r.tokens:
             self.meter.add(r.provider or "unknown", r.tokens)
@@ -624,6 +693,41 @@ class Conductor:
         if not label.startswith("probe-"):  # after the tamper comparison, like the meter (R14)
             self._activity().add(self.last_run_s)
         return r
+
+    def _tamper_alarm(self, role: str, run_id: str, changed: list[str]) -> None:
+        """R9: KILL (with lanes, for every lane: they share caps and state), a log line and a halt question."""
+        (self.state / "KILL").write_text("state tampered during an agent run\n")
+        if self.shared is not None:  # R60: the lanes share caps and state; a tamper alarm stops them all
+            self._stop_all(f"state tampered ({role}, {run_id}) in lane {self.lane}\n")
+        try:
+            self._log(f"TAMPER during {role} run {run_id}: {changed}")
+            self._ask("tamper", f"Forge stopped: a {role} agent changed Forge's own state files",
+                      "Files changed during the agent run:\n" + "\n".join(changed) +
+                      "\n\nForge is halted (KILL). Nothing from that run was recorded.", halt=True)
+        except Exception:  # noqa: BLE001 - the halt stands even if the report can't be written
+            pass
+
+    def _admit(self, provider: str | None, d: Path) -> None:
+        """R60: launch admission. With lanes, one transaction under the shared lock: this lane's own accounting is
+        what it last wrote, the shared accounting is readable, the provider is under its caps, holds and the runs
+        per day, and the run is reserved (its run folder, which every lane's runs-per-day count sees) before the lock
+        is released. So two lanes can never both take the last run of the day. Without lanes: the run folder."""
+        if self.shared is None:
+            d.mkdir(parents=True, exist_ok=True)
+            return
+        with self.shared_lock:
+            try:
+                self.meter.verify()
+                self.mail_files.verify()
+            except lanes_mod.AccountingTampered as e:
+                self._tamper_alarm("launch admission", d.name, [str(e)])
+                raise Tampered(str(e)) from e
+            problem = lanes_mod.accounting_problem(self.shared)
+            if problem:  # fail closed (R15): caps we can't count admit nothing
+                raise lanes_mod.AccountingError(problem)
+            if provider and self.meter.over(provider, self.limits):
+                raise Capped(provider)
+            d.mkdir(parents=True, exist_ok=True)
 
     def _layer_wt(self) -> Path | None:
         try:
@@ -711,16 +815,19 @@ class Conductor:
                     f = Path(root) / name
                     rel = DROP_PREFIX + f.relative_to(drop).as_posix()
                     fp[rel] = self._signature(f, rel)
-        # R60: with lanes, the shared folder too, except the files other lanes legitimately write at any time: the
-        # accumulate files (checked by _shrunk_shared: they may only grow), the shared lock, and atomic-replace
-        # temporaries. Anything else there (the global KILL, a stray file) is fingerprinted like this lane's own.
+        # R60: with lanes, the shared folder too, except what other lanes legitimately write at any time: their own
+        # accounting files (meter/, holds/, mail/ of other lanes, and inbox_seen.json unless this is main; each
+        # checked by lanes.shrunk: they may only grow), the shared lock, and atomic-replace temporaries. This lane's
+        # own accounting files, migrated.json, the global KILL and anything else there are fingerprinted.
         if self.shared is not None and self.shared.is_dir():
+            own = {f"{k}/{self.lane}.json" for k in lanes_mod.KINDS}
             for root, _dirs, files in os.walk(self.shared, onerror=fail):
                 for name in files:
                     f = Path(root) / name
                     rel = f.relative_to(self.shared).as_posix()
-                    if rel in lanes_mod.ACCUMULATORS or rel == lanes_mod.SHARED_LOCK \
-                            or name.startswith(lanes_mod.TMP_PREFIX):
+                    others = (rel.split("/", 1)[0] in lanes_mod.KINDS and rel not in own) or \
+                        (rel == lanes_mod.INBOX_SEEN and self.lane != lanes_mod.MAIN)
+                    if others or rel == lanes_mod.SHARED_LOCK or name.startswith(lanes_mod.TMP_PREFIX):
                         continue
                     fp[SHARED_PREFIX + rel] = self._signature(f, SHARED_PREFIX + rel)
         return fp
@@ -1219,11 +1326,12 @@ class Conductor:
                 return False
         from email.utils import make_msgid
 
-        def reserve(log: dict) -> str | None:  # R60: one locked transaction when every lane shares the budget
+        def reserve(log: dict, others=()) -> str | None:  # R60: one locked transaction across every lane
             sent = [x for x in log.get("sent", []) if (now - datetime.fromisoformat(x)).total_seconds() < 86400]
-            hour = [x for x in sent if (now - datetime.fromisoformat(x)).total_seconds() < 3600]
+            every = sent + [x for x in others if (now - datetime.fromisoformat(x)).total_seconds() < 86400]
+            hour = [x for x in every if (now - datetime.fromisoformat(x)).total_seconds() < 3600]
             if len(hour) >= int(self.limits.get("mail_per_hour", 6)) or \
-                    len(sent) >= int(self.limits.get("mail_per_day", 30)):
+                    len(every) >= int(self.limits.get("mail_per_day", 30)):
                 stamp = now.strftime("%Y-%m-%dT%H")
                 if log.get("budget_logged") != stamp:
                     self._log(f"mail budget reached; held back: {subject[:120]}")
@@ -1235,7 +1343,19 @@ class Conductor:
             log["ids"] = (list(log.get("ids", [])) + [mid])[-SENT_IDS_KEEP:]
             return mid
 
-        mid = self._shared_update("mail_log.json", reserve, {"sent": [], "budget_logged": "", "ids": []})
+        if self.shared is None:
+            log = self._read("mail_log.json", {"sent": [], "budget_logged": "", "ids": []})
+            mid = reserve(log)
+            self._write("mail_log.json", log)
+        else:  # R60: every lane's sends count; only this lane's own mail file is written
+            try:
+                with self.shared_lock:
+                    others = [x for ln, d in self.mail_files.read_all().items() if ln != self.lane
+                              for x in d.get("sent", [])]
+                    mid = self.mail_files.update(lambda log: reserve(log, others))
+            except lanes_mod.AccountingError as e:  # fail closed: a budget we can't count sends nothing
+                self._log(f"mail held back, shared mail accounting can't be trusted: {e}"[:500])
+                return False
         if mid is None:
             return False
         if halt:  # R32: the halt throttle starts only when an attempt actually goes ahead
@@ -1307,7 +1427,7 @@ class Conductor:
         batch = (pending if isinstance(pending, list) else []) + list(messages)
         if pending:
             self._write("inbox_pending.json", [])
-        own_ids = set(self._shared_read("mail_log.json", {}).get("ids", []))
+        own_ids = set(self._mail_log().get("ids", []))
         names = lanes_mod.listed(self.shared.parent) if self.shared is not None and self.lane == lanes_mod.MAIN \
             else []
         for i, m in enumerate(batch):
@@ -1465,7 +1585,7 @@ class Conductor:
     def _mail_used(self) -> tuple[int, int]:
         now = self.clock()
         ages = []
-        for x in self._shared_read("mail_log.json", {}).get("sent", []):
+        for x in self._mail_log().get("sent", []):
             try:
                 ages.append((now - datetime.fromisoformat(x)).total_seconds())
             except (TypeError, ValueError):
@@ -1538,10 +1658,15 @@ class Conductor:
     # ------------------------------------------------------------------ main step
     def step(self) -> str:
         if self._kill_set():  # R21: KILL stops everything, email included
+            if self._mail_reader_only():  # R60: except the mailbox, while other lanes may still need it
+                self._mailbox_only()
             return "killed"
         self._handle_inbox()
         if self._kill_set():
             return "killed"
+        acct = self._accounting_check()  # R60: caps that can't be counted admit no work (fail closed)
+        if acct is not None:
+            return acct
         self._channel_tick()  # 1E: the daily digest (a no-op unless the channel policy is on)
         if (self.state / "PAUSED").exists():
             return "paused"
@@ -1698,7 +1823,15 @@ class Conductor:
                 self._log(f"step crashed: {e!r}")
             n += 1
             if status == "killed" or self._kill_set():  # T1D2: a stop pressed mid-step ends the loop
-                return "killed"
+                if not self._mail_reader_only():
+                    return "killed"
+                if on_step:  # R60: main stopped alone stays up as the mailbox reader for the other lanes
+                    try:
+                        on_step(status)
+                    except Exception as e:  # noqa: BLE001
+                        self._log(f"on_step hook failed: {e!r}"[:500])
+                sleep(idle_sleep_s)
+                continue
             if on_step:  # T1D2: the always-on service (core.service): status, pacing; never fatal
                 try:
                     on_step(status)
@@ -3294,6 +3427,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--owner", default="benjaminanderson0802@gmail.com")
     ap.add_argument("--work", default=str(Path.home() / "Forge-work"))
     ap.add_argument("--lane", default=lanes_mod.MAIN, help="R60: which lane's conductor (default: main)")
+    ap.add_argument("--force", action="store_true", help="init: replace a queue that still has tasks")
     a = ap.parse_args(argv)
     problem = lanes_mod.name_problem(a.lane)
     if problem:
@@ -3304,6 +3438,17 @@ def main(argv: list[str]) -> int:
     lanes_mod.migrate(root)  # R60: today's main-lane meter, holds and mail log become the shared ones (once)
     state, shared = lanes_mod.state_dir(root, a.lane), lanes_mod.shared_dir(root)
     work = lanes_mod.work_dir(Path(a.work), a.lane)
+    if a.cmd == "init" and not a.force:  # R60: init never silently replaces a lane's queue
+        try:
+            existing = json.loads((state / "queue.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            existing = {}
+        except (OSError, ValueError):
+            existing = {"tasks": ["unreadable"]}
+        if isinstance(existing, dict) and existing.get("tasks"):
+            print(f"lane {a.lane} already has a queue with {len(existing['tasks'])} task(s) "
+                  f"(layer {existing.get('layer')!r}); pass --force to replace it, or use another --lane")
+            return 2
     if a.cmd == "status":
         q = json.loads((state / "queue.json").read_text(encoding="utf-8")) if (state / "queue.json").exists() else {}
         for t in q.get("tasks", []):
@@ -3362,6 +3507,9 @@ def main(argv: list[str]) -> int:
             health = service.Health(lanes_mod.service_dir(root, a.lane), limits).start()  # T1D2, R60: per lane
             if not _start_session(c, health):
                 return 0
+            if c._kill_set():  # R60: the mailbox reader only: no smoke test, no start notice, no work
+                print(service.Service(c, lanes_mod.service_dir(root, a.lane), limits, health=health).serve())
+                return 0
         if a.cmd == "smoke" or _smoke_stale(c.state, c.clock()):
             problems = _guarded_smoke(c, Path(a.work), force=a.cmd == "smoke")
             if a.cmd == "smoke":
@@ -3392,7 +3540,7 @@ def _start_session(c: Conductor, health, pause_s: float = 60) -> bool:
     health.set_phase("step")
     if c._kill_set():  # R32: while stopped, only retry a pending halt alert
         c._retry_halts()
-        return False
+        return c._mail_reader_only()  # R60: main stopped alone still reads the mailbox for the other lanes
     c._handle_inbox()  # R31: a STOP is honoured before anything is launched
     if c._kill_set():
         return False

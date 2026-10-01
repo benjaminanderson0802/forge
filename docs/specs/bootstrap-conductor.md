@@ -524,3 +524,38 @@ Module: `core/lanes.py`, with hooks in `core/bootstrap.py`, `core/usage.py`, `co
   - **Status page:** the usage bars are the shared meter, runs and mail budget (every lane together). A "Lanes" section shows each other lane's layer, current task, flags and queue. Answers on the page are for main's questions; other lanes' questions are answered by email.
 
 - **R61 Each layer is built against its own design.** `init --spec <file>` records `spec_file` in the lane's queue. The drift keeper and the coverage map read that design. Without it they read `limits["spec_file"]`, else the Layer 1 design. A Phase 2 lane therefore drifts against `docs/specs/phase-2-design.md`, not Layer 1's.
+
+## R60 review round 1 (Codex review, 2026-10-01; overrides R60 where they differ)
+
+- **R60a Launch admission is atomic.** Under the shared lock, one transaction does all of this before the lock is released:
+  - checks this lane's own accounting and the shared accounting;
+  - checks the provider's token cap, holds and runs per day;
+  - reserves the launch by creating its run folder, which every lane's runs-per-day count sees.
+
+  `_admit`, called by `_guarded_run`, does this for every launch, probes included. Two lanes can never both take the last run of the day.
+- **R60b Shared usage can't be lost or lowered silently.** The single shared `meter.json`, `holds.json` and `mail_log.json` are replaced by one file per lane: `state/shared/meter/<lane>.json`, `holds/<lane>.json` and `mail/<lane>.json`.
+  - **Writing:** each lane writes only its own files, under the lock.
+  - **Totals:** the meter and the mail budget are summed over every lane's file; a hold is the latest over every lane's file.
+  - **No lost updates:** no lane ever rewrites a file that another lane increments, so a concurrent increment can't be overwritten by a stale copy.
+  - **Protection:**
+    - **Own files** are fingerprinted by their lane, like the rest of its state.
+    - **Other lanes' files** may only grow during this lane's agent runs (`lanes.shrunk`).
+    - **Expected-content check:** the owning conductor remembers exactly what it last wrote, and checks before every write, every launch and every step (`OwnFiles.verify`). Any difference is a tamper alarm (KILL for every lane and a halt question). An agent that writes back a stale copy of another lane's counter is therefore caught by the lane that owns it, even when the running lane's before/after comparison can't see it.
+    - **While the owning lane isn't running,** its file doesn't change, so any decrease is below the running lane's snapshot and that lane catches it.
+  - **`inbox_seen.json`** is the main lane's own file: main fingerprints it, and the other lanes check it only grows.
+- **R60c Unreadable accounting fails closed.** Shared accounting is read strictly: a missing marker, a missing main meter, unreadable files, invalid JSON, or invalid shapes all count as unreadable.
+  - Every `step()` checks it. If it can't be trusted: nothing is launched, `step()` returns `"not_ready"`, the problem is logged, and Ben is asked once (question kind `accounting`, a halt question).
+  - `Meter.over` reports capped.
+  - A meter or mail file that can't be read is never overwritten.
+  - `_send` sends nothing while the mail accounting can't be read.
+  - Before a run, an unreadable accounting file means the agent is not launched. After a run, a file that became unreadable is tampering.
+- **R60d Migration happens once, with a marker.** The first start copies the old main-lane files into `meter/main.json`, `holds/main.json`, `mail/main.json` and `inbox_seen.json`, then writes `state/shared/migrated.json`. Every start calls `migrate` (the CLI and every `Conductor` with lanes), but a marked folder is never migrated again: a meter missing after that is unreadable accounting (R60c), never a reset. The R60 meter top-up is dropped.
+- **R60e `init` never replaces a queue silently.** `init` refuses (exit 2) when the lane's queue still has tasks, unless `--force` is given. The Phase 2 start command is `python -m core.bootstrap init --lane p2 --layer phase-2 --tasks docs/specs/phase-2-queue.json --spec docs/specs/phase-2-design.md`.
+- **R60f The mailbox reader outlives main's own stop.** When main is stopped by its own KILL alone (no global KILL) and other lanes exist, main stays up as the mailbox reader (`_mail_reader_only`). It does nothing else:
+  - its `step()` reads the mailbox;
+  - a STOP still writes the global KILL;
+  - replies to other lanes' questions are still routed;
+  - replies to main's own questions wait in `inbox_pending.json` until main restarts (R35);
+  - nothing is sent and nothing else runs.
+
+  The run loop and the service sleep continue, and the watchdog keeps main running. Only the global KILL stops the mailbox reader.

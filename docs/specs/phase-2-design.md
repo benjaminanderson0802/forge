@@ -114,7 +114,7 @@ Both feed one **score per agent role** (D-031: "Rejected easy-outs are logged ag
 - **P2A Auditor** (`docs/superpowers/plans/2026-10-01-phase-2a-auditor.md`): the ledger `audit` action, `S_AUDIT` and `agents/auditor.md`, the `audit_due` trigger and scheduling, findings validation, fix tasks, confirmed/unconfirmed/`dismissed`, gate condition, drift keeper reading `spec_file`.
 - **P2B Challenger** (`docs/superpowers/plans/2026-10-01-phase-2b-challenger.md`, `depends_on` P2A): the ledger `challenge` action, `S_CHALLENGE` and `agents/challenger.md`, proof verification, the three targets, bounds and pending/withdraw handling.
 - **P2C Scores and gate drills** (`docs/superpowers/plans/2026-10-01-phase-2c-scores-gate.md`, `depends_on` P2A and P2B): `core/scores.py`, prompt record line, digest/status page section, the `false_claims` alarm, mechanical drills, fixtures and `core/gate_drills.py`.
-- **Starting the lane:** load the queue with `python -m core.bootstrap init --layer phase-2 --tasks docs/specs/phase-2-queue.json`, with `spec_file` pointing at this file for that lane.
+- **Starting the lane:** load the queue into its own lane (never main's) with `python -m core.bootstrap init --lane p2 --layer phase-2 --tasks docs/specs/phase-2-queue.json --spec docs/specs/phase-2-design.md`. `init` refuses to replace a queue that still has tasks unless `--force` is given.
 
 ## Proposed decisions (not yet in DECISIONS.md)
 

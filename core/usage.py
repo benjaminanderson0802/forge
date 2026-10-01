@@ -16,15 +16,29 @@ from typing import Callable
 
 
 class Meter:
-    """R60 (lanes): with `lock` (a core.lanes.SharedLock) the meter and holds are shared by several conductor
-    processes: every read-modify-write happens under that lock, and `runs_dirs` lists every lane's runs/ folder so
-    agent_runs_per_day counts launches across all lanes. Without them it is the single-conductor meter."""
+    """R60 (lanes): with `lock` (a core.lanes.SharedLock) `state_dir` is state/shared and the meter and holds are
+    shared by several conductor processes. Each lane writes only its own files (meter/<lane>.json, holds/<lane>.json)
+    under the lock; totals are summed (holds: the latest) over every lane's file, read strictly: an unreadable or
+    invalid file raises core.lanes.AccountingError, and over() then says "capped" (fail closed). `runs_dirs` lists
+    every lane's runs/ folder so agent_runs_per_day counts launches across all lanes. `lane` None is read-only (the
+    status page). Without `lock` it is the single-conductor meter (state/meter.json, state/holds.json)."""
 
     def __init__(self, state_dir: Path, clock: Callable[[], datetime] | None = None, *,
-                 lock=None, runs_dirs: Callable[[], list[Path]] | None = None):
+                 lock=None, runs_dirs: Callable[[], list[Path]] | None = None, lane: str | None = None):
         self.path = Path(state_dir) / "meter.json"
         self.clock = clock or (lambda: datetime.now(timezone.utc))
-        self.lock, self.runs_dirs = lock, runs_dirs
+        self.lock, self.runs_dirs, self.lane = lock, runs_dirs, lane
+        self._own = self._own_holds = None
+        if lock is not None:
+            from core.lanes import OwnFiles
+            self._own = OwnFiles(Path(state_dir), "meter", lane, lock)
+            self._own_holds = OwnFiles(Path(state_dir), "holds", lane, lock)
+
+    def verify(self) -> None:
+        """R60: this lane's own meter and holds files are exactly what it last wrote (AccountingTampered if not)."""
+        if self._own is not None and self.lane is not None:
+            self._own.verify()
+            self._own_holds.verify()
 
     def _locked(self):
         return self.lock if self.lock is not None else nullcontext()
@@ -44,6 +58,14 @@ class Meter:
         return self.clock().astimezone(timezone.utc).strftime("%Y-%m-%d")
 
     def _read(self) -> dict:
+        if self._own is not None:  # R60: every lane's own file, summed
+            total: dict = {}
+            for data in self._own.read_all().values():
+                for day, provs in data.items():
+                    d = total.setdefault(day, {})
+                    for p, n in provs.items():
+                        d[p] = d.get(p, 0) + n
+            return total
         with self._locked():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -57,13 +79,27 @@ class Meter:
     def add(self, provider: str, tokens: int) -> None:
         if tokens < 0:
             raise ValueError("tokens must be >= 0")
-        with self._locked():  # R60: one read-modify-write at a time across every lane
-            data = self._read()
-            day = data.setdefault(self._day(), {})
-            day[provider] = int(day.get(provider, 0)) + tokens
-            self._replace(data, self.path)
+        if self._own is not None:  # R60: only this lane's own file, under the shared lock
+            if self.lane is None:
+                raise ValueError("a read-only meter can't add usage")
+
+            def bump(data: dict) -> None:
+                day = data.setdefault(self._day(), {})
+                day[provider] = int(day.get(provider, 0)) + tokens
+            self._own.update(bump)
+            return
+        data = self._read()
+        day = data.setdefault(self._day(), {})
+        day[provider] = int(day.get(provider, 0)) + tokens
+        self._replace(data, self.path)
 
     def over(self, provider: str, limits: dict) -> bool:
+        try:
+            return self._over(provider, limits)
+        except RuntimeError:  # R60: core.lanes.AccountingError: accounting we can't read admits nothing
+            return True
+
+    def _over(self, provider: str, limits: dict) -> bool:
         cap = limits.get(f"{provider}_daily_token_cap")
         if cap is not None and self.used_today(provider) >= cap:
             return True
@@ -78,6 +114,13 @@ class Meter:
         return self.path.parent / "holds.json"
 
     def _holds(self) -> dict:
+        if self._own_holds is not None:  # R60: the latest hold per provider over every lane's file
+            merged: dict = {}
+            for data in self._own_holds.read_all().values():
+                for p, until in data.items():
+                    if p not in merged or datetime.fromisoformat(until) > datetime.fromisoformat(merged[p]):
+                        merged[p] = until
+            return merged
         with self._locked():
             try:
                 data = json.loads(self._holds_path.read_text(encoding="utf-8"))
@@ -97,13 +140,21 @@ class Meter:
 
     def hold(self, provider: str, until: datetime) -> None:
         """Hold a provider until a limit window resets. A later hold extends an earlier one, never shortens it."""
-        with self._locked():
-            data = self._holds()
-            cur = self.held(provider)
-            if cur is not None and cur >= until:
-                return
-            data[provider] = until.astimezone(timezone.utc).isoformat()
-            self._replace(data, self._holds_path)
+        if self._own_holds is not None:  # R60: this lane's own holds file
+            if self.lane is None:
+                raise ValueError("a read-only meter can't hold")
+            with self.lock:
+                cur = self.held(provider)
+                if cur is not None and cur >= until:
+                    return
+                self._own_holds.update(lambda d: d.__setitem__(provider, until.astimezone(timezone.utc).isoformat()))
+            return
+        data = self._holds()
+        cur = self.held(provider)
+        if cur is not None and cur >= until:
+            return
+        data[provider] = until.astimezone(timezone.utc).isoformat()
+        self._replace(data, self._holds_path)
 
     def runs_today(self) -> int:
         prefix = self.clock().astimezone(timezone.utc).strftime("%Y%m%d") + "T"

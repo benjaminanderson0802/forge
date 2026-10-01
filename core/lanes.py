@@ -12,8 +12,8 @@ Layout (main keeps today's paths):
     state/bootstrap/            the "main" lane's state (unchanged)
     state/lanes/<name>/         every other lane's state: lock, queue, questions, runs, capabilities, ...
     state/lanes.json            the lane names the watchdog and the Windows script start (main is implied)
-    state/shared/               shared by every lane: meter.json, holds.json, mail_log.json, inbox_seen.json,
-                                shared.lock and the global KILL
+    state/shared/               shared by every lane: meter/, holds/ and mail/ (one file per lane, summed),
+                                inbox_seen.json (main's), migrated.json, shared.lock and the global KILL
     state/service/              main's heartbeat; state/service/<name>/ for every other lane
     Forge-work/                 main's worktrees; Forge-work/lanes/<name>/ for every other lane
 
@@ -38,11 +38,9 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,23}$")  # no "-": a question id's lane 
 # Names that would collide with question kinds (qid prefixes), service files (Windows names are case-insensitive)
 # or the state layout.
 RESERVED = frozenset({MAIN, "gate", "blocked", "replan", "tamper", "capability", "merge", "shared", "lanes",
-                      "bootstrap", "service", "channel", "wake", "kill", "paused", "heartbeat", "status", "routed"})
+                      "bootstrap", "service", "channel", "wake", "kill", "paused", "heartbeat", "status", "routed",
+                      "accounting", "meter", "holds", "mail"})
 SHARED_LOCK = "shared.lock"
-# Files every lane accumulates into. Written only by conductor code (never by agents), at any time, by any lane:
-# so no lane can fingerprint them. Each gets a never-decreases check instead (shrunk()).
-ACCUMULATORS = ("meter.json", "holds.json", "mail_log.json", "inbox_seen.json")
 TMP_PREFIX = ".tmp-"  # atomic-replace temporaries; transient while another lane writes
 ROUTED_KEEP, ROUTED_SEEN_KEEP = 50, 500
 MAIL_IDS_KEEP, INBOX_SEEN_KEEP = 500, 2000  # R26: the caps the writers apply (bootstrap.SENT_IDS_KEEP, gmail_inbox)
@@ -262,67 +260,203 @@ def update_json(path: Path, fn: Callable, default, lock: SharedLock):
         return result
 
 
+# ------------------------------------------------------------------ shared accounting: one file per lane (R60)
+# Each lane writes only its own file in state/shared/meter/, holds/ and mail/ (state/shared/<kind>/<lane>.json); the
+# shared total is the sum (meter, mail sends) or the latest (holds) over every lane's file. So no lane ever writes a
+# file another lane writes, and a concurrent increment can never be overwritten by a stale copy:
+#   - a lane fingerprints its OWN files like the rest of its state (only it writes them, never during its runs);
+#   - every other lane's file may only grow during this lane's agent runs (shrunk());
+#   - the owning lane keeps, in memory, exactly what it last wrote and checks it before every write, every launch
+#     and every step (OwnFiles.verify): a lowered file is a tamper alarm even if it was lowered "in between".
+# inbox_seen.json is written only by the main lane (the one mailbox reader) and is treated as main's own file.
+KINDS = ("meter", "holds", "mail")
+INBOX_SEEN = "inbox_seen.json"
+MARKER = "migrated.json"
+
+
+class AccountingError(RuntimeError):
+    """Shared accounting (meter, holds, mail log) is missing, unreadable or invalid: fail closed (R15)."""
+
+
+class AccountingTampered(AccountingError):
+    """A lane's own accounting file is not what that lane last wrote."""
+
+
+def _valid_meter(d) -> bool:
+    return isinstance(d, dict) and all(
+        isinstance(day, str) and isinstance(provs, dict) and all(
+            isinstance(p, str) and isinstance(n, int) and not isinstance(n, bool) and n >= 0
+            for p, n in provs.items()) for day, provs in d.items())
+
+
+def _valid_holds(d) -> bool:
+    return isinstance(d, dict) and all(isinstance(k, str) and _when(v) is not None for k, v in d.items())
+
+
+def _valid_mail(d) -> bool:
+    return isinstance(d, dict) and isinstance(d.get("sent", []), list) and isinstance(d.get("ids", []), list) \
+        and all(_when(x) is not None for x in d.get("sent", []))
+
+
+def _valid_seen(d) -> bool:
+    return isinstance(d, list)
+
+
+VALID = {"meter": _valid_meter, "holds": _valid_holds, "mail": _valid_mail}
+
+
+def read_strict(path: Path, valid: Callable) -> object:
+    """The parsed file, None when it doesn't exist; AccountingError when it can't be read or isn't valid."""
+    p = Path(path)
+    for i in range(5):
+        try:
+            raw = p.read_text(encoding="utf-8")
+            break
+        except FileNotFoundError:
+            return None
+        except PermissionError:  # Windows: a writer is replacing it right now
+            if i == 4:
+                raise AccountingError(f"{p.name}: can't be read")
+            time.sleep(0.02 * (i + 1))
+        except OSError as e:
+            raise AccountingError(f"{p.name}: can't be read ({type(e).__name__})") from e
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise AccountingError(f"{p.parent.name}/{p.name}: invalid JSON") from e
+    if not valid(data):
+        raise AccountingError(f"{p.parent.name}/{p.name}: not valid {p.parent.name} data")
+    return data
+
+
+def _canon(data) -> str:
+    return json.dumps(data, sort_keys=True)
+
+
+class OwnFiles:
+    """state/shared/<kind>/<lane>.json for every lane: each lane writes only its own file."""
+
+    def __init__(self, shared: Path, kind: str, lane: str | None, lock: SharedLock):
+        self.folder, self.kind, self.lane, self.lock = Path(shared) / kind, kind, lane, lock
+        self.valid = VALID[kind]
+        self._expected: str | None = None  # what this process last read or wrote for its own file
+
+    @property
+    def path(self) -> Path:
+        return self.folder / f"{self.lane}.json"
+
+    def read_all(self) -> dict:
+        """{lane: data} for every lane's file; AccountingError if any is unreadable or invalid."""
+        out = {}
+        with self.lock:
+            try:
+                names = sorted(e.name for e in os.scandir(self.folder) if e.is_file())
+            except FileNotFoundError:
+                return out
+            except OSError as e:
+                raise AccountingError(f"{self.kind}/ can't be listed ({type(e).__name__})") from e
+            for n in names:
+                if not n.endswith(".json") or n.startswith(TMP_PREFIX):
+                    continue
+                data = read_strict(self.folder / n, self.valid)
+                if data is not None:
+                    out[n[:-5]] = data
+        return out
+
+    def own(self) -> dict:
+        """This lane's file, checked against what this process last saw of it."""
+        with self.lock:
+            data = read_strict(self.path, self.valid)
+            canon = _canon(data)
+            if self._expected is not None and canon != self._expected:
+                raise AccountingTampered(f"shared/{self.kind}/{self.lane}.json is not what lane {self.lane} "
+                                         "last wrote")
+            self._expected = canon
+            return data if data is not None else {}
+
+    verify = own
+
+    def update(self, fn: Callable):
+        with self.lock:
+            data = self.own()
+            result = fn(data)
+            write_json_atomic(self.path, data)
+            self._expected = _canon(data)
+            return result
+
+
 # ------------------------------------------------------------------ migration
 def migrate(state_root: Path) -> bool:
-    """First run with lanes: copy today's main-lane meter, holds, mail log and inbox_seen into state/shared/, so no
-    cap resets. Runs once (state/shared/meter.json marks it done); the old copies are left untouched. Returns True
-    when it copied."""
+    """First run with lanes: today's main-lane meter, holds, mail log and inbox_seen become the main lane's shared
+    files (state/shared/meter/main.json, holds/main.json, mail/main.json, inbox_seen.json), so no cap resets. Runs
+    once: state/shared/migrated.json, written last, marks it done, and a marked folder is never migrated again (a
+    missing meter after that is an accounting error, never a silent reset). The old copies are left untouched.
+    Returns True when it copied."""
     shared, boot = shared_dir(state_root), Path(state_root) / "bootstrap"
-    if (shared / "meter.json").exists():
-        _top_up_meter(shared, boot)
+    if (shared / MARKER).exists():
         return False
     with SharedLock(shared):
-        if (shared / "meter.json").exists():
-            _top_up_meter(shared, boot)
+        if (shared / MARKER).exists():
             return False
-        for name in ACCUMULATORS[1:]:  # meter.json last: its existence marks the migration as done
-            src = boot / name
-            if src.is_file() and not (shared / name).exists():
-                write_bytes_atomic(shared / name, src.read_bytes())
+        for kind, old in (("holds", "holds.json"), ("mail", "mail_log.json")):
+            src = boot / old
+            if src.is_file():
+                write_bytes_atomic(shared / kind / f"{MAIN}.json", src.read_bytes())
+        if (boot / INBOX_SEEN).is_file():
+            write_bytes_atomic(shared / INBOX_SEEN, (boot / INBOX_SEEN).read_bytes())
         src = boot / "meter.json"
-        write_bytes_atomic(shared / "meter.json", src.read_bytes() if src.is_file() else b"{}")
+        write_bytes_atomic(shared / "meter" / f"{MAIN}.json", src.read_bytes() if src.is_file() else b"{}")
+        write_json_atomic(shared / MARKER, {"at": datetime.now(timezone.utc).isoformat(), "from": str(boot)})
     return True
 
 
-def _top_up_meter(shared: Path, boot: Path) -> None:
-    """Belt and braces for "caps never reset": if the old main-lane meter still counts more for some day and
-    provider than the shared one (e.g. an older conductor kept writing it after the copy), the shared meter is raised
-    to it. With every conductor on lanes the old file never changes again, so this is then a no-op."""
-    old = read_json(boot / "meter.json", None)
-    if not isinstance(old, dict) or not old:
-        return
-    with SharedLock(shared):
-        cur = read_json(shared / "meter.json", {})
-        cur = cur if isinstance(cur, dict) else {}
-        changed = False
-        for day, provs in old.items():
-            if not isinstance(provs, dict):
-                continue
-            for prov, n in provs.items():
-                if isinstance(n, int) and not isinstance(n, bool):
-                    d = cur.setdefault(day, {}) if isinstance(cur.get(day, {}), dict) else None
-                    if d is not None and int(_num(d.get(prov, 0))) < n:
-                        d[prov], changed = n, True
-        if changed:
-            write_json_atomic(shared / "meter.json", cur)
+def accounting_problem(shared: Path) -> str | None:
+    """Why the shared accounting can't be trusted, or None. Checked before any work is admitted (fail closed)."""
+    shared = Path(shared)
+    if not (shared / MARKER).exists():
+        return "shared accounting was never set up (state/shared/migrated.json missing)"
+    if not (shared / "meter" / f"{MAIN}.json").exists():
+        return "the shared meter is missing after migration (state/shared/meter/main.json)"
+    lock = SharedLock(shared)
+    try:
+        for kind in KINDS:
+            OwnFiles(shared, kind, None, lock).read_all()
+        with lock:
+            read_strict(shared / INBOX_SEEN, _valid_seen)
+    except AccountingError as e:
+        return str(e)
+    return None
 
 
 # ------------------------------------------------------------------ the never-decreases check
+_BAD = "<unreadable>"
+
+
 def accumulators(shared: Path) -> dict:
-    """The parsed shared accumulate files (None when missing), read under the shared lock."""
+    """Every lane's accounting file, parsed ({"meter/<lane>.json": data, ..., "inbox_seen.json": data}); _BAD for
+    one that can't be read or isn't valid. Read under the shared lock."""
     out = {}
     with SharedLock(shared):
-        for name in ACCUMULATORS:
-            p = Path(shared) / name
-            if not p.exists():
-                out[name] = None
-                continue
-            data = read_json(p, _BAD)
-            out[name] = data
+        for kind in KINDS:
+            try:
+                names = sorted(e.name for e in os.scandir(Path(shared) / kind) if e.is_file())
+            except FileNotFoundError:
+                names = []
+            for n in names:
+                if n.endswith(".json") and not n.startswith(TMP_PREFIX):
+                    try:
+                        out[f"{kind}/{n}"] = read_strict(Path(shared) / kind / n, VALID[kind])
+                    except AccountingError:
+                        out[f"{kind}/{n}"] = _BAD
+        try:
+            out[INBOX_SEEN] = read_strict(Path(shared) / INBOX_SEEN, _valid_seen)
+        except AccountingError:
+            out[INBOX_SEEN] = _BAD
     return out
 
 
-_BAD = "<unreadable>"
+def unreadable(acc: dict) -> list[str]:
+    return sorted(k for k, v in acc.items() if v == _BAD)
 
 
 def _num(x) -> float:
@@ -342,45 +476,44 @@ def _when(x) -> datetime | None:
 
 
 def shrunk(before: dict, after: dict, now: datetime) -> list[str]:
-    """What an agent run may have taken away from the shared accumulate files. Conductor code only ever adds to
+    """What an agent run may have taken away from other lanes' accounting files. Conductor code only ever adds to
     them (or drops what has aged out or passed a fixed cap), so any other loss is tampering:
-      meter.json   no day/provider count may decrease or disappear
-      holds.json   no hold may be shortened or removed
-      mail_log     no send younger than 23 hours may disappear (the budget); no recent Message-ID either
+      meter/*      no day/provider count may decrease or disappear
+      holds/*      no hold may be shortened or removed
+      mail/*       no send younger than 23 hours may disappear (the budget); no recent Message-ID either
       inbox_seen   no handled Message-ID may disappear (unless the list is at its cap)
-    A file that was readable before and is unreadable or missing after counts as a loss."""
+    A file that existed before and is unreadable, invalid or missing after counts as a loss."""
     out = []
-    for name in ACCUMULATORS:
-        b, a = before.get(name), after.get(name)
+    for name, b in before.items():
+        a = after.get(name)
         if b is None or b == _BAD:
             continue
         if a is None or a == _BAD:
-            out.append(f"shared/{name} (removed or unreadable after the run)")
+            out.append(f"shared/{name} (removed, unreadable or invalid after the run)")
             continue
-        if name == "meter.json" and isinstance(b, dict):
+        if name.startswith("meter/"):
             for day, provs in b.items():
-                for prov, n in (provs.items() if isinstance(provs, dict) else []):
-                    m = (a.get(day) or {}).get(prov) if isinstance(a, dict) and isinstance(a.get(day), dict) else None
+                for prov, n in provs.items():
+                    m = a.get(day, {}).get(prov) if isinstance(a.get(day), dict) else None
                     if m is None or _num(m) < _num(n):
-                        out.append(f"shared/meter.json (decreased: {day} {prov} {n} -> {m})")
-        elif name == "holds.json" and isinstance(b, dict):
+                        out.append(f"shared/{name} (decreased: {day} {prov} {n} -> {m})")
+        elif name.startswith("holds/"):
             for prov, until in b.items():
-                tb, ta = _when(until), _when(a.get(prov)) if isinstance(a, dict) else None
+                tb, ta = _when(until), _when(a.get(prov))
                 if tb is not None and (ta is None or ta < tb):
-                    out.append(f"shared/holds.json (hold on {prov} shortened or removed)")
-        elif name == "mail_log.json" and isinstance(b, dict):
-            sent_after = set(a.get("sent", [])) if isinstance(a, dict) and isinstance(a.get("sent"), list) else set()
-            for x in b.get("sent", []) if isinstance(b.get("sent"), list) else []:
+                    out.append(f"shared/{name} (hold on {prov} shortened or removed)")
+        elif name.startswith("mail/"):
+            sent_after = set(a.get("sent", []))
+            for x in b.get("sent", []):
                 t = _when(x)
                 if t is not None and (now - t).total_seconds() < 23 * 3600 and x not in sent_after:
-                    out.append("shared/mail_log.json (a recent send was removed)")
+                    out.append(f"shared/{name} (a recent send was removed)")
                     break
-            ids_b = b.get("ids", []) if isinstance(b.get("ids"), list) else []
-            ids_a = a.get("ids", []) if isinstance(a, dict) and isinstance(a.get("ids"), list) else []
-            if len(ids_a) < MAIL_IDS_KEEP and not set(ids_b) <= set(ids_a):
-                out.append("shared/mail_log.json (sent Message-IDs were removed)")
-        elif name == "inbox_seen.json" and isinstance(b, list):
-            if not isinstance(a, list) or (len(a) < INBOX_SEEN_KEEP and not set(map(str, b)) <= set(map(str, a))):
+            ids_b, ids_a = b.get("ids", []), a.get("ids", [])
+            if len(ids_a) < MAIL_IDS_KEEP and not set(map(str, ids_b)) <= set(map(str, ids_a)):
+                out.append(f"shared/{name} (sent Message-IDs were removed)")
+        elif name == INBOX_SEEN:
+            if len(a) < INBOX_SEEN_KEEP and not set(map(str, b)) <= set(map(str, a)):
                 out.append("shared/inbox_seen.json (handled messages were removed)")
     return out
 

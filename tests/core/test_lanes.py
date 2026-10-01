@@ -161,7 +161,7 @@ class SharedCapsAndKill(LaneHarness):
     def test_a_hold_in_one_lane_holds_the_provider_in_every_lane(self):
         a, b = self.lane("main"), self.lane("b")
         a.meter.hold("codex", datetime.now(timezone.utc) + timedelta(hours=1))
-        self.assertTrue((self.shared / "holds.json").exists())
+        self.assertTrue((self.shared / "holds" / "main.json").exists())
         self.assertEqual(b.step(), "capped")
 
     def test_global_kill_stops_every_lane(self):
@@ -195,7 +195,8 @@ class SharedCapsAndKill(LaneHarness):
         self.assertTrue(b._send("two", "x"))
         self.assertTrue(a._send("three", "x"))
         self.assertFalse(b._send("four", "x"), "the hourly budget counts every lane's mail")
-        self.assertEqual(len(json.loads((self.shared / "mail_log.json").read_text())["sent"]), 3)
+        sent = [x for n in ("main", "b") for x in json.loads((self.shared / "mail" / f"{n}.json").read_text())["sent"]]
+        self.assertEqual(len(sent), 3, "each lane writes only its own mail file; the budget sums them")
         self.assertFalse((a.state / "mail_log.json").exists())
 
 
@@ -223,7 +224,7 @@ class TamperAcrossLanes(LaneHarness):
         a.meter.add("claude", 5000)
 
         def lower(cwd):
-            m = self.shared / "meter.json"
+            m = self.shared / "meter" / "main.json"
             data = json.loads(m.read_text())
             data[today()]["claude"] = 10
             m.write_text(json.dumps(data))
@@ -234,7 +235,7 @@ class TamperAcrossLanes(LaneHarness):
         self.assertTrue((self.shared / "KILL").exists(), "lanes share caps: a tamper alarm stops them all")
         tamper = [q for q in self.questions(a).values() if q["kind"] == "tamper"]
         self.assertEqual(len(tamper), 1)
-        self.assertIn("shared/meter.json", tamper[0]["body"])
+        self.assertIn("shared/meter/main.json", tamper[0]["body"])
 
     def test_an_agent_that_deletes_the_shared_meter_or_a_hold_or_mail_is_tampering(self):
         for what in ("meter", "hold", "mail"):
@@ -248,11 +249,11 @@ class TamperAcrossLanes(LaneHarness):
 
                 def strike(cwd, what=what):
                     if what == "meter":
-                        (self.shared / "meter.json").unlink()
+                        (self.shared / "meter" / "main.json").unlink()
                     elif what == "hold":
-                        (self.shared / "holds.json").write_text("{}")
+                        (self.shared / "holds" / "main.json").write_text("{}")
                     else:
-                        (self.shared / "mail_log.json").write_text('{"sent": [], "ids": []}')
+                        (self.shared / "mail" / "main.json").write_text('{"sent": [], "ids": []}')
 
                 a.team.test_writer = FakeAgent(self.writer(during=strike), provider="codex")
                 self.assertEqual(a.step(), "killed")
@@ -281,22 +282,27 @@ class TamperAcrossLanes(LaneHarness):
         self.assertIn("queue.json", next(q for q in self.questions(a).values() if q["kind"] == "tamper")["body"])
         self.assertFalse((b.state / "KILL").exists(), "known limit: lane b's own check can't see it")
 
-    def test_the_fingerprint_leaves_out_exactly_the_accumulate_files_and_the_lock(self):
-        a = self.lane("b")
-        a.meter.add("codex", 1)
-        a._send("[Forge] x", "y")
+    def test_the_fingerprint_leaves_out_exactly_other_lanes_accounting_and_the_lock(self):
+        main, b = self.lane("main"), self.lane("b")
+        main.meter.add("codex", 1)
+        main._send("[Forge] x", "y")
+        b.meter.add("codex", 1)
+        b._send("[Forge] x", "y")
+        b.meter.hold("gemini", datetime.now(timezone.utc) + timedelta(minutes=5))
         (self.shared / "inbox_seen.json").write_text("[]")
         (self.shared / "KILL").write_text("x")
-        keys = a._fingerprint()
-        shared_keys = sorted(k for k in keys if k.startswith("shared/"))
-        self.assertEqual(shared_keys, ["shared/KILL"])
+        keys = b._fingerprint()
+        self.assertEqual(sorted(k for k in keys if k.startswith("shared/")),
+                         ["shared/KILL", "shared/holds/b.json", "shared/mail/b.json", "shared/meter/b.json",
+                          "shared/migrated.json"], "own accounting is fingerprinted; other lanes' is not")
+        self.assertIn("shared/inbox_seen.json", main._fingerprint(), "inbox_seen.json is main's own file")
         self.assertTrue((self.shared / "shared.lock").exists())
         self.assertIn("queue.json", keys)
         self.assertFalse([k for k in keys if k.startswith("bootstrap") or "lanes/" in k])
 
 
 class Migration(LaneHarness):
-    def test_first_run_copies_todays_counts_into_shared_and_never_resets_them(self):
+    def old_state(self):
         boot = self.sroot / "bootstrap"
         boot.mkdir(parents=True)
         until = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
@@ -305,32 +311,45 @@ class Migration(LaneHarness):
         (boot / "holds.json").write_text(json.dumps({"claude": until}))
         (boot / "mail_log.json").write_text(json.dumps({"sent": [now], "ids": ["<a@forge.local>"]}))
         (boot / "inbox_seen.json").write_text(json.dumps(["<m1>"]))
+        return boot, now
+
+    def test_first_run_copies_todays_counts_into_shared_and_never_resets_them(self):
+        boot, now = self.old_state()
         self.assertTrue(lanes.migrate(self.sroot))
-        for name in lanes.ACCUMULATORS:
-            self.assertEqual((self.shared / name).read_bytes(), (boot / name).read_bytes(), name)
+        for old, new in (("meter.json", "meter/main.json"), ("holds.json", "holds/main.json"),
+                         ("mail_log.json", "mail/main.json"), ("inbox_seen.json", "inbox_seen.json")):
+            self.assertEqual((self.shared / new).read_bytes(), (boot / old).read_bytes(), new)
+        self.assertTrue((self.shared / "migrated.json").exists())
         a = self.lane("main")
         self.assertEqual(a.meter.used_today("claude"), 1234)
         self.assertIsNotNone(a.meter.held("claude"))
-        self.assertEqual(a._shared_read("mail_log.json", {})["sent"], [now], "the mail budget carries over")
+        self.assertEqual(a._mail_log()["sent"], [now], "the mail budget carries over")
         a.meter.add("claude", 6)
         self.assertFalse(lanes.migrate(self.sroot), "migration runs once")
         self.assertEqual(a.meter.used_today("claude"), 1240, "a second start never overwrites the shared meter")
 
-    def test_a_meter_the_old_conductor_kept_writing_is_topped_up(self):
-        boot = self.sroot / "bootstrap"
-        boot.mkdir(parents=True)
-        (boot / "meter.json").write_text(json.dumps({today(): {"claude": 100}}))
-        lanes.migrate(self.sroot)
-        (boot / "meter.json").write_text(json.dumps({today(): {"claude": 500}}))
-        lanes.migrate(self.sroot)
-        self.assertEqual(self.shared_meter().used_today("claude"), 500)
-        (boot / "meter.json").write_text(json.dumps({today(): {"claude": 50}}))
-        lanes.migrate(self.sroot)
-        self.assertEqual(self.shared_meter().used_today("claude"), 500, "never lowered")
-
     def test_no_old_state_starts_an_empty_shared_meter(self):
         self.assertTrue(lanes.migrate(self.sroot))
-        self.assertEqual(json.loads((self.shared / "meter.json").read_text()), {})
+        self.assertEqual(json.loads((self.shared / "meter" / "main.json").read_text()), {})
+
+    def test_a_missing_shared_meter_after_migration_fails_closed_not_reset(self):
+        """Review fix 6: once migrated.json exists, a missing meter is an accounting error (nothing launches; Ben is
+        asked once), never a silent re-migration that resets the day's usage."""
+        self.old_state()
+        calls = []
+        a = self.lane("main", test_writer=lambda p, c: calls.append(1) or ('{}', 1))
+        a.meter.add("claude", 6)
+        (self.shared / "meter" / "main.json").unlink()
+        (self.sroot / "bootstrap" / "meter.json").write_text(json.dumps({today(): {"claude": 1}}))
+        fresh = self.lane("p2")  # a new conductor start: migrate() runs again
+        self.assertFalse((self.shared / "meter" / "main.json").exists(), "never re-migrated")
+        self.assertEqual(fresh.step(), "not_ready")
+        self.assertEqual(calls, [])
+        qs = [q for q in self.questions(fresh).values() if q["kind"] == "accounting"]
+        self.assertEqual(len(qs), 1)
+        self.assertEqual(fresh.step(), "not_ready")
+        self.assertEqual(len([q for q in self.questions(fresh).values() if q["kind"] == "accounting"]), 1,
+                         "Ben is asked once")
 
 
 class Routing(LaneHarness):
@@ -438,19 +457,19 @@ class SharedLocking(unittest.TestCase):
                 from core import lanes
                 from core.usage import Meter
                 shared = Path(sys.argv[1])
-                m = Meter(shared, lock=lanes.SharedLock(shared))
+                m = Meter(shared, lock=lanes.SharedLock(shared), lane=sys.argv[2])
                 for _ in range(200):
                     m.add("claude", 1)
                     lanes.update_json(shared / "counter.json", lambda d: d.__setitem__("n", d.get("n", 0) + 1),
                                       {{}}, lanes.SharedLock(shared))
             """)
-            procs = [subprocess.Popen([sys.executable, "-c", script, t]) for _ in range(2)]
+            procs = [subprocess.Popen([sys.executable, "-c", script, t, lane]) for lane in ("main", "b")]
             for p in procs:
                 self.assertEqual(p.wait(180), 0)
             shared = Path(t)
             self.assertEqual(service.shared_meter(shared, lambda: datetime.now(timezone.utc)).used_today("claude"), 400)
             self.assertEqual(json.loads((shared / "counter.json").read_text())["n"], 400)
-            self.assertFalse([f for f in shared.iterdir() if f.name.startswith(lanes.TMP_PREFIX)])
+            self.assertFalse([f for f in shared.rglob("*") if f.name.startswith(lanes.TMP_PREFIX)])
 
     def test_the_lock_is_reentrant_in_one_thread_and_exclusive_across_handles(self):
         with tempfile.TemporaryDirectory() as t:
@@ -536,3 +555,212 @@ class ServiceAndPage(LaneHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRound1(LaneHarness):
+    """R60 review round 1 (Codex): each test fails on the code before its fix."""
+
+    def ready_pair(self):
+        a, b = self.lane("main"), self.lane("b")
+        self.assertEqual(a.step(), "worked")  # readiness evidence for both providers now exists
+        self.assertEqual(b.step(), "worked")
+        return a, b
+
+    def test_fix1_the_last_run_of_the_day_is_admitted_once_across_lanes(self):
+        """With one run left, lane b admits itself while lane a is between its cap check and its launch. Only one
+        agent may run, and the day's runs never exceed the cap."""
+        import threading
+        from core.bootstrap import Capped
+        a, b = self.ready_pair()
+        ran = []
+        for c, name in ((a, "a"), (b, "b")):
+            c.team.drift_keeper = FakeAgent(lambda p, cwd, n=name: ran.append(n) or ('{"status":"ok"}', 1),
+                                            provider="claude")
+        cap = self.shared_meter().runs_today() + 1
+        a.limits["agent_runs_per_day"] = b.limits["agent_runs_per_day"] = cap
+        results, threads = [], []
+
+        def attempt(c):
+            try:
+                c._call("drift_keeper", "check", None)
+                return "ran"
+            except Capped:
+                return "capped"
+
+        real_over = a.meter.over
+
+        def over(provider, limits):
+            res = real_over(provider, limits)
+            if not threads:  # lane b's whole admission happens right after lane a's check
+                t = threading.Thread(target=lambda: results.append(attempt(b)))
+                threads.append(t)
+                t.start()
+                t.join(2)
+            return res
+
+        a.meter.over = over
+        results.append(attempt(a))
+        for t in threads:
+            t.join(60)
+        self.assertEqual(len(ran), 1, f"both lanes launched: {ran}")
+        self.assertEqual(sorted(results), ["capped", "ran"])
+        self.assertLessEqual(self.shared_meter().runs_today(), cap)
+
+    def test_fix2_another_lanes_increment_written_back_lower_is_caught(self):
+        """Lane main's agent copies the shared meter, lane b meters 50 tokens meanwhile, and the agent writes its
+        stale copy back. Main's own before/after can't see it; the shared total must still never drop silently."""
+        b = self.lane("b")
+        b.meter.add("claude", 10)
+        stale = {}
+
+        def during(cwd):
+            stale.update({p: p.read_bytes() for p in self.shared.rglob("*.json") if "meter" in p.as_posix()})
+            b.meter.add("claude", 50)  # lane b's conductor meters a run
+            for p, raw in stale.items():  # the agent puts back what it copied
+                p.write_bytes(raw)
+
+        a = self.lane("main", test_writer=self.writer(during=during))
+        before_total = self.shared_meter().used_today("claude")
+        status_a = a.step()
+        status_b = b.step()
+        alarmed = (self.shared / "KILL").exists()
+        lost = self.shared_meter().used_today("claude") < before_total + 50
+        self.assertTrue(alarmed or not lost, "50 tokens of lane b's usage vanished without a tamper alarm")
+        self.assertEqual(status_b, "killed")
+        tamper = [q for q in self.questions(b).values() if q["kind"] == "tamper"]
+        self.assertTrue(tamper and "meter/b.json" in tamper[0]["body"])
+        self.assertIn(status_a, ("worked", "killed"))
+
+    def test_fix2_an_agent_lowering_another_lanes_counter_below_its_snapshot_is_caught_by_the_runner(self):
+        b = self.lane("b")
+        b.meter.add("claude", 500)
+
+        def lower(cwd):
+            (self.shared / "meter" / "b.json").write_text(json.dumps({today(): {"claude": 1}}))
+
+        a = self.lane("main", test_writer=self.writer(during=lower))
+        self.assertEqual(a.step(), "killed")
+        tamper = [q for q in self.questions(a).values() if q["kind"] == "tamper"]
+        self.assertIn("shared/meter/b.json", tamper[0]["body"])
+
+    def test_fix3_unreadable_shared_accounting_admits_nothing_and_is_never_overwritten(self):
+        calls = []
+        a = self.lane("main", test_writer=lambda p, c: calls.append(1) or ('{"files":[]}', 1))
+        b = self.lane("b")
+        b.meter.add("claude", 7)
+        bad = sorted(p for p in self.shared.rglob("*.json") if "meter" in p.as_posix())
+        for p in bad:
+            p.write_text("{not json")
+        self.assertEqual(a.step(), "not_ready")
+        self.assertEqual(calls, [], "no agent may launch while usage can't be counted")
+        self.assertTrue(a.meter.over("codex", a.limits), "the caps fail closed")
+        self.assertEqual(a.step(), "not_ready")
+        qs = [q for q in self.questions(a).values() if q["kind"] == "accounting"]
+        self.assertEqual(len(qs), 1, "Ben is asked once")
+        self.assertTrue(any("accounting" in s.lower() or "usage" in s.lower() for s, _ in self.mails["main"]))
+        for p in bad:
+            self.assertEqual(p.read_text(), "{not json", f"{p.name} was overwritten")
+        self.assertIn("accounting can't be trusted", (a.state / "errors.log").read_text())
+
+    def test_fix3_an_agent_corrupting_another_lanes_accounting_is_tampering(self):
+        b = self.lane("b")
+        b._send("[Forge] x", "y")
+        a = self.lane("main", test_writer=self.writer(
+            during=lambda cwd: (self.shared / "mail" / "b.json").write_text("garbage")))
+        self.assertEqual(a.step(), "killed")
+
+    def _main_cli(self, argv):
+        import io
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+        from core import bootstrap
+        out = io.StringIO()
+        patches = [patch("core.bootstrap.__file__", str(self.repo / "core" / "bootstrap.py")),
+                   patch("core.agents.load_limits", return_value=dict(CAPS)),
+                   patch("core.bootstrap.real_team", return_value=self.lane_team()),
+                   patch("core.bootstrap.real_checks", return_value=dict(HEALTHY_CHECKS)),
+                   patch("core.bootstrap.real_probes", side_effect=lambda limits: healthy_probes()),
+                   patch("core.bootstrap.real_manager", return_value=None),
+                   patch("core.bootstrap.gmail_mailer", return_value=lambda s, b: None),
+                   patch("core.bootstrap.gmail_inbox", return_value=lambda: []),
+                   patch("core.bootstrap.gh_cli", return_value=lambda args: (0, ""))]
+        for p in patches:
+            p.start()
+        try:
+            with redirect_stdout(out):
+                rc = bootstrap.main(argv + ["--work", str(self.work_root)])
+        finally:
+            for p in patches:
+                p.stop()
+        return rc, out.getvalue()
+
+    def lane_team(self):
+        noop = lambda p, c: ('{"status":"ok"}', 1)  # noqa: E731
+        return Team(*[FakeAgent(noop, provider=pr) for pr in ("codex", "claude", "codex", "claude", "claude",
+                                                             "claude")])
+
+    def test_fix4_init_never_replaces_a_queue_with_tasks_unless_forced(self):
+        tasks = Path(self.tmp.name) / "tasks.json"
+        tasks.write_text(json.dumps([self.task()]))
+        other = Path(self.tmp.name) / "other.json"
+        other.write_text(json.dumps([self.task(id="X9")]))
+        qfile = self.repo / "state" / "lanes" / "p2" / "queue.json"
+        self.assertEqual(self._main_cli(["init", "--lane", "p2", "--layer", "phase-2", "--tasks", str(tasks)])[0], 0)
+        self.assertEqual(json.loads(qfile.read_text())["tasks"][0]["id"], "T1")
+        rc, out = self._main_cli(["init", "--lane", "p2", "--layer", "phase-2", "--tasks", str(other)])
+        self.assertEqual(rc, 2)
+        self.assertIn("--force", out)
+        self.assertEqual(json.loads(qfile.read_text())["tasks"][0]["id"], "T1", "the queue was replaced")
+        rc, _ = self._main_cli(["init", "--layer", "layer-1", "--tasks", str(tasks)])  # main's own, empty: fine
+        self.assertEqual(rc, 0)
+        rc, _ = self._main_cli(["init", "--layer", "phase-2b", "--tasks", str(other)])  # main has tasks now
+        self.assertEqual(rc, 2)
+        rc, _ = self._main_cli(["init", "--lane", "p2", "--layer", "phase-2", "--tasks", str(other), "--force"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(qfile.read_text())["tasks"][0]["id"], "X9")
+
+    def test_fix4_the_phase_2_start_command_names_its_lane(self):
+        text = (ROOT / "docs" / "specs" / "phase-2-design.md").read_text(encoding="utf-8")
+        for line in [ln for ln in text.splitlines() if "core.bootstrap init" in ln]:
+            self.assertIn("--lane p2", line)
+            self.assertIn("--spec docs/specs/phase-2-design.md", line)
+
+    def test_fix5_main_stopped_alone_still_reads_mail_for_the_other_lanes(self):
+        a, b = self.lane("main"), self.lane("p2")
+        q = b._queue()
+        q["tasks"][0]["status"] = "blocked"
+        b._save_queue(q)
+        qid = b._ask("blocked", "Task T1 is blocked", "details", task="T1")
+        mine = a._ask("blocked", "main's own", "details", task="T1")
+        (a.state / "KILL").write_text("Ben stopped main only\n")
+        code = self.questions(b)[qid]["code"]
+        self.messages += [{"from": OWNER, "subject": f"Re: [Forge Q-{qid} {code}] x", "body": "use plan B"},
+                          {"from": OWNER, "subject": f"Re: [Forge Q-{mine} {self.questions(a)[mine]['code']}] x",
+                           "body": "later"}]
+        self.assertEqual(a.step(), "killed")
+        self.assertEqual(self.messages, [], "main read the mailbox although its own KILL is set")
+        b._handle_inbox()
+        self.assertEqual(self.questions(b)[qid]["status"], "answered", "the answer reached lane p2")
+        self.assertEqual(self.questions(a)[mine]["status"], "open", "main answers nothing while stopped")
+        self.assertEqual(len(a._read("inbox_pending.json", [])), 1, "main's own reply waits for its restart")
+        self.assertFalse((self.shared / "KILL").exists())
+        self.messages.append({"from": OWNER, "subject": "STOP", "body": ""})
+        self.assertEqual(a.step(), "killed")
+        self.assertTrue((self.shared / "KILL").exists(), "an owner STOP still stops every lane")
+        self.assertEqual(b.step(), "killed")
+
+    def test_fix5_main_stopped_alone_keeps_its_loop_and_the_watchdog_keeps_it_up(self):
+        a, _ = self.lane("main"), self.lane("p2")
+        (a.state / "KILL").write_text("main only\n")
+        sleeps = []
+        self.assertEqual(a.run(max_steps=3, sleep=sleeps.append), "killed")
+        self.assertEqual(len(sleeps), 3, "the loop kept going as the mailbox reader")
+        res = service.watchdog_all(self.repo.parent, {"heartbeat_stale_s": 600}, lock_free=lambda: True,
+                                   run=lambda args: 0)
+        self.assertEqual(res["main"], "started")
+        self.assertTrue(service.Service(a, lanes.service_dir(self.sroot, "main"), {})._killed() is False)
+        (self.shared / "KILL").write_text("all\n")
+        self.assertEqual(a.run(max_steps=3, sleep=sleeps.append), "killed")
+        self.assertEqual(len(sleeps), 3, "the global KILL ends the loop at once")
+        self.assertEqual(service.watchdog_all(self.repo.parent, {}, lock_free=lambda: True,
+                                              run=lambda args: 0)["main"], "stopped")

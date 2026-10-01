@@ -66,7 +66,10 @@ def _e(x) -> str:
 
 def _mail_used(state: Path, now: datetime) -> tuple[int, int]:
     hour = day = 0
-    for x in _read(state, "mail_log.json", {}).get("sent", []):
+    folder = Path(state) / "mail"  # R60: with lanes, every lane's own mail file in state/shared/mail/
+    logs = [_read(folder, f.name, {}) for f in sorted(folder.glob("*.json")) if not f.name.startswith(".")] \
+        if folder.is_dir() else [_read(state, "mail_log.json", {})]
+    for x in [x for log in logs for x in log.get("sent", [])]:
         try:
             age = (now - datetime.fromisoformat(x)).total_seconds()
         except (TypeError, ValueError):
