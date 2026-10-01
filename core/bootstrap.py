@@ -29,6 +29,7 @@ from core import channel
 from core import coverage as cov_mod
 from core import drift as drift_mod
 from core import manager as manager_mod
+from core import lanes as lanes_mod
 from core import readiness, service
 from core.finalize import ApprovedMerges, Finalizer, Hooks, Journal, safe_push
 from core.ledger import Ledger, Rejected
@@ -210,6 +211,7 @@ class Stopped(Capped):
 
 
 STOP_FILES = ("KILL", "PAUSED")
+SHARED_PREFIX = "shared/"  # R58: fingerprint keys of files in state/shared
 DROP_PREFIX = "channel/in/"  # fingerprint keys of the answer drop folder (never a state/ path: state has no channel/)
 STOP_MARK = "agent stopped:"  # R49: core.agents.Stopped's message; an agent killed by a stop flag reports it
 
@@ -276,16 +278,30 @@ class Conductor:
                  owner_email: str, mailer: Callable[[str, str], None], inbox: Callable[[], list[dict]],
                  gh: Callable[[list[str]], tuple[int, str]], clock: Callable[[], datetime] | None = None,
                  judge_cmds: list[str] | None = None, push: bool = True,
-                 checks: dict | None = None, probes: dict | None = None, manager=None):
+                 checks: dict | None = None, probes: dict | None = None, manager=None,
+                 shared: Path | None = None, lane: str = lanes_mod.MAIN):
         self.repo, self.work, self.state = Path(repo), Path(work), Path(state)
+        # R58 lanes: `shared` is state/shared (meter, holds, mail log, inbox_seen, the global KILL), shared by every
+        # lane. None keeps the single-conductor layout where all of those live in `state`.
+        self.shared = Path(shared) if shared is not None else None
+        self.lane = lane
         self.team, self.limits = team, limits
         self.owner = owner_email.strip().lower()
         self.mailer, self.inbox, self.gh = mailer, inbox, gh
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.judge_cmds = list(judge_cmds or [])
         self.push = push
-        self.meter = Meter(self.state, clock=self.clock)
         self.state.mkdir(parents=True, exist_ok=True)
+        if self.shared is None:
+            self.meter = Meter(self.state, clock=self.clock)
+        else:
+            self.shared.mkdir(parents=True, exist_ok=True)
+            self.shared_lock = lanes_mod.SharedLock(self.shared)
+            root = self.shared.parent
+            self.meter = Meter(self.shared, clock=self.clock, lock=self.shared_lock,
+                               runs_dirs=lambda: lanes_mod.runs_dirs(root))
+            if lane != lanes_mod.MAIN:  # each lane has its own answer drop folder (never state/lanes/channel)
+                self.channel_dir = str(lanes_mod.channel_dir(root, lane))
         # D-030: readiness always runs; None means the real checks and AI probes (there is no "off" mode).
         self.checks = dict(real_checks() if checks is None else checks)
         self.probes = dict(real_probes(limits) if probes is None else probes)
@@ -330,6 +346,37 @@ class Conductor:
 
     def _queue(self) -> dict:
         return self._read("queue.json", {"layer": "", "tasks": []})
+
+    # ------------------------------------------------------------------ R58 lanes: shared files and stops
+    def _shared_read(self, name: str, default):
+        """A shared accumulate file (mail_log.json): in state/shared with lanes, else in this conductor's state."""
+        if self.shared is None:
+            return self._read(name, default)
+        with self.shared_lock:
+            data = lanes_mod.read_json(self.shared / name, default)
+        return data
+
+    def _shared_update(self, name: str, fn: Callable, default):
+        """Read-modify-write of a shared accumulate file; with lanes, under the shared lock and replaced atomically."""
+        if self.shared is None:
+            data = self._read(name, default)
+            result = fn(data)
+            self._write(name, data)
+            return result
+        return lanes_mod.update_json(self.shared / name, fn, default, self.shared_lock)
+
+    def _kill_set(self) -> bool:
+        """KILL in this lane's state, or the global KILL in state/shared that stops every lane."""
+        return (self.state / "KILL").exists() or (self.shared is not None and (self.shared / "KILL").exists())
+
+    def _stop_all(self, reason: str) -> None:
+        """Ben's STOP (email or the page): this conductor's KILL, and with lanes the global KILL that stops all."""
+        (self.state / "KILL").write_text(reason)
+        if self.shared is not None:
+            (self.shared / "KILL").write_text(reason)
+
+    def _stop_keys(self) -> tuple:
+        return STOP_FILES + ((SHARED_PREFIX + "KILL",) if self.shared is not None else ())
 
     def _save_queue(self, q: dict, durable: bool = False) -> None:
         if isinstance(q.get("notes"), list):  # R28
@@ -477,6 +524,10 @@ class Conductor:
             raise RuntimeError("state file unreadable before agent run: " + ", ".join(unreadable))
         if not before.get(LOCK_NAME, "lock:0:").startswith("lock:0:"):  # R15: only an empty lock is trusted
             raise RuntimeError(f"state file {LOCK_NAME} is not empty before agent run")
+        try:  # R58: the shared accumulate files are checked for loss instead of fingerprinted
+            acc_before = lanes_mod.accumulators(self.shared) if self.shared is not None else None
+        except OSError as e:
+            raise RuntimeError(f"shared state could not be read before agent run: {type(e).__name__}: {e}") from e
         # T1C4: a deadline (the builder's remaining focus time) is passed to agents that accept one; the run's
         # duration on the conductor clock is recorded as active time (never for readiness probes).
         extra = {"timeout_s": timeout_s} if timeout_s is not None and self._takes_timeout(agent) else {}
@@ -506,17 +557,21 @@ class Conductor:
         try:
             after = self._fingerprint()
             changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+            if acc_before is not None:  # R58: the meter (and the other accumulate files) may never decrease
+                changed += lanes_mod.shrunk(acc_before, lanes_mod.accumulators(self.shared), self.clock())
         except Exception as e:  # noqa: BLE001 - R15: a check that can't complete counts as tampering
             changed = [f"state could not be fingerprinted after the run: {type(e).__name__}: {e}"]
         if committed is not None:  # logged only after the after-run fingerprint (the log is a state file)
             self._log(f"{role} run {run_id} made a commit; reset to base. Files: {', '.join(committed)}"[:500])
-        if changed and all(k in STOP_FILES and k not in before for k in changed):  # R42: a stop, not tampering
+        if changed and all(k in self._stop_keys() and k not in before for k in changed):  # R42: a stop
             if r.tokens:
                 self.meter.add(r.provider or "unknown", r.tokens)
             self._log(f"stop requested during {role} run {run_id} ({', '.join(changed)}); run discarded")
             raise Stopped(", ".join(changed))
         if changed:
             (self.state / "KILL").write_text("state tampered during an agent run\n")
+            if self.shared is not None:  # R58: the lanes share caps and state; a tamper alarm stops them all
+                self._stop_all(f"state tampered during a {role} run in lane {self.lane}\n")
             try:
                 self._log(f"TAMPER during {role} run {run_id}: {changed}")
                 self._ask("tamper", f"Forge stopped: a {role} agent changed Forge's own state files",
@@ -592,7 +647,10 @@ class Conductor:
         return sorted(files) if moved else None
 
     def _stop_flags(self) -> list[str]:
-        return [f for f in STOP_FILES if (self.state / f).exists()]
+        flags = [f for f in STOP_FILES if (self.state / f).exists()]
+        if self.shared is not None and (self.shared / "KILL").exists():  # R58: the global KILL
+            flags.append(SHARED_PREFIX + "KILL")
+        return flags
 
     def _stop_requested(self) -> bool:
         """R42/R49: the check a real agent polls while it runs (core.agents.launch)."""
@@ -627,6 +685,18 @@ class Conductor:
                     f = Path(root) / name
                     rel = DROP_PREFIX + f.relative_to(drop).as_posix()
                     fp[rel] = self._signature(f, rel)
+        # R58: with lanes, the shared folder too, except the files other lanes legitimately write at any time: the
+        # accumulate files (checked by _shrunk_shared: they may only grow), the shared lock, and atomic-replace
+        # temporaries. Anything else there (the global KILL, a stray file) is fingerprinted like this lane's own.
+        if self.shared is not None and self.shared.is_dir():
+            for root, _dirs, files in os.walk(self.shared, onerror=fail):
+                for name in files:
+                    f = Path(root) / name
+                    rel = f.relative_to(self.shared).as_posix()
+                    if rel in lanes_mod.ACCUMULATORS or rel == lanes_mod.SHARED_LOCK \
+                            or name.startswith(lanes_mod.TMP_PREFIX):
+                        continue
+                    fp[SHARED_PREFIX + rel] = self._signature(f, SHARED_PREFIX + rel)
         return fp
 
     @staticmethod
@@ -679,7 +749,7 @@ class Conductor:
     def _refresh_readiness(self, names=None, force=frozenset()) -> dict:
         """Run the plain checks and (guarded, cap-aware) AI probes, write the capability map and return it.
         names limits the refresh to those capabilities; force bypasses every cache for the names in it."""
-        if (self.state / "KILL").exists():
+        if self._kill_set():
             return self._cap_map()
         old = self._cap_map()
         now = self.clock()
@@ -731,7 +801,7 @@ class Conductor:
 
     def session_start(self) -> dict:
         """D-030: readiness before every build session. Launches nothing while stopped, paused or capped."""
-        if (self.state / "KILL").exists() or (self.state / "PAUSED").exists() or self._capped():
+        if self._kill_set() or (self.state / "PAUSED").exists() or self._capped():
             return {}
         m = self._refresh_readiness()
         try:
@@ -1085,7 +1155,7 @@ class Conductor:
         seq = self._read("q_seq.json", {"n": len(qs)})
         seq["n"] = int(seq.get("n", 0)) + 1
         self._write("q_seq.json", seq)
-        qid = f"{kind}-{seq['n']}"
+        qid = f"{kind}-{seq['n']}" if self.lane == lanes_mod.MAIN else f"{self.lane}-{kind}-{seq['n']}"  # R58
         code = secrets.token_urlsafe(6)[:8]
         qs[qid] = {"kind": kind, "status": "open", "code": code, "subject": str(subject)[:SUBJECT_CAP],
                    "body": str(body)[:BODY_CAP], "delivered": False, **extra}  # R28
@@ -1101,7 +1171,7 @@ class Conductor:
     def _send(self, subject: str, body: str, halt: bool = False) -> bool:
         """R20/R24/R25: every email goes through here. Nothing but a halt alert while KILL is set; at most
         mail_per_hour / mail_per_day attempts (counted before sending); each email gets a recorded Message-ID."""
-        if (self.state / "KILL").exists() and not halt:
+        if self._kill_set() and not halt:
             return False
         if not halt and self._quiet_now():  # 1E / D-023: quiet hours; nothing is attempted, nothing counted
             return False
@@ -1111,25 +1181,30 @@ class Conductor:
             last = notes.get("halt")
             if last and (now - datetime.fromisoformat(last)).total_seconds() < 12 * 3600:
                 return False
-        log = self._read("mail_log.json", {"sent": [], "budget_logged": "", "ids": []})
-        sent = [x for x in log.get("sent", []) if (now - datetime.fromisoformat(x)).total_seconds() < 86400]
-        hour = [x for x in sent if (now - datetime.fromisoformat(x)).total_seconds() < 3600]
-        if len(hour) >= int(self.limits.get("mail_per_hour", 6)) or len(sent) >= int(self.limits.get("mail_per_day", 30)):
-            stamp = now.strftime("%Y-%m-%dT%H")
-            if log.get("budget_logged") != stamp:
-                self._log(f"mail budget reached; held back: {subject[:120]}")
-                log["budget_logged"] = stamp
-            log["sent"] = sent
-            self._write("mail_log.json", log)
+        from email.utils import make_msgid
+
+        def reserve(log: dict) -> str | None:  # R58: one locked transaction when every lane shares the budget
+            sent = [x for x in log.get("sent", []) if (now - datetime.fromisoformat(x)).total_seconds() < 86400]
+            hour = [x for x in sent if (now - datetime.fromisoformat(x)).total_seconds() < 3600]
+            if len(hour) >= int(self.limits.get("mail_per_hour", 6)) or \
+                    len(sent) >= int(self.limits.get("mail_per_day", 30)):
+                stamp = now.strftime("%Y-%m-%dT%H")
+                if log.get("budget_logged") != stamp:
+                    self._log(f"mail budget reached; held back: {subject[:120]}")
+                    log["budget_logged"] = stamp
+                log["sent"] = sent
+                return None
+            mid = make_msgid(domain="forge.local")
+            log["sent"] = sent + [now.isoformat()]  # R25: the attempt counts even if SMTP fails part-way
+            log["ids"] = (list(log.get("ids", [])) + [mid])[-SENT_IDS_KEEP:]
+            return mid
+
+        mid = self._shared_update("mail_log.json", reserve, {"sent": [], "budget_logged": "", "ids": []})
+        if mid is None:
             return False
         if halt:  # R32: the halt throttle starts only when an attempt actually goes ahead
             notes["halt"] = now.isoformat()
             self._write("notices.json", notes)
-        from email.utils import make_msgid
-        mid = make_msgid(domain="forge.local")
-        log["sent"] = sent + [now.isoformat()]  # R25: the attempt counts even if SMTP fails part-way
-        log["ids"] = (list(log.get("ids", [])) + [mid])[-SENT_IDS_KEEP:]
-        self._write("mail_log.json", log)
         try:
             if self._mailer_takes_id:
                 self.mailer(str(subject)[:SUBJECT_CAP], body[:BODY_CAP], message_id=mid)
@@ -1151,7 +1226,7 @@ class Conductor:
 
     def _notice_once(self, key: str, subject: str, body: str, every_h: float = 12) -> bool:
         """R22: a notice goes out at most once per every_h hours, and never while KILL is set."""
-        if (self.state / "KILL").exists() or self._quiet_now():  # 1E: a quiet-hours notice waits, it isn't lost
+        if self._kill_set() or self._quiet_now():  # 1E: a quiet-hours notice waits, it isn't lost
             return False
         now = self.clock()
         notes = self._read("notices.json", {})
@@ -1196,7 +1271,9 @@ class Conductor:
         batch = (pending if isinstance(pending, list) else []) + list(messages)
         if pending:
             self._write("inbox_pending.json", [])
-        own_ids = set(self._read("mail_log.json", {}).get("ids", []))
+        own_ids = set(self._shared_read("mail_log.json", {}).get("ids", []))
+        names = lanes_mod.listed(self.shared.parent) if self.shared is not None and self.lane == lanes_mod.MAIN \
+            else []
         for i, m in enumerate(batch):
             try:
                 if not isinstance(m, dict):
@@ -1207,14 +1284,18 @@ class Conductor:
                     continue
                 subject, body = str(m.get("subject", "")), clean_reply(str(m.get("body", "")))
                 if is_stop(subject, body):
-                    (self.state / "KILL").write_text("stopped by owner email\n")
+                    self._stop_all("stopped by owner email\n")  # R58: a STOP stops every lane
                     rest = [dict(x, body=clean_reply(str(x.get("body", "")))) for x in batch[i + 1:]
                             if isinstance(x, dict)]
                     if rest:  # R35: kept for after the restart, never lost
                         self._write("inbox_pending.json", rest[-50:])
                     return  # R24: nothing after a STOP is processed now
                 mq = re.search(r"\[Forge Q-([\w-]+) ([\w-]{8})\]", subject)
-                if mq:
+                if mq and lanes_mod.qid_lane(mq.group(1), names):  # R58: main hands it to the lane that asked
+                    lanes_mod.route(self.state, lanes_mod.qid_lane(mq.group(1), names),
+                                    {"from": m.get("from", ""), "subject": subject, "body": body,
+                                     "message_id": m.get("message_id", "")})
+                elif mq:
                     self._answer(mq.group(1), body, mq.group(2))
             except Exception as e:  # noqa: BLE001 - R35: one bad message never blocks the rest
                 self._log(f"inbox message failed: {e!r}"[:500])
@@ -1325,14 +1406,14 @@ class Conductor:
     def _take_channel_answers(self) -> None:
         """Answers dropped by the status page (or a later channel) are checked exactly like email replies: an open
         question and its code. A STOP creates KILL at once; answers after it are kept for after the restart."""
-        if (self.state / "KILL").exists():
+        if self._kill_set():
             return
         answers = channel.take_answers(self.channel_in)
         for i, a in enumerate(answers):
             try:
                 text = clean_reply(a["answer"])
                 if is_stop("", text):
-                    (self.state / "KILL").write_text(f"stopped by owner via {a['source']}\n")
+                    self._stop_all(f"stopped by owner via {a['source']}\n")
                     for rest in answers[i + 1:]:
                         channel.drop_answer(self.channel_in, rest["qid"], rest["code"], rest["answer"], rest["source"])
                     return
@@ -1348,7 +1429,7 @@ class Conductor:
     def _mail_used(self) -> tuple[int, int]:
         now = self.clock()
         ages = []
-        for x in self._read("mail_log.json", {}).get("sent", []):
+        for x in self._shared_read("mail_log.json", {}).get("sent", []):
             try:
                 ages.append((now - datetime.fromisoformat(x)).total_seconds())
             except (TypeError, ValueError):
@@ -1368,7 +1449,7 @@ class Conductor:
         """D-023 digest: at most one a local day, at or after digest_hour, when there is something to report; and
         an early one (at most every 12 hours) when nothing can run and Ben hasn't yet heard of a held question.
         Every attempt is recorded before sending and retried at most hourly; all mail goes through _send."""
-        if not self._channel_on or (self.state / "KILL").exists() or self._quiet_now():
+        if not self._channel_on or self._kill_set() or self._quiet_now():
             return
         try:
             now, local = self.clock(), self._local_now()
@@ -1420,10 +1501,10 @@ class Conductor:
 
     # ------------------------------------------------------------------ main step
     def step(self) -> str:
-        if (self.state / "KILL").exists():  # R21: KILL stops everything, email included
+        if self._kill_set():  # R21: KILL stops everything, email included
             return "killed"
         self._handle_inbox()
-        if (self.state / "KILL").exists():
+        if self._kill_set():
             return "killed"
         self._channel_tick()  # 1E: the daily digest (a no-op unless the channel policy is on)
         if (self.state / "PAUSED").exists():
@@ -1557,7 +1638,7 @@ class Conductor:
 
     def _held(self) -> str:
         """R42: why an undone attempt stopped: Ben's stop, a pause, or a token cap."""
-        if (self.state / "KILL").exists():
+        if self._kill_set():
             return "killed"
         if (self.state / "PAUSED").exists():
             return "paused"
@@ -1577,7 +1658,7 @@ class Conductor:
                 status = "error"
                 self._log(f"step crashed: {e!r}")
             n += 1
-            if status == "killed" or (self.state / "KILL").exists():  # T1D2: a stop pressed mid-step ends the loop
+            if status == "killed" or self._kill_set():  # T1D2: a stop pressed mid-step ends the loop
                 return "killed"
             if on_step:  # T1D2: the always-on service (core.service): status, pacing; never fatal
                 try:
@@ -1590,7 +1671,10 @@ class Conductor:
                     told = True
                     try:
                         self._notice_once("error", "[Forge] the conductor keeps hitting an error",
-                                          "It keeps retrying with a growing pause. Details: state/bootstrap/errors.log")
+                                          "It keeps retrying with a growing pause. Details: state/bootstrap/errors.log"
+                                          if self.lane == lanes_mod.MAIN else
+                                          f"It keeps retrying with a growing pause. Lane {self.lane}. "
+                                          f"Details: state/lanes/{self.lane}/errors.log")
                     except Exception:  # noqa: BLE001
                         pass
                 sleep(min(idle_sleep_s * errors, 1800))
@@ -2806,7 +2890,7 @@ def gmail_inbox(owner: str, state: Path, imap_factory: Callable | None = None,
                 m.logout()
             except Exception:  # noqa: BLE001
                 pass
-        seen_path.write_text(json.dumps(seen[-2000:]), encoding="utf-8")
+        lanes_mod.write_bytes_atomic(seen_path, json.dumps(seen[-2000:]).encode("utf-8"))  # R58: other lanes read it
         return out
     return read
 
@@ -2990,9 +3074,17 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--tasks")
     ap.add_argument("--owner", default="benjaminanderson0802@gmail.com")
     ap.add_argument("--work", default=str(Path.home() / "Forge-work"))
+    ap.add_argument("--lane", default=lanes_mod.MAIN, help="R58: which lane's conductor (default: main)")
     a = ap.parse_args(argv)
+    problem = lanes_mod.name_problem(a.lane)
+    if problem:
+        print(f"bad --lane: {problem}")
+        return 2
     limits = load_limits(forge)
-    state = forge / "state" / "bootstrap"
+    root = forge / "state"
+    lanes_mod.migrate(root)  # R58: today's main-lane meter, holds and mail log become the shared ones (once)
+    state, shared = lanes_mod.state_dir(root, a.lane), lanes_mod.shared_dir(root)
+    work = lanes_mod.work_dir(Path(a.work), a.lane)
     if a.cmd == "status":
         q = json.loads((state / "queue.json").read_text(encoding="utf-8")) if (state / "queue.json").exists() else {}
         for t in q.get("tasks", []):
@@ -3008,14 +3100,26 @@ def main(argv: list[str]) -> int:
         for f in ("KILL", "PAUSED"):
             if (state / f).exists():
                 print(f"{f} is set")
+        if (shared / "KILL").exists():
+            print("global KILL is set (every lane is stopped)")
         return 0
-    c = Conductor(forge, Path(a.work), state, real_team(limits), limits, owner_email=a.owner,
-                  mailer=gmail_mailer(a.owner), inbox=gmail_inbox(a.owner, state), gh=gh_cli(forge),
+    # R58: only the main lane reads Ben's email; it routes replies to other lanes' questions to those lanes.
+    inbox = gmail_inbox(a.owner, shared) if a.lane == lanes_mod.MAIN else \
+        lanes_mod.routed_inbox(lanes_mod.state_dir(root, lanes_mod.MAIN), a.lane, state)
+    c = Conductor(forge, work, state, real_team(limits), limits, owner_email=a.owner,
+                  mailer=gmail_mailer(a.owner), inbox=inbox, gh=gh_cli(forge),
                   manager=real_manager(limits),
-                  judge_cmds=["python drills/run_drills.py", "python -m core.suite"])
+                  judge_cmds=["python drills/run_drills.py", "python -m core.suite"],
+                  shared=shared, lane=a.lane)
     if a.cmd == "init":
+        owner = lanes_mod.layer_owner(root, a.layer, a.lane)
+        if owner is not None:
+            print(f"layer branch {a.layer!r} already belongs to lane {owner!r}; each lane needs its own")
+            return 2
+        work.mkdir(parents=True, exist_ok=True)
         c.init_queue(a.layer, json.loads(Path(a.tasks).read_text(encoding="utf-8")))
-        print("queue ready")
+        lanes_mod.register(root, a.lane)
+        print("queue ready" if a.lane == lanes_mod.MAIN else f"queue ready for lane {a.lane}")
         return 0
     lock = acquire_lock(state)  # R15: every command that can launch agents holds the lock
     if a.cmd == "step":
@@ -3032,7 +3136,7 @@ def main(argv: list[str]) -> int:
     health = None
     try:
         if a.cmd == "run":
-            health = service.Health(forge / "state" / "service", limits).start()  # T1D2: heartbeat and stall exit
+            health = service.Health(lanes_mod.service_dir(root, a.lane), limits).start()  # T1D2, R58: per lane
             if not _start_session(c, health):
                 return 0
         if a.cmd == "smoke" or _smoke_stale(c.state, c.clock()):
@@ -3050,7 +3154,7 @@ def main(argv: list[str]) -> int:
                        "The conductor is running in the background. You'll hear from it only when something "
                        "needs you, when a layer is ready for approval, or if it hits trouble.\n\n"
                        "To stop everything: reply STOP to any Forge email.")
-        print(service.Service(c, forge / "state" / "service", limits, health=health).serve())  # T1D2
+        print(service.Service(c, lanes_mod.service_dir(root, a.lane), limits, health=health).serve())  # T1D2
     finally:
         if health:
             health.stop()
@@ -3063,21 +3167,21 @@ def _start_session(c: Conductor, health, pause_s: float = 60) -> bool:
     readiness, and the smoke test that follows) runs in the "step" phase, so a hang is caught like a hung step;
     only the paused wait is exempt. Returns False when the service must not start (KILL, a stop, tampering)."""
     health.set_phase("step")
-    if (c.state / "KILL").exists():  # R32: while stopped, only retry a pending halt alert
+    if c._kill_set():  # R32: while stopped, only retry a pending halt alert
         c._retry_halts()
         return False
     c._handle_inbox()  # R31: a STOP is honoured before anything is launched
-    if (c.state / "KILL").exists():
+    if c._kill_set():
         return False
     while (c.state / "PAUSED").exists():  # R40: while paused, only wait for Ben's answer
         (c.state / "conductor.heartbeat").write_text(f"{os.getpid()} {time.time()}")
         health.set_phase("paused")
         time.sleep(pause_s)
         health.set_phase("step")
-        if (c.state / "KILL").exists():
+        if c._kill_set():
             return False
         c._handle_inbox()
-        if (c.state / "KILL").exists():
+        if c._kill_set():
             return False
     try:
         c.session_start()  # D-030: readiness before every session, before the smoke test

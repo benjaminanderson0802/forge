@@ -7,6 +7,10 @@ state/bootstrap/, so the heartbeat thread can write while an agent runs without 
     python -m core.service stop        # the kill switch (same as the Stop Forge shortcut)
     python -m core.service wake        # end the service's sleep now
     python -m core.service watchdog    # run every 5 minutes by the "Forge watchdog" task
+
+R58 lanes: `stop` writes the global KILL (state/shared/KILL), which stops every lane (`--lane NAME` stops one);
+the watchdog checks every lane in state/lanes.json plus main; each lane beats in its own service folder
+(state/service/ for main, state/service/<lane>/ for the others).
 """
 from __future__ import annotations
 
@@ -225,7 +229,8 @@ class Service:
         self.mode = mode(None, limits)
 
     def _killed(self) -> bool:
-        return (Path(self.c.state) / "KILL").exists()
+        kill_set = getattr(self.c, "_kill_set", None)  # R58: the lane's KILL or the global one
+        return bool(kill_set()) if callable(kill_set) else (Path(self.c.state) / "KILL").exists()
 
     def nap(self, seconds: float) -> None:
         """Sleep until the time is up, KILL appears, or someone wakes us. Checks every tick_s."""
@@ -253,7 +258,7 @@ class Service:
         self.mode = mode(self.idle(), self.limits)
         self.health.mode = self.mode["state"]
         try:
-            snap = snapshot(Path(self.c.state), self.root, self.limits)
+            snap = snapshot(Path(self.c.state), self.root, self.limits, shared=getattr(self.c, "shared", None))
             snap["last_status"], snap["mode"] = status, self.mode
             _write_json(self.root / "status.json", snap)
         except Exception as e:  # noqa: BLE001 - status is for Ben's eyes; it never stops the work
@@ -274,17 +279,21 @@ def _next_utc_midnight(now: datetime) -> datetime:
     return datetime(d.year, d.month, d.day, tzinfo=timezone.utc) + timedelta(days=1)
 
 
-def snapshot(bootstrap_state: Path, root: Path, limits: dict, now: datetime | None = None) -> dict:
-    """Everything the status page and the daily digest (1E) need, read-only."""
+def snapshot(bootstrap_state: Path, root: Path, limits: dict, now: datetime | None = None,
+             shared: Path | None = None) -> dict:
+    """Everything the status page and the daily digest (1E) need, read-only. With `shared` (R58 lanes) the usage
+    is the shared meter's (every lane together) and the global KILL counts as a stop."""
     from core.usage import Meter
     st, root = Path(bootstrap_state), Path(root)
     now = now or datetime.now(timezone.utc)
 
     def flag(name: str) -> str | None:
-        try:
-            return (st / name).read_text(encoding="utf-8", errors="replace").strip()[:300] or name
-        except OSError:
-            return None
+        for folder in (st, *([Path(shared)] if shared is not None and name == "KILL" else [])):
+            try:
+                return (folder / name).read_text(encoding="utf-8", errors="replace").strip()[:300] or name
+            except OSError:
+                continue
+        return None
 
     hb = _read_json(root / "heartbeat.json", {})
     hb = hb if isinstance(hb, dict) else {}
@@ -302,7 +311,7 @@ def snapshot(bootstrap_state: Path, root: Path, limits: dict, now: datetime | No
     qs = _read_json(st / "questions.json", {})
     open_q = sum(1 for v in (qs.values() if isinstance(qs, dict) else [])
                  if isinstance(v, dict) and v.get("status") == "open")
-    meter = Meter(st, clock=lambda: now)
+    meter = shared_meter(shared, lambda: now) if shared is not None else Meter(st, clock=lambda: now)
     caps = {}
     for key in sorted(limits):
         if key.endswith("_daily_token_cap"):
@@ -331,6 +340,14 @@ def snapshot(bootstrap_state: Path, root: Path, limits: dict, now: datetime | No
     return snap
 
 
+def shared_meter(shared: Path, clock):
+    """R58: the meter every lane shares (state/shared), counting runs across all lanes."""
+    from core import lanes
+    from core.usage import Meter
+    shared = Path(shared)
+    return Meter(shared, clock=clock, lock=lanes.SharedLock(shared), runs_dirs=lambda: lanes.runs_dirs(shared.parent))
+
+
 # ------------------------------------------------------------------ watchdog (T1D4)
 TASK_NAME = "Forge conductor"
 
@@ -350,15 +367,20 @@ def _run_hidden(args: list[str]) -> int:
 
 
 def watchdog(forge: Path, limits: dict, *, now: float | None = None,
-             lock_free: Callable[[], bool] | None = None, run: Callable[[list[str]], int] | None = None) -> str:
+             lock_free: Callable[[], bool] | None = None, run: Callable[[list[str]], int] | None = None,
+             lane: str = "main") -> str:
     """Every 5 minutes. A dead service (lock free, heartbeat stale) is started; a hung one (lock still held,
     heartbeat stale) is ended and started, because while its task instance runs the task's own 5-minute
-    trigger is ignored. Never acts while KILL is set, and never on a lock holder that wrote no heartbeat."""
-    st, root = Path(forge) / "state" / "bootstrap", Path(forge) / "state" / "service"
+    trigger is ignored. Never acts while KILL is set, and never on a lock holder that wrote no heartbeat.
+    R58: one lane at a time (its state, heartbeat and "Forge conductor <lane>" task); the global KILL stops all."""
+    from core import lanes
+    sroot = Path(forge) / "state"
+    st, root = lanes.state_dir(sroot, lane), lanes.service_dir(sroot, lane)
+    task = lanes.task_name(lane)
     now = time.time() if now is None else now
     lock_free = lock_free or (lambda: _lock_free(st))
     run = run or _run_hidden
-    if (st / "KILL").exists():
+    if (st / "KILL").exists() or (lanes.shared_dir(sroot) / "KILL").exists():
         return "stopped"
     hb = _read_json(root / "heartbeat.json", {})
     at = hb.get("at") if isinstance(hb, dict) else None
@@ -374,14 +396,27 @@ def watchdog(forge: Path, limits: dict, *, now: float | None = None,
 
     if lock_free():
         _log(root, "watchdog: the service is not running; starting it")
-        do(["schtasks", "/Run", "/TN", TASK_NAME])
+        do(["schtasks", "/Run", "/TN", task])
         return "started"
     if not isinstance(at, (int, float)):
         return "unknown"
     _log(root, f"watchdog: heartbeat is {int(now - at)} s old but the lock is held; ending and restarting the task")
-    do(["schtasks", "/End", "/TN", TASK_NAME])
-    do(["schtasks", "/Run", "/TN", TASK_NAME])
+    do(["schtasks", "/End", "/TN", task])
+    do(["schtasks", "/Run", "/TN", task])
     return "restarted"
+
+
+def watchdog_all(forge: Path, limits: dict, **kw) -> dict[str, str]:
+    """R58: the watchdog for every lane in state/lanes.json, plus main. One lane's error never skips the others."""
+    from core import lanes
+    out = {}
+    for lane in lanes.listed(Path(forge) / "state"):
+        try:
+            out[lane] = watchdog(forge, limits, lane=lane, **kw)
+        except Exception as e:  # noqa: BLE001 - a scheduled task with no one to read a traceback
+            _log(lanes.service_dir(Path(forge) / "state", lane), f"watchdog error: {e!r}")
+            out[lane] = "error"
+    return out
 
 
 # ------------------------------------------------------------------ command line
@@ -390,25 +425,35 @@ def main(argv: list[str], forge: Path | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m core.service")
     ap.add_argument("cmd", choices=["status", "stop", "wake", "watchdog"])
     ap.add_argument("--reason", default="stopped from the command line")
+    ap.add_argument("--lane", default=None, help="R58: one lane only (stop, wake, status)")
     a = ap.parse_args(argv)
-    st, root = forge / "state" / "bootstrap", forge / "state" / "service"
+    from core import lanes
+    lane = a.lane or lanes.MAIN
+    if lanes.name_problem(lane):
+        print(f"bad --lane: {lanes.name_problem(lane)}")
+        return 2
+    sroot = forge / "state"
+    st, root = lanes.state_dir(sroot, lane), lanes.service_dir(sroot, lane)
     try:
         from core.agents import load_limits
         limits = load_limits(forge)
     except (OSError, ValueError):
         limits = {}
     if a.cmd == "stop":
-        request_stop(st, a.reason)
+        request_stop(st, a.reason)  # this lane's KILL (main: state/bootstrap/KILL, as before)
+        if a.lane is None:
+            request_stop(lanes.shared_dir(sroot), a.reason)  # R58: and the global KILL, which stops every lane
         print("Forge is stopped. Nothing new will start. Run Start Forge to resume.")
     elif a.cmd == "wake":
         wake(root)
     elif a.cmd == "watchdog":
         try:
-            print(watchdog(forge, limits))
+            res = watchdog_all(forge, limits)
+            print(res["main"] if list(res) == ["main"] else json.dumps(res))
         except Exception as e:  # noqa: BLE001 - a scheduled task with no one to read a traceback
             _log(root, f"watchdog error: {e!r}")
     else:
-        print(json.dumps(snapshot(st, root, limits), indent=2, default=str))
+        print(json.dumps(snapshot(st, root, limits, shared=lanes.shared_dir(sroot)), indent=2, default=str))
     return 0
 
 
