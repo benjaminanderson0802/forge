@@ -111,6 +111,7 @@ S_DRIFT = _obj({"status": {"type": "string", "enum": ["ok", "replan"]}, "reasons
 S_PLAN = _obj({"tasks": {"type": "array", "items": _obj(
     {"id": _STR, "title": _STR, "section": _STR, "files_in_scope": _STRS, "test_files": _STRS, "test_cmd": _STR,
      "needs": {"type": "array", "items": {"type": "string"}},
+     "covers": {"type": "array", "items": {"type": "string"}},
      "depends_on": {"type": "array", "items": {"type": "string"}}},
     list(TASK_FIELDS))}}, ["tasks"])
 
@@ -266,6 +267,25 @@ def parse_test_cmd(cmd: str, test_files: list[str]) -> list[str] | None:
             return None
         paths.append(path)
     return paths or None
+
+
+def _covers_problem(tasks: list[dict], reqs: dict) -> str | None:
+    """R62: every planned task names known, non-repeated requirement ids it covers."""
+    for x in tasks:
+        cov = x.get("covers")
+        who = x.get("id")
+        if cov is None:
+            return f"plan rejected: covers missing for task {who} (required: non-empty list of requirement ids)"
+        if not isinstance(cov, list) or not all(isinstance(c, str) for c in cov):
+            return f"plan rejected: covers for task {who} must be a list of requirement ids"
+        if not cov:
+            return f"plan rejected: covers empty for task {who} (required: non-empty)"
+        bad = [c for c in cov if c not in reqs]
+        if bad:
+            return f"plan rejected: covers unknown requirements for task {who}: {', '.join(bad)}"
+        if len(set(cov)) != len(cov):
+            return f"plan rejected: covers repeats a requirement for task {who}"
+    return None
 
 
 def validate_task(t: dict) -> str | None:
@@ -2612,6 +2632,12 @@ class Conductor:
         t = self._task(tid)
         self._reset_wt()
         plan_file = _norm(t["plan_file"])
+        spec = None if t.get("no_coverage") else self._spec()  # R62
+        reqs = spec[1] if spec else {}
+        cover_text = ("Each task must also list \"covers\": the ids of the layer spec requirements below that "
+                      "its acceptance tests prove (at least one, no repeats). Claim only what the task's section "
+                      "states as acceptance criteria.\nREQUIREMENTS (id: text):\n" +
+                      "\n".join(f"{k}: {v}" for k, v in reqs.items()) + "\n") if reqs else ""
         try:
             prior = [str(n) for n in t.get("notes", [])
                      if str(n).startswith(("plan rejected", "plan review failed"))][-PLAN_MEMORY_NOTES:]  # R47
@@ -2625,7 +2651,7 @@ class Conductor:
                            "Builder needs beyond git and its own AI.\n"
                            "Each task may also list \"depends_on\": ids of earlier tasks in this plan whose code it "
                            "uses. It is not started (tests or build) until those are done and merged, and its "
-                           "builder works on top of their code (R55).\n"
+                           "builder works on top of their code (R55).\n" + cover_text +
                            "IMPORTANT (R41): each task's section is the ONLY instruction the test writer and the "
                            "builder will see. Make it complete and self-contained: what to build, exact interfaces "
                            "and signatures, behaviour, edge cases, dependencies on earlier tasks, and the acceptance "
@@ -2664,9 +2690,18 @@ class Conductor:
             existing = {x["id"] for x in self._queue()["tasks"]}
             if any(x["id"] in existing for x in tasks):
                 reason = "plan rejected: task ids clash with existing tasks"
+        if not reason and reqs:  # R62
+            reason = _covers_problem(tasks, reqs)
+        if not reason and not reqs and isinstance(tasks, list):  # R62: ignored claims never reach the reviewer
+            tasks = [{k: v for k, v in x.items() if k != "covers"} for x in tasks]
+        claimed = ""
+        if not reason and reqs:  # R62: the reviewer sees what each claimed requirement says
+            ids = [c for x in tasks for c in x["covers"]]
+            claimed = ("\nREQUIREMENTS CLAIMED IN covers (id: text):\n" +
+                       "\n".join(f"{k}: {reqs[k]}" for k in dict.fromkeys(ids)) + "\n")
         if not reason:
             plan_text = (self.wt / plan_file).read_text(encoding="utf-8")
-            size = len(plan_text) + len(json.dumps(tasks))
+            size = len(plan_text) + len(json.dumps(tasks)) + len(claimed)
             if size > PLAN_REVIEW_MAX:  # R44: the reviewer must see the whole plan
                 reason = f"plan rejected: plan too large for review ({size} characters); split this plan task"
         if not reason:
@@ -2676,12 +2711,16 @@ class Conductor:
                                             "Fail ONLY for blocking problems (R44): a requirement of this plan task "
                                             "that no task covers; a task that contradicts docs/DECISIONS.md or the "
                                             "design; a task that can't be done within its files_in_scope; wrong "
-                                            "ordering or dependencies between tasks; placeholders or thin sections. "
+                                            "ordering or dependencies between tasks; placeholders or thin sections" +
+                                            ("; a task whose covers claims a requirement that no acceptance "
+                                             "criteria in its section prove (R62: covers must be backed by "
+                                             "matching acceptance criteria in the task's section, or it is "
+                                             "blocking)" if reqs else "") + ". "
                                             "Edge cases, extra tests and implementation details are NOT reasons to "
                                             "fail: put each in task_notes against the task id it affects, and they "
                                             "will be added to that task's instructions.\n\n" +
                                 self._task_prompt(t) + "\nPLAN:\n" + plan_text + "\nTASKS JSON:\n" +
-                                json.dumps(tasks) +
+                                json.dumps(tasks) + claimed +
                                 "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...], "
                                 "\"task_notes\": [{\"task\": \"<task id>\", \"note\": \"...\"}]}",
                                 S_PLAN_REVIEW)
@@ -2708,6 +2747,8 @@ class Conductor:
             nt["kind"], nt["status"] = "build", "todo"
             if isinstance(x.get("needs"), list):
                 nt["needs"] = list(x["needs"])
+            if reqs:  # R62: validated above; ignored without a spec or under no_coverage
+                nt["covers"] = list(x["covers"])
             deps = x.get("depends_on")
             if isinstance(deps, list):  # R55: built only after these tasks are done (merged)
                 nt["depends_on"] = [str(d) for d in deps if isinstance(d, str) and d != nt["id"]]
