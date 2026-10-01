@@ -132,7 +132,12 @@ class SelfFixMixin:
         held = {x.get("bid") for x in (box if isinstance(box, list) else []) if isinstance(x, dict) and x.get("digest")}
         recs = self.blockers.active() + [r for r in self.blockers.all().values()
                                          if r.get("status") == "fixed" and r.get("id") in held]
-        return blockers_mod.digest_lines(recs)
+        notices = [x for x in (box if isinstance(box, list) else [])
+                   if isinstance(x, dict) and x.get("digest") and not x.get("bid")]
+        lines = blockers_mod.digest_lines(recs)
+        for x in notices:  # standalone notices (gate passed, merged into main) go in whole, capped
+            lines += [str(x.get("subject", "")), str(x.get("body", ""))[:3000], ""]
+        return lines
 
     def _sf_digest_sent(self) -> None:
         if not self._self_fix:
@@ -156,8 +161,9 @@ class SelfFixMixin:
     def _sf_ready(self, rec: dict, kit: dict) -> dict | None:
         cur = self.blockers.get(rec["id"]) or rec
         old = cur.get("kit") or {}
-        if cur.get("status") == "ready_for_ben" and all(old.get(k) == kit.get(k) for k in kit):
-            return cur  # the same kit again: no rewrite, no second email
+        if cur.get("status") == "ready_for_ben" and all(old.get(k) == kit.get(k)
+                                                         for k in ("category", "where", "paste", "script")):
+            return cur  # the same fix again (only its wording may differ): no rewrite, no second email
         try:
             new = self.blockers.ready_for_ben(rec["id"], kit)
         except ValueError as e:
@@ -367,6 +373,11 @@ class SelfFixMixin:
             "Forge queues a fresh re-plan; you get an email when one is accepted."))
 
     def _sf_drift_failed(self, error) -> None:
+        d = drift_mod.load(self.state)
+        if d and d.get("stall"):  # the stall that wanted this check must not ask for it every step
+            d["stall"] = None
+            drift_mod.restart_window(d, self._activity().total())
+            drift_mod.save(self.state, d)
         rec = self._sf_open("drift", "drift", "the drift keeper keeps returning unusable output")
         self._sf_ready(rec, self._sf_retry_kit(
             rec, f"The drift keeper returned unusable output 3 times in a row (last error: {str(error)[:300]}). "
@@ -427,9 +438,10 @@ class SelfFixMixin:
             st[qid] = self.clock().isoformat()
             self._write("gate_watch.json", st)
             pr = str(q.get("pr"))
-            if not q.get("merge_set"):
+            gb = self.blockers.find("gate", pr)
+            if not q.get("merge_set") and not (gb and gb.get("status") == "ready_for_ben"):
                 if not self._sf_gate_merge(qid, pr, layer):
-                    continue
+                    continue  # bounded: once the blocker is ready for Ben, only his retry tries again
             code, out = self.gh(["pr", "view", pr, "--json", "state"])
             try:
                 state = str(json.loads(out or "{}").get("state", "")).upper() if code == 0 else ""
@@ -444,10 +456,17 @@ class SelfFixMixin:
                 self._sf_fix_kind("gate", pr)
                 self._sf_mail(f"[Forge] {layer} is merged into main", f"Pull request #{pr} is merged into main. "
                               "Nothing for you to do.\n\n" + blockers_mod.STOP_LINE, digest=True)
+            elif state == "OPEN" and q.get("closed_seen"):  # Ben reopened it: auto-merge again
+                qs = self._read("questions.json", {})
+                qs[qid].update(closed_seen=False, merge_set=False)
+                self._write("questions.json", qs)
+                if gb:
+                    self.blockers.back_to_fixing(gb["id"])
+                self._sf_gate_merge(qid, pr, layer, first=True)
             elif state == "CLOSED":
                 qs = self._read("questions.json", {})
-                if qs[qid].get("merge_set"):
-                    qs[qid]["merge_set"] = False
+                if qs[qid].get("merge_set") or not qs[qid].get("closed_seen"):
+                    qs[qid].update(merge_set=False, closed_seen=True)
                     self._write("questions.json", qs)
                 rec = self._sf_open("gate", pr, f"{layer}'s pull request #{pr} was closed without merging")
                 line = f"cd {self.repo}; gh pr reopen {pr}"
@@ -509,7 +528,8 @@ class SelfFixMixin:
         if fix.startswith("PowerShell: ") or fix.startswith("Win + R: "):
             where, paste = ("PowerShell", fix[len("PowerShell: "):]) if fix.startswith("PowerShell: ") else \
                 ("Win + R", fix[len("Win + R: "):])
-            cat = "credentials" if cond in ("no_password", "auth_rejected") else \
+            cat = "credentials" if cond in ("no_password", "auth_rejected", "logged_out") or \
+                re.search(r"\blogin\b|\bauth\b|keyring set", paste, re.I) or cond.startswith("auth") else \
                 "admin" if "winget install" in paste.lower() else "exhausted"
             why = {"credentials": f"{name} needs a password or key that only you can create or enter.",
                    "admin": f"{name} needs an install that asks for your administrator approval (UAC).",
@@ -581,14 +601,20 @@ class SelfFixMixin:
         elif kind == "capability":
             if not_needed:
                 qs = self._read("questions.json", {})
+                dropped = False
                 for qid, q in qs.items():
-                    if q.get("kind") == "capability" and q.get("status") == "open" and q.get("capability") == key:
+                    if q.get("kind") == "capability" and q.get("status") == "open" and q.get("capability") == key \
+                            and q.get("condition") == "no_check":  # only a need Forge can't check may be dropped
                         if self._answer_capability(qs, q, "not needed", "not needed"):
                             q.update(status="answered", answer="not needed (R66e)",
                                      closed_at=self.clock().isoformat(),
                                      closed_seq=self._read("q_seq.json", {}).get("n", 0))
+                            dropped = True
                 self._write("questions.json", _bs()._prune_questions(qs))
-                self._sf_fixed(self.blockers.get(rec["id"]))
+                if dropped:
+                    self._sf_fixed(self.blockers.get(rec["id"]))
+                else:
+                    self._log(f"refused 'not needed' for {key}: only a capability with no check can be dropped")
                 return True
             routing = self._read("cap_routing.json", {})
             if isinstance(routing, dict) and key in routing:

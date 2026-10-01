@@ -314,22 +314,25 @@ def script_text(state, rec: dict) -> str | None:
     return raw.decode("utf-8", "replace")
 
 
-def powershell_runner(script: Path, log: Path, timeout_s: float) -> int:
-    """Run a prepared fix script hidden (no window), output to the log. Used only after Ben pressed Do it."""
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "wb") as f:
-        try:
-            p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                                "-File", str(script)], stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                               timeout=timeout_s, creationflags=flags, cwd=str(script.parent))
-            return p.returncode
-        except subprocess.TimeoutExpired:
-            f.write(f"\n[Forge] the fix ran longer than {int(timeout_s)} s and was stopped\n".encode())
-            return 124
-        except OSError as e:
-            f.write(f"\n[Forge] could not start PowerShell: {e}\n".encode())
-            return 127
+def powershell_text_runner(text: str):
+    """A runner that feeds PowerShell exactly the validated script bytes on stdin (`-Command -`), so the file on
+    disk can't be swapped between the check and the run (R66i review P1)."""
+    def run(script: Path, log: Path, timeout_s: float) -> int:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "wb") as f:
+            try:
+                p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                    "-Command", "-"], input=text.encode("utf-8"), stdout=f, stderr=subprocess.STDOUT,
+                                   timeout=timeout_s, creationflags=flags, cwd=str(log.parent))
+                return p.returncode
+            except subprocess.TimeoutExpired:
+                f.write(f"\n[Forge] the fix ran longer than {int(timeout_s)} s and was stopped\n".encode())
+                return 124
+            except OSError as e:
+                f.write(f"\n[Forge] could not start PowerShell: {e}\n".encode())
+                return 127
+    return run
 
 
 def run_status(state_root, bid: str) -> dict | None:
@@ -363,7 +366,6 @@ def run_fix(state_root, lane: str, bid: str, sha: str, runner=None) -> tuple[boo
         return False, "this fix has no prepared script, or the script changed since Forge prepared it"
     if not isinstance(sha, str) or not secrets.compare_digest(sha, str(kit.get("script_sha256"))):
         return False, "the script you saw is not the one on disk; reload the page"
-    script = state / str(kit["script_file"])
     d = fixruns_dir(state_root)
     with _run_lock:
         st = read_json(d / f"{bid}.json", {})
@@ -373,7 +375,8 @@ def run_fix(state_root, lane: str, bid: str, sha: str, runner=None) -> tuple[boo
         start = {"id": bid, "lane": lane, "sha": sha, "started_at": datetime.now(timezone.utc).isoformat(),
                  "finished_at": None, "exit": None, "pid": os.getpid()}
         _atomic(d / f"{bid}.json", json.dumps(start, indent=2).encode("utf-8"))
-    run = runner or powershell_runner
+    script = state / str(kit["script_file"])  # named for the record; the real run never re-reads it
+    run = runner or powershell_text_runner(text)  # exactly the validated bytes, fed on stdin
 
     def work() -> None:
         code = None
