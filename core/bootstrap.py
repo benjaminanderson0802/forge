@@ -2526,7 +2526,8 @@ class Conductor:
                             [sys.executable, "-m", "unittest", *(parse_test_cmd(t["test_cmd"], t["test_files"]) or [])],
                             mutation_min=float(self.limits.get("mutation_min", 0.8)),
                             budget_s=float(self.limits.get("mutation_budget_s", self.limits.get("test_timeout_s", 600))),
-                            per_mutant_timeout_s=min(timeout, max(5.0, 3 * baseline)))
+                            per_mutant_timeout_s=min(timeout, max(5.0, 3 * baseline)),
+                            max_mutants=int(self.limits.get("mutation_max_mutants", 25)))
 
     @staticmethod
     def _survivor_listing(mres) -> str:
