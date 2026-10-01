@@ -185,7 +185,7 @@ _TASK_TEST = re.compile(r"tests/core/test_\w+\.py")
 MAIN_SYNC_EVERY_S = 600  # R58: origin is fetched for the main sync at most this often
 
 
-def task_judge_cmds(cmds: list[str], base: str, sha: str, test_files=()) -> list[str]:
+def task_judge_cmds(cmds: list[str], base: str, sha: str, test_files=(), exclude=()) -> list[str]:
     """R57: a per-task judge runs the suite only for what base..sha can affect. Every `-m core.suite` command
     gets --changed <base>..<sha> and --include for each of the task's own tests/core test files; other judge
     commands (the drills) are unchanged. The layer gate and CI run the commands as written: the full suite."""
@@ -197,6 +197,11 @@ def task_judge_cmds(cmds: list[str], base: str, sha: str, test_files=()) -> list
                 f = str(f).replace("\\", "/")
                 if _TASK_TEST.fullmatch(f):
                     cmd += f" --include {f}"
+        if _SUITE_CMD.search(cmd):
+            mine = {str(f).replace("\\", "/") for f in test_files or ()}
+            for f in sorted({str(x).replace("\\", "/") for x in exclude or ()} - mine):
+                if _TASK_TEST.fullmatch(f):  # R59: tests of layer tasks not built yet
+                    cmd += f" --exclude {f}"
         out.append(cmd)
     return out
 
@@ -817,6 +822,16 @@ class Conductor:
 
     def _gate_ready(self, cap_map: dict) -> dict[str, str]:
         return self._unready({"git", "github"}, cap_map)
+
+    def _unbuilt_test_files(self, tid: str) -> list[str]:
+        """R59: test files of other build tasks in this layer that aren't done. Their tests were committed ahead of
+        their code (Stage A runs before earlier tasks merge), so they can't pass yet and aren't this task's judges.
+        The layer gate (every task done) and CI still run the whole suite."""
+        out = []
+        for t in self._queue().get("tasks", []):
+            if t.get("id") != tid and t.get("kind", "build") == "build" and t.get("status") != "done":
+                out += [str(f) for f in t.get("test_files") or []]
+        return out
 
     def _pick_tasks(self, q: dict, cap_map: dict):
         """Runnable tasks in the order they should run: pending troubleshooting first (troubleshooter's
@@ -1942,7 +1957,8 @@ class Conductor:
             try:
                 results = [("task tests", *self._run_tests(t, cwd=jw)[:2])]
                 baseline = time.monotonic() - started
-                for cmd in task_judge_cmds(self.judge_cmds, base, sha, t.get("test_files") or []):
+                for cmd in task_judge_cmds(self.judge_cmds, base, sha, t.get("test_files") or [],
+                                           self._unbuilt_test_files(t["id"])):
                     if results[-1][1] != 0:
                         break
                     results.append((cmd, *self._run_cmd(cmd, cwd=jw)))
@@ -2114,7 +2130,8 @@ class Conductor:
         run_id = f"ci-merge-{tid}-{sha[:12]}"
         passed, output = True, ""
         cand = next(c for c in rec.get("candidates") or [] if c.get("sha") == sha)
-        cmds = task_judge_cmds(self.judge_cmds, cand["base"], sha, mine[0].get("test_files") if mine else [])
+        cmds = task_judge_cmds(self.judge_cmds, cand["base"], sha, mine[0].get("test_files") if mine else [],
+                               self._unbuilt_test_files(mine[0]["id"] if mine else ""))
         with self.trees.throwaway(sha) as jw:
             checks = [(f"tests of {t['id']}", lambda t=t: self._run_tests(t, cwd=jw)[:2]) for t in mine + done]
             checks += [(cmd, lambda cmd=cmd: self._run_cmd(cmd, cwd=jw)) for cmd in cmds]  # R57: fast

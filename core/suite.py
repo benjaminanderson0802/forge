@@ -244,6 +244,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--module-timeout", type=float, default=1500.0)
     ap.add_argument("--changed", metavar="BASE..SHA", help="R57: run only the modules this range can affect")
     ap.add_argument("--include", action="append", default=[], help="R57: a test file that always runs")
+    ap.add_argument("--exclude", action="append", default=[],
+                    help="R59: a test file that must not run (the tests of a layer task not built yet)")
     ap.add_argument("--write-fast", action="store_true", help=f"R57: time every module and rewrite {FAST_FILE}")
     a = ap.parse_args(argv)
     root = Path(a.root).resolve()
@@ -264,6 +266,10 @@ def main(argv: list[str] | None = None) -> int:
             if not names:
                 print("no test modules selected")
                 return 0
+    skip = {Path(str(x).replace("\\", "/")).stem for x in a.exclude}
+    if skip:  # R59: tests committed ahead of their (not yet built) task are not this task's judges
+        print("R59 excluded: " + ", ".join(sorted(skip & set(names))))
+        names = [n for n in names if n not in skip]
     failed = []
     with ThreadPoolExecutor(max_workers=a.jobs) as ex:
         for name, ok, out in ex.map(lambda n: run_module(root, n, a.module_timeout), names):
