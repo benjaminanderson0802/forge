@@ -559,3 +559,20 @@ Module: `core/lanes.py`, with hooks in `core/bootstrap.py`, `core/usage.py`, `co
   - nothing is sent and nothing else runs.
 
   The run loop and the service sleep continue, and the watchdog keeps main running. Only the global KILL stops the mailbox reader.
+
+## R60 review round 2 (Codex review, 2026-10-01; overrides R60 and R60a–f where they differ)
+
+- **R60g Accounting manifest.** `state/shared/accounting.json` lists every accounting file that must exist. Migration registers main's files. A lane registers its own `meter/`, `holds/` or `mail/` file, under the shared lock, before it first writes that file.
+  - **Entries are never removed.** A registered file that is missing, unreadable or invalid is unreadable accounting (R60c): every lane fails closed, `Meter.over` reports capped, and `_send` sends nothing. A lost file is never read as zero usage.
+  - **Tamper protection:** any lane may add to the manifest at any time, so no lane fingerprints it. Instead it is checked like the other accounting files: during an agent run its entries may only grow.
+- **R60h No migration over existing accounting.** Migration happens only when `state/shared` has no accounting at all (no manifest, no `inbox_seen.json`, no file in `meter/`, `holds/` or `mail/`).
+  - **The marker:** `migrated.json` is written as `{"state": "migrating"}` before the copy and `{"state": "done"}` after it. The next start finishes an interrupted migration, and no conductor runs until it is done.
+  - **A lost marker:** if the marker is missing or unreadable while accounting exists, every lane fails closed (R60c) and nothing is migrated.
+  - **Read-only commands never migrate:** `python -m core.bootstrap status`, `core.service status` and the status page.
+- **R60i Smoke folders per lane.** `main run` and `smoke` run the smoke test in the lane's own work root.
+  - **Folder names:** with lanes they are `forge-smoke-<lane>-<role>-<hex>`.
+  - **The R39 sweep** removes only this lane's own folders, and only those older than an hour (`SMOKE_SWEEP_AGE_S`), best effort. Another process's folder is never touched.
+- **R60j Task branches per lane.** Main keeps `forge-task/<tid>`. Any other lane uses `forge-lane/<lane>/<tid>` (`Worktrees(branch_prefix=…)`). Preparing, cleaning up, recovering and finalizing a task all go through it.
+  - **Why not `forge-task/<lane>/<tid>`:** git can't hold both that and a main task branch `forge-task/<lane>`.
+  - **A lane's sweep** removes orphan branches only in its own namespace.
+  - **Task ids are unique across lanes:** `init` refuses a task id that another lane's queue already has (exit 2).

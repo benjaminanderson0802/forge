@@ -494,7 +494,8 @@ class Conductor:
 
     @property
     def trees(self) -> Worktrees:
-        return Worktrees(self.repo, self.work)
+        prefix = "forge-task/" if self.lane == lanes_mod.MAIN else f"forge-lane/{self.lane}/"  # R60: per lane
+        return Worktrees(self.repo, self.work, branch_prefix=prefix)
 
     # ------------------------------------------------------------------ setup
     def init_queue(self, layer: str, tasks: list[dict]) -> None:
@@ -826,7 +827,8 @@ class Conductor:
                     f = Path(root) / name
                     rel = f.relative_to(self.shared).as_posix()
                     others = (rel.split("/", 1)[0] in lanes_mod.KINDS and rel not in own) or \
-                        (rel == lanes_mod.INBOX_SEEN and self.lane != lanes_mod.MAIN)
+                        (rel == lanes_mod.INBOX_SEEN and self.lane != lanes_mod.MAIN) or \
+                        rel == lanes_mod.MANIFEST  # any lane registers its first file at any time (grow-checked)
                     if others or rel == lanes_mod.SHARED_LOCK or name.startswith(lanes_mod.TMP_PREFIX):
                         continue
                     fp[SHARED_PREFIX + rel] = self._signature(f, SHARED_PREFIX + rel)
@@ -3325,8 +3327,11 @@ SMOKE_ROLES = {  # role: (schema, writes a file?, example answer)
 }
 
 
+SMOKE_SWEEP_AGE_S = 3600  # R60: with lanes, only this lane's smoke folders older than this are swept
+
+
 def smoke(team: Team, workdir: Path, call: Callable | None = None,
-          warn: Callable[[str], None] | None = None) -> list[str]:
+          warn: Callable[[str], None] | None = None, lane: str | None = None) -> list[str]:
     """R23/R29: run every role once for real, each in a fresh throwaway repo. Returns problems; empty = passed.
     call(role, prompt, schema, cwd) runs the agent; main passes the conductor's guarded _call."""
     import shutil
@@ -3364,7 +3369,16 @@ def smoke(team: Team, workdir: Path, call: Callable | None = None,
                     return
                 time.sleep(2)
 
-    for old in Path(workdir).glob("forge-smoke-*"):  # R39: sweep leftovers from earlier runs (best effort)
+    # R39: sweep leftovers from earlier runs (best effort). R60: with lanes, only this lane's own folders
+    # (forge-smoke-<lane>-*) and only those older than an hour: another process may be using a newer one.
+    tag = f"{lane}-" if lane else ""
+    for old in Path(workdir).glob(f"forge-smoke-{tag}*"):
+        if lane:
+            try:
+                if time.time() - old.stat().st_mtime < SMOKE_SWEEP_AGE_S:
+                    continue
+            except OSError:
+                continue
         if old.is_dir():
             try:
                 shutil.rmtree(old, onerror=unlock)
@@ -3374,7 +3388,7 @@ def smoke(team: Team, workdir: Path, call: Callable | None = None,
     for role, (schema, writes, example) in SMOKE_ROLES.items():
         # Plain mkdir, not mkdtemp: on Windows mkdtemp locks the folder to this user, and Codex's sandbox runs as
         # a separate user, so files it wrote there could not be read back.
-        root = Path(workdir) / f"forge-smoke-{role}-{uuid.uuid4().hex[:8]}"
+        root = Path(workdir) / f"forge-smoke-{tag}{role}-{uuid.uuid4().hex[:8]}"
         root.mkdir()
         try:
             _git(root, "init", "-q")
@@ -3435,7 +3449,6 @@ def main(argv: list[str]) -> int:
         return 2
     limits = load_limits(forge)
     root = forge / "state"
-    lanes_mod.migrate(root)  # R60: today's main-lane meter, holds and mail log become the shared ones (once)
     state, shared = lanes_mod.state_dir(root, a.lane), lanes_mod.shared_dir(root)
     work = lanes_mod.work_dir(Path(a.work), a.lane)
     if a.cmd == "init" and not a.force:  # R60: init never silently replaces a lane's queue
@@ -3467,6 +3480,19 @@ def main(argv: list[str]) -> int:
         if (shared / "KILL").exists():
             print("global KILL is set (every lane is stopped)")
         return 0
+    if a.cmd == "init":  # R60: task ids are unique across lanes (task branches, ledger and questions name them)
+        new_ids = {t.get("id") for t in json.loads(Path(a.tasks).read_text(encoding="utf-8")) if isinstance(t, dict)}
+        for other in lanes_mod.listed(root):
+            if other == a.lane:
+                continue
+            q = lanes_mod.read_json(lanes_mod.state_dir(root, other) / "queue.json", {})
+            clash = sorted(new_ids & {t.get("id") for t in (q.get("tasks", []) if isinstance(q, dict) else [])
+                                      if isinstance(t, dict)})
+            if clash:
+                print(f"task id(s) {', '.join(map(str, clash))} already exist in lane {other}; task ids must be "
+                      "unique across lanes")
+                return 2
+    lanes_mod.migrate(root)  # R60: once, and only when state/shared has no accounting at all (never for status)
     # R60: only the main lane reads Ben's email; it routes replies to other lanes' questions to those lanes.
     inbox = gmail_inbox(a.owner, shared) if a.lane == lanes_mod.MAIN else \
         lanes_mod.routed_inbox(lanes_mod.state_dir(root, lanes_mod.MAIN), a.lane, state)
@@ -3511,7 +3537,7 @@ def main(argv: list[str]) -> int:
                 print(service.Service(c, lanes_mod.service_dir(root, a.lane), limits, health=health).serve())
                 return 0
         if a.cmd == "smoke" or _smoke_stale(c.state, c.clock()):
-            problems = _guarded_smoke(c, Path(a.work), force=a.cmd == "smoke")
+            problems = _guarded_smoke(c, work, force=a.cmd == "smoke")  # R60: the lane's own work root
             if a.cmd == "smoke":
                 print("\n".join(problems) or "smoke test passed")
                 return 1 if problems else 0
@@ -3583,7 +3609,7 @@ def _guarded_smoke(c: Conductor, workdir: Path, force: bool = False) -> list[str
     else:
         try:
             problems = smoke(c.team, workdir, lambda role, prompt, schema, cwd: c._call(role, prompt, schema, cwd=cwd),
-                             warn=c._log)
+                             warn=c._log, **({"lane": c.lane} if c.shared is not None else {}))
         except Stopped as e:  # R42/R49
             problems = [f"stopped during the smoke test ({e})"]
         except Capped as e:  # R37

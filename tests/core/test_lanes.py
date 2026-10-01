@@ -84,6 +84,36 @@ class LaneHarness(unittest.TestCase):
         self.cs[name] = c
         return c
 
+    def _main_cli(self, argv):
+        import io
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+        from core import bootstrap
+        out = io.StringIO()
+        patches = [patch("core.bootstrap.__file__", str(self.repo / "core" / "bootstrap.py")),
+                   patch("core.agents.load_limits", return_value=dict(CAPS)),
+                   patch("core.bootstrap.real_team", return_value=self.lane_team()),
+                   patch("core.bootstrap.real_checks", return_value=dict(HEALTHY_CHECKS)),
+                   patch("core.bootstrap.real_probes", side_effect=lambda limits: healthy_probes()),
+                   patch("core.bootstrap.real_manager", return_value=None),
+                   patch("core.bootstrap.gmail_mailer", return_value=lambda s, b: None),
+                   patch("core.bootstrap.gmail_inbox", return_value=lambda: []),
+                   patch("core.bootstrap.gh_cli", return_value=lambda args: (0, ""))]
+        for p in patches:
+            p.start()
+        try:
+            with redirect_stdout(out):
+                rc = bootstrap.main(argv + ["--work", str(self.work_root)])
+        finally:
+            for p in patches:
+                p.stop()
+        return rc, out.getvalue()
+
+    def lane_team(self):
+        noop = lambda p, c: ('{"status":"ok"}', 1)  # noqa: E731
+        return Team(*[FakeAgent(noop, provider=pr) for pr in ("codex", "claude", "codex", "claude", "claude",
+                                                             "claude")])
+
     @staticmethod
     def task(**kw):
         d = {"id": "T1", "kind": "build", "title": "Implement feature", "section": "Feature value is 42.",
@@ -669,36 +699,6 @@ class ReviewRound1(LaneHarness):
             during=lambda cwd: (self.shared / "mail" / "b.json").write_text("garbage")))
         self.assertEqual(a.step(), "killed")
 
-    def _main_cli(self, argv):
-        import io
-        from contextlib import redirect_stdout
-        from unittest.mock import patch
-        from core import bootstrap
-        out = io.StringIO()
-        patches = [patch("core.bootstrap.__file__", str(self.repo / "core" / "bootstrap.py")),
-                   patch("core.agents.load_limits", return_value=dict(CAPS)),
-                   patch("core.bootstrap.real_team", return_value=self.lane_team()),
-                   patch("core.bootstrap.real_checks", return_value=dict(HEALTHY_CHECKS)),
-                   patch("core.bootstrap.real_probes", side_effect=lambda limits: healthy_probes()),
-                   patch("core.bootstrap.real_manager", return_value=None),
-                   patch("core.bootstrap.gmail_mailer", return_value=lambda s, b: None),
-                   patch("core.bootstrap.gmail_inbox", return_value=lambda: []),
-                   patch("core.bootstrap.gh_cli", return_value=lambda args: (0, ""))]
-        for p in patches:
-            p.start()
-        try:
-            with redirect_stdout(out):
-                rc = bootstrap.main(argv + ["--work", str(self.work_root)])
-        finally:
-            for p in patches:
-                p.stop()
-        return rc, out.getvalue()
-
-    def lane_team(self):
-        noop = lambda p, c: ('{"status":"ok"}', 1)  # noqa: E731
-        return Team(*[FakeAgent(noop, provider=pr) for pr in ("codex", "claude", "codex", "claude", "claude",
-                                                             "claude")])
-
     def test_fix4_init_never_replaces_a_queue_with_tasks_unless_forced(self):
         tasks = Path(self.tmp.name) / "tasks.json"
         tasks.write_text(json.dumps([self.task()]))
@@ -711,7 +711,9 @@ class ReviewRound1(LaneHarness):
         self.assertEqual(rc, 2)
         self.assertIn("--force", out)
         self.assertEqual(json.loads(qfile.read_text())["tasks"][0]["id"], "T1", "the queue was replaced")
-        rc, _ = self._main_cli(["init", "--layer", "layer-1", "--tasks", str(tasks)])  # main's own, empty: fine
+        mine = Path(self.tmp.name) / "mine.json"
+        mine.write_text(json.dumps([self.task(id="M1")]))
+        rc, _ = self._main_cli(["init", "--layer", "layer-1", "--tasks", str(mine)])  # main's own, empty: fine
         self.assertEqual(rc, 0)
         rc, _ = self._main_cli(["init", "--layer", "phase-2b", "--tasks", str(other)])  # main has tasks now
         self.assertEqual(rc, 2)
@@ -764,3 +766,156 @@ class ReviewRound1(LaneHarness):
         self.assertEqual(len(sleeps), 3, "the global KILL ends the loop at once")
         self.assertEqual(service.watchdog_all(self.repo.parent, {}, lock_free=lambda: True,
                                               run=lambda args: 0)["main"], "stopped")
+
+
+class ReviewRound2(LaneHarness):
+    """R60 review round 2 (Codex): each test fails on the code before its fix."""
+
+    def test_r2_fix1_a_missing_lane_accounting_file_fails_closed_after_a_restart(self):
+        for kind in ("meter", "mail", "holds"):
+            with self.subTest(kind=kind):
+                self.tearDown()
+                self.setUp()
+                b = self.lane("b")
+                b.meter.add("claude", 500)
+                self.assertTrue(b._send("[Forge] x", "y"))
+                b.meter.hold("gemini", datetime.now(timezone.utc) + timedelta(hours=1))
+                (self.shared / kind / "b.json").unlink()  # lost while every conductor was stopped
+                calls = []
+                b = self.lane("b", test_writer=lambda p, c: calls.append(1) or ('{"files":[]}', 1))  # restart
+                main = self.lane("main", test_writer=lambda p, c: calls.append(1) or ('{"files":[]}', 1))
+                self.assertEqual(b.step(), "not_ready")
+                self.assertEqual(main.step(), "not_ready", "every lane's caps include lane b's usage")
+                self.assertEqual(calls, [])
+                if kind == "mail":
+                    self.assertFalse(b._send("[Forge] z", "y"), "a mail budget that can't be counted sends nothing")
+                else:
+                    self.assertTrue(b.meter.over("claude", b.limits), "the caps fail closed")
+                self.assertIn(f"{kind}/b.json", lanes.accounting_problem(self.shared))
+
+    def test_r2_fix1_registered_files_are_listed_in_the_manifest(self):
+        b = self.lane("b")
+        b.meter.add("claude", 1)
+        files = json.loads((self.shared / "accounting.json").read_text())["files"]
+        self.assertIn("meter/main.json", files)
+        self.assertIn("meter/b.json", files)
+
+    def test_r2_fix1_an_agent_unregistering_a_file_is_tampering(self):
+        b = self.lane("b")
+        b.meter.add("claude", 1)
+
+        def unregister(cwd):
+            m = self.shared / "accounting.json"
+            m.write_text(json.dumps({"files": ["meter/main.json"]}))
+
+        a = self.lane("main", test_writer=self.writer(during=unregister))
+        self.assertEqual(a.step(), "killed")
+        self.assertIn("accounting.json", next(q for q in self.questions(a).values() if q["kind"] == "tamper")["body"])
+
+    def test_r2_fix2_a_lost_marker_never_remigrates_over_existing_accounting(self):
+        sroot = self.repo / "state"
+        boot = sroot / "bootstrap"
+        boot.mkdir(parents=True)
+        (boot / "meter.json").write_text(json.dumps({today(): {"claude": 5}}))
+        shared = lanes.shared_dir(sroot)
+        self.assertTrue(lanes.migrate(sroot))
+        from core.usage import Meter
+        Meter(shared, lock=lanes.SharedLock(shared), lane="main").add("claude", 1000)
+        before = (shared / "meter" / "main.json").read_bytes()
+        (shared / "migrated.json").unlink()
+        rc, _ = self._main_cli(["status"])
+        self.assertEqual(rc, 0)
+        self.assertEqual((shared / "meter" / "main.json").read_bytes(), before, "status re-migrated")
+        self.assertFalse((shared / "migrated.json").exists(), "status never migrates")
+        self.assertFalse(lanes.migrate(sroot))
+        self.assertEqual((shared / "meter" / "main.json").read_bytes(), before)
+        self.assertIn("migrated.json is missing", lanes.accounting_problem(shared))
+
+    def test_r2_fix2_a_conductor_start_with_a_lost_marker_fails_closed(self):
+        boot = self.sroot / "bootstrap"
+        boot.mkdir(parents=True)
+        (boot / "meter.json").write_text(json.dumps({today(): {"claude": 5}}))
+        a = self.lane("main")
+        a.meter.add("claude", 1000)
+        before = (self.shared / "meter" / "main.json").read_bytes()
+        (self.shared / "migrated.json").unlink()
+        calls = []
+        b = self.lane("p2", test_writer=lambda p, c: calls.append(1) or ('{"files":[]}', 1))  # a new start
+        self.assertEqual((self.shared / "meter" / "main.json").read_bytes(), before)
+        self.assertEqual(b.step(), "not_ready")
+        self.assertEqual(calls, [])
+
+    def test_r2_fix2_an_interrupted_migration_is_finished_not_abandoned(self):
+        boot = self.sroot / "bootstrap"
+        boot.mkdir(parents=True)
+        (boot / "meter.json").write_text(json.dumps({today(): {"claude": 77}}))
+        self.shared.mkdir(parents=True)
+        (self.shared / "migrated.json").write_text(json.dumps({"state": "migrating"}))
+        (self.shared / "holds").mkdir()
+        (self.shared / "holds" / "main.json").write_text("{")  # half-written when the PC lost power
+        (boot / "holds.json").write_text("{}")
+        self.assertTrue(lanes.migrate(self.sroot))
+        self.assertIsNone(lanes.accounting_problem(self.shared))
+        self.assertEqual(self.shared_meter().used_today("claude"), 77)
+
+    def test_r2_fix3_the_smoke_test_runs_in_the_lanes_own_work_root(self):
+        from unittest.mock import patch
+        seen = []
+        with patch("core.bootstrap.smoke", side_effect=lambda team, workdir, *a, **k: seen.append((workdir, k)) or []):
+            rc, _ = self._main_cli(["smoke", "--lane", "p2"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(Path(seen[0][0]), self.work_root / "lanes" / "p2")
+        self.assertEqual(seen[0][1].get("lane"), "p2")
+
+    def test_r2_fix3_the_smoke_sweep_spares_other_lanes_and_folders_in_use(self):
+        import os
+        import time
+        from core import bootstrap
+        d = Path(self.tmp.name) / "smokework"
+        d.mkdir()
+        old = time.time() - 2 * 3600
+        made = {}
+        for name, age in (("forge-smoke-p2-builder-old", old), ("forge-smoke-p2-builder-new", None),
+                          ("forge-smoke-main-builder-old", old), ("forge-smoke-builder-legacy", old)):
+            (d / name).mkdir()
+            if age:
+                os.utime(d / name, (age, age))
+            made[name] = d / name
+        noop = lambda p, c: ('{"status":"ok"}', 1)  # noqa: E731
+        team = Team(*[FakeAgent(noop, provider="claude") for _ in range(6)])
+        bootstrap.smoke(team, d, lane="p2")
+        self.assertFalse(made["forge-smoke-p2-builder-old"].exists(), "this lane's stale folder is swept")
+        self.assertTrue(made["forge-smoke-p2-builder-new"].exists(), "a folder that may be in use is kept")
+        self.assertTrue(made["forge-smoke-main-builder-old"].exists(), "another lane's folder is never swept")
+        self.assertTrue(made["forge-smoke-builder-legacy"].exists())
+        self.assertFalse([p for p in d.iterdir() if p.name.startswith("forge-smoke-p2-") and p.name not in made],
+                         "this run's own folders are removed")
+
+    def test_r2_fix4_two_lanes_with_the_same_task_id_have_separate_branches(self):
+        a, b = self.lane("main"), self.lane("b")
+        self.assertEqual(a.trees.task_branch("T1"), "forge-task/T1")
+        self.assertEqual(b.trees.task_branch("T1"), "forge-lane/b/T1")
+        pa = a.trees.prepare_task("T1", "main")
+        (pa / "x.txt").write_text("main lane's work\n")
+        git(pa, "add", ".")
+        git(pa, "commit", "-q", "-m", "main T1 work")
+        work_sha = git(self.repo, "rev-parse", "forge-task/T1")
+        b.trees.prepare_task("T1", "main")
+        self.assertEqual(git(self.repo, "rev-parse", "forge-task/T1"), work_sha, "lane b reset main's task branch")
+        self.assertTrue((pa / "x.txt").exists())
+        b.trees.sweep(set())
+        self.assertEqual(git(self.repo, "rev-parse", "forge-task/T1"), work_sha, "lane b's sweep took main's branch")
+        b.trees.prepare_task("T1", "main")
+        a.trees.sweep({"T1"})
+        self.assertIn("forge-lane/b/T1", git(self.repo, "branch", "--format=%(refname:short)").split())
+        a.trees.prepare_task("b", "main")  # a main task named like a lane: no ref clash with forge-lane/b/T1
+        self.assertIn("forge-task/b", git(self.repo, "branch", "--format=%(refname:short)").split())
+
+    def test_r2_fix4_lane_init_refuses_task_ids_another_lane_has(self):
+        tasks = Path(self.tmp.name) / "tasks.json"
+        tasks.write_text(json.dumps([self.task()]))
+        self.assertEqual(self._main_cli(["init", "--layer", "layer-1", "--tasks", str(tasks)])[0], 0)
+        rc, out = self._main_cli(["init", "--lane", "p2", "--layer", "phase-2", "--tasks", str(tasks)])
+        self.assertEqual(rc, 2)
+        self.assertIn("unique across lanes", out)
+        self.assertFalse((self.repo / "state" / "lanes" / "p2" / "queue.json").exists())
