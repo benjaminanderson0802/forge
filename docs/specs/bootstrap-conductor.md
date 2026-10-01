@@ -522,3 +522,5 @@ Module: `core/lanes.py`, with hooks in `core/bootstrap.py`, `core/usage.py`, `co
     - **Watchdog:** `python -m core.service watchdog` checks main and every lane in `state/lanes.json` (R53 per lane: its heartbeat, its lock, its task `Forge conductor <lane>`; main keeps `Forge conductor`).
     - **`scripts/start_conductor.ps1`** registers one conductor task per listed lane.
   - **Status page:** the usage bars are the shared meter, runs and mail budget (every lane together). A "Lanes" section shows each other lane's layer, current task, flags and queue. Answers on the page are for main's questions; other lanes' questions are answered by email.
+
+- **R61 Each layer is built against its own design.** `init --spec <file>` records `spec_file` in the lane's queue. The drift keeper and the coverage map read that design. Without it they read `limits["spec_file"]`, else the Layer 1 design. A Phase 2 lane therefore drifts against `docs/specs/phase-2-design.md`, not Layer 1's.

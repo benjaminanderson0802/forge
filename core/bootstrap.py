@@ -2457,7 +2457,7 @@ class Conductor:
         tasks, the spec coverage map and the stall facts. A stall forces a re-plan whatever it answers. The
         re-plan is saved durably before drift_due and the stall are cleared (T1C5)."""
         q = self._queue()
-        design = self.wt / "docs" / "specs" / "layer-1-design.md"
+        design = self.wt / self._spec_rel()  # R61: the lane's own design
         text = design.read_text(encoding="utf-8") if design.exists() else "(no design file)"
         listing = "\n".join(f"- {t['id']} [{t['status']}] {t['title']}" for t in q["tasks"])
         d0 = drift_mod.load(self.state) or {}
@@ -2511,9 +2511,15 @@ class Conductor:
                       "\n".join(f"- {x}" for x in reasons) + "\n\nReply with guidance to resume.")
 
     # ------------------------------------------------------------------ coverage, stall rules, re-plans (T1C5)
+    def _spec_rel(self) -> str:
+        """R61: the design this layer is built against. A lane's queue may name its own ("spec_file", set by
+        init --spec); otherwise limits["spec_file"], else the Layer 1 design."""
+        q = self._queue()
+        return _norm(str(q.get("spec_file") or self.limits.get("spec_file", "docs/specs/layer-1-design.md")))
+
     def _spec(self) -> tuple[str, dict] | None:
         """(spec text, requirements) from the layer worktree, or None when there is no usable spec."""
-        rel = _norm(str(self.limits.get("spec_file", "docs/specs/layer-1-design.md")))
+        rel = self._spec_rel()
         if ".." in rel or re.match(r"^([A-Za-z]:|/)", rel):
             return None
         try:
@@ -3251,6 +3257,7 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["init", "run", "step", "status", "smoke"])
     ap.add_argument("--layer")
+    ap.add_argument("--spec", help="R61: the design this layer is built against (default: limits spec_file)")
     ap.add_argument("--tasks")
     ap.add_argument("--owner", default="benjaminanderson0802@gmail.com")
     ap.add_argument("--work", default=str(Path.home() / "Forge-work"))
@@ -3298,6 +3305,10 @@ def main(argv: list[str]) -> int:
             return 2
         work.mkdir(parents=True, exist_ok=True)
         c.init_queue(a.layer, json.loads(Path(a.tasks).read_text(encoding="utf-8")))
+        if a.spec:  # R61
+            qd = c._queue()
+            qd["spec_file"] = _norm(a.spec)
+            c._save_queue(qd)
         lanes_mod.register(root, a.lane)
         print("queue ready" if a.lane == lanes_mod.MAIN else f"queue ready for lane {a.lane}")
         return 0

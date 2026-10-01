@@ -57,3 +57,17 @@ class UnbuiltTests(Harness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpecFileTests(Harness):
+    def test_lane_queue_names_its_own_design(self):
+        c = self.init()
+        self.assertEqual(c._spec_rel(), "docs/specs/layer-1-design.md")
+        q = c._queue()
+        q["spec_file"] = "docs/specs/phase-2-design.md"
+        c._save_queue(q)
+        self.assertEqual(c._spec_rel(), "docs/specs/phase-2-design.md")
+
+
+if __name__ == "__main__":
+    unittest.main()
