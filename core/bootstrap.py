@@ -2858,11 +2858,29 @@ class Conductor:
                        f"{failed[:3000]}\n\nNo pull request was opened. Forge runs it again when the layer changes.")
         return not failed
 
-    # ------------------------------------------------------------------ R60: layers stay current with main
+    # ------------------------------------------------------------------ R58: layers stay current with main
+    def _repair_sync_approval(self, wt: Path, layer: str, head: str) -> None:
+        """R58: a crash between git's merge commit and its registration leaves an unapproved sync merge that safe
+        push would refuse forever. A HEAD that is Forge's own "Sync <layer> with main" merge is registered here."""
+        try:
+            msg = _git(wt, "log", "-1", "--format=%s", head)
+            parents = _git(wt, "rev-list", "--parents", "-n", "1", head).split()[1:]
+            if msg != f"Sync {layer} with main" or len(parents) != 2:
+                return
+            approved = ApprovedMerges(self.state)
+            if not approved.has(head):
+                approved.add(head, {"kind": "main_sync", "base": parents[0], "other": parents[1], "parents": parents,
+                                    "repaired": True})
+                self._log(f"main sync: registered an unregistered sync merge {head[:12]} (interrupted sync)")
+        except (RuntimeError, OSError) as e:
+            self._log(f"main sync: approval repair failed: {e!r}"[:300])
+
     def _sync_busy(self, q: dict, wt: Path) -> str:
-        """R60: why the layer can't take a main merge right now ("" when it can)."""
+        """R58: why the layer can't take a main merge right now ("" when it can)."""
         if Journal(self.state).active():
             return "a finalization is active"
+        if any(v.get("kind") == "gate" and v.get("status") == "open" for v in self._read("questions.json", {}).values()):
+            return "a gate pull request is open"  # its tip was judged by the full suite: never move it under review
         contracts = self._ledger().contracts()
         for t in q.get("tasks", []):
             if t.get("status") == "tests_ok" and contracts.get(t["id"], {}).get("status") in ("claimed", "submitted"):
@@ -2879,7 +2897,7 @@ class Conductor:
         return ""
 
     def _sync_with_main(self) -> str:
-        """R60: when nothing is mid-stage, merge origin/main into the layer (no-ff, by Forge) so new task
+        """R58: when nothing is mid-stage, merge origin/main into the layer (no-ff, by Forge) so new task
         worktrees start from current main code. Fetches at most every MAIN_SYNC_EVERY_S. A conflict is aborted
         and asked about once ("merge" question); the layer keeps its old base. Returns what happened."""
         try:
@@ -2913,6 +2931,7 @@ class Conductor:
             head = _git(wt, "rev-parse", "HEAD")
             if not main or subprocess.run(["git", "merge-base", "--is-ancestor", main, head], cwd=str(wt),
                                           capture_output=True, stdin=subprocess.DEVNULL, **NOWIN).returncode == 0:
+                self._repair_sync_approval(wt, layer, head)
                 return "current"  # nothing on main that the layer lacks
             qs = self._read("questions.json", {})
             c = st.get("conflict") or {}
