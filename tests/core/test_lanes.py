@@ -919,3 +919,17 @@ class ReviewRound2(LaneHarness):
         self.assertEqual(rc, 2)
         self.assertIn("unique across lanes", out)
         self.assertFalse((self.repo / "state" / "lanes" / "p2" / "queue.json").exists())
+
+    def test_r2_fix2_read_only_commands_never_migrate(self):
+        boot = self.sroot / "bootstrap"
+        boot.mkdir(parents=True)
+        (boot / "meter.json").write_text(json.dumps({today(): {"claude": 5}}))
+        import io
+        from contextlib import redirect_stdout
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(service.main(["status"], forge=self.repo.parent), 0)
+        status_page.render(boot, CAPS, shared=self.shared)
+        rc, _ = self._main_cli(["status"])
+        self.assertEqual(rc, 0)
+        self.assertFalse((self.shared / "migrated.json").exists(), "a read-only command migrated")
+        self.assertFalse((self.shared / "meter").exists(), "a read-only command wrote shared accounting")
