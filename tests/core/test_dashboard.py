@@ -123,7 +123,8 @@ class DashboardTests(ForgeFixture, unittest.TestCase):
             "gate-1": dict(kind="gate", status="open", code="gatecode", subject="Ready"),
             "old-2": dict(kind="blocked", status="answered", code="oldcode", subject="Old")})
         s = self.snap()
-        self.assertLessEqual({"generated_at", "lanes", "project", "tokens", "timeline", "stage_medians"}, s.keys())
+        self.assertLessEqual({"generated_at", "lanes", "project", "tokens", "timeline", "stage_medians",
+                              "attempts"}, s.keys())
         self.assertEqual(instant(s["generated_at"]), NOW)
         self.assertEqual([l["name"] for l in s["lanes"]], ["main", "p2"])
         self.assertEqual([l["layer"] for l in s["lanes"]], ["layer-1", "layer-2"])
@@ -191,13 +192,24 @@ class DashboardTests(ForgeFixture, unittest.TestCase):
 
     def test_current_is_newest_unfinished_run_with_task_and_elapsed(self):
         self.add_run("planner", 500)
+        self.add_run("reviewer", 300, 10)
         rid = self.add_run("test_writer", 120, task="T7", title="Title: with colon")
-        self.add_run("reviewer", 60, 10)
         cur = self.main_lane()["current"]
         self.assertEqual({k: cur[k] for k in ("role", "task_id", "task_title", "run_id", "elapsed_s")},
                          dict(role="test_writer", task_id="T7", task_title="Title: with colon",
                               run_id=rid, elapsed_s=120))
         self.assertEqual(instant(cur["started"]), NOW - timedelta(seconds=120))
+
+    def test_older_unfinished_run_is_abandoned_after_newer_finished_run(self):
+        abandoned = self.add_run("test_writer", 500, task="old")
+        self.add_run("reviewer", 300, 100, task="new")
+        self.assertIsNone(self.main_lane()["current"])
+        rid = self.add_run("builder", 120, 100, task="new")
+        cur = self.main_lane()["current"]
+        self.assertEqual((cur["role"], cur["task_id"], cur["run_id"], cur["elapsed_s"]),
+                         ("judge", "new", rid, 20))
+        rows = self.snap()["timeline"]["lanes"]["main"]
+        self.assertFalse(next(r for r in rows if r["run_id"] == abandoned)["running"])
 
     def test_hyphenated_probe_role_has_no_task(self):
         self.add_run("probe-claude", 30, task=None)
@@ -237,19 +249,95 @@ class DashboardTests(ForgeFixture, unittest.TestCase):
             self.assertEqual(med[role], dict(median_s=200, n=2, source="history"))
         self.assertEqual(med["merge"], dict(median_s=600, n=0, source="default"))
 
-    def test_judge_gaps_use_next_reviewer_in_same_lane_under_six_hours(self):
+    def test_judge_gaps_use_next_run_of_any_role_in_same_lane_under_six_hours(self):
         self.second_lane()
+        self.add_run("builder", 70000, 100)
+        self.add_run("probe-claude", 48300, 10)  # exactly 6 h: excluded
         self.add_run("builder", 40000, 100)
         self.add_run("reviewer", 18000, 100)  # 21900 s: excluded
         self.add_run("builder", 15000, 100)
-        self.add_run("planner", 14700, 100)  # intervenes: no judge sample
+        self.add_run("planner", 14700, 100)  # next run gives a 200 s sample
         self.add_run("reviewer", 14500, 100)
         self.add_run("builder", 10000, 100)
         self.add_run("reviewer", 9800, 100, lane="p2")  # cannot pair across lanes
         self.add_run("reviewer", 9500, 100)  # 400 s
         self.add_run("builder", 5000, 100, lane="p2")
         self.add_run("reviewer", 4100, 100, lane="p2")  # 800 s
-        self.assertEqual(self.snap()["stage_medians"]["judge"], dict(median_s=600, n=2, source="history"))
+        self.add_run("builder", 3000, 100)
+        self.add_run("builder", 2300, 100)  # retry: 600 s sample
+        self.add_run("probe-claude", 2200, 10)  # zero gap: excluded
+        self.add_run("builder", 1000, 100)
+        self.add_run("probe-codex", 950, 10)  # negative gap: excluded
+        self.assertEqual(self.snap()["stage_medians"]["judge"], dict(median_s=500, n=4, source="history"))
+
+    def test_attempts_default_without_builder_task_history(self):
+        self.add_run("reviewer", 1000, 100)
+        self.add_run("builder", 500, 100, task=None)
+        self.assertEqual(self.snap()["attempts"], dict(median=1.0, n=0, source="default"))
+
+    def test_attempts_history_is_median_builder_runs_per_task_across_lanes(self):
+        self.second_lane()
+        # Four task samples: 1, 2, 5, 8 runs, so median 3.5 (not their mean).
+        for task, count, lane in [("A", 1, "main"), ("B", 2, "main"),
+                                  ("C", 5, "p2"), ("D", 8, "p2")]:
+            for i in range(count):
+                self.add_run("builder", 10000 - self.serial * 200, 100, lane=lane, task=task)
+        self.add_run("reviewer", 100, 50, task="unrelated")
+        self.add_run("builder", 30, 10, task=None)
+        self.assertEqual(self.snap()["attempts"], dict(median=3.5, n=4, source="history"))
+
+    def attempt_history(self):
+        # Five historical tasks keep the median at four even with a target task.
+        for i in range(5):
+            self.finished_attempts(f"history-{i}", 4)
+
+    def finished_attempts(self, task, count):
+        for _ in range(count):
+            ago = 100000 - self.serial * 500
+            self.add_run("builder", ago, 100, task=task)
+            self.add_run("probe-claude", ago - 300, 10, task=None)
+        # Every builder sample is 100 s and every judge sample is 200 s.
+
+    def check_attempt_eta(self, status, role, base_eta):
+        self.attempt_history()
+        for done, extra in [(2, 1 if role != "judge" else 2), (5, 0)]:
+            with self.subTest(finished_builders=done):
+                task = f"target-{done}"
+                self.queue([self.task(status, task)])
+                self.finished_attempts(task, done - (role == "judge"))
+                if role == "judge":
+                    self.add_run("builder", 140, 100, task=task)
+                elif role:
+                    self.add_run(role, 40, task=task)
+                else:
+                    self.add_run("probe-claude", 20, 10, task=None)
+                row = self.main_lane()["tasks"][0]
+                self.assertEqual(row["stage"], role or ("test_writer" if status == "todo" else "builder"))
+                self.assertEqual(self.snap()["attempts"]["median"], 4)
+                self.assertEqual(row["eta_s"], base_eta + extra * (100 + 200))
+                if extra:
+                    self.assertIn("attempt", row["eta_basis"].lower())
+                    self.assertRegex(row["eta_basis"].lower(), r"median\s+4\b")
+
+    def test_todo_eta_adds_only_remaining_attempts(self):
+        self.check_attempt_eta("todo", None, 1800)
+
+    def test_tests_ok_eta_adds_only_remaining_attempts(self):
+        self.check_attempt_eta("tests_ok", None, 1200)
+
+    def test_running_builder_eta_adds_only_remaining_attempts(self):
+        self.check_attempt_eta("tests_ok", "builder", 1160)
+
+    def test_judging_eta_adds_only_remaining_attempts(self):
+        self.check_attempt_eta("tests_ok", "judge", 1060)
+
+    def test_checkpoint_unplanned_work_uses_historical_attempts(self):
+        self.attempt_history()
+        self.queue([self.task(kind="plan")])
+        cp = self.main_lane()["checkpoint"]
+        self.assertEqual(cp["eta_s"], 1200 + 6 * (600 + 4 * (100 + 200) + 300 + 600))
+        self.assertIn("attempt", cp["eta_basis"].lower())
+        self.assertIn("4", cp["eta_basis"])
 
     def test_task_stages_and_default_etas_by_status(self):
         cases = [("plan", "todo", "planner", 1200), ("build", "todo", "test_writer", BUILD),
