@@ -59,18 +59,6 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class SpecFileTests(Harness):
-    def test_lane_queue_names_its_own_design(self):
-        c = self.init()
-        self.assertEqual(c._spec_rel(), "docs/specs/layer-1-design.md")
-        q = c._queue()
-        q["spec_file"] = "docs/specs/phase-2-design.md"
-        c._save_queue(q)
-        self.assertEqual(c._spec_rel(), "docs/specs/phase-2-design.md")
-
-
-if __name__ == "__main__":
-    unittest.main()
 class ReviewRound1Tests(unittest.TestCase):
     def test_deleted_module_forces_full_suite(self):
         r = Path(tempfile.mkdtemp())
@@ -140,3 +128,13 @@ class SyncRepairRound2Tests(Harness):
         c._write("main_sync.json", {"fetched_at": c.clock().isoformat()})
         (c.wt / ".git").exists() and c._sync_with_main()
         self.assertEqual(len(calls), 1)
+
+
+class SpecFileTests(Harness):
+    def test_lane_queue_names_its_own_design(self):
+        c = self.init()
+        self.assertEqual(c._spec_rel(), "docs/specs/layer-1-design.md")
+        q = c._queue()
+        q["spec_file"] = "docs/specs/phase-2-design.md"
+        c._save_queue(q)
+        self.assertEqual(c._spec_rel(), "docs/specs/phase-2-design.md")
