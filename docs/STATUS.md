@@ -43,6 +43,7 @@
 
 ## Open items
 
+- **Lanes (R58, 2026-10-01):** parallel conductors with shared caps (`--lane NAME`). Known limit: an agent can edit another lane's state undetected unless that lane has an agent run in progress; the strong fix is Layer 3's separate Windows user. To add a lane: `init --lane NAME`, then re-run `scripts/start_conductor.ps1`.
 - **ChatGPT Dots evaluated (2026-09-30):** not adopted for now. Email stays Forge's channel. A Dot round-trip trial is part of 1E, and the criteria are in `docs/specs/layer-1-design.md`.
 - **Codex runs that time out are not metered.** Codex keeps no session log under `--ephemeral` and reports usage only on a completed turn (see R46).
 - **Plan size:** a planner call has 30 minutes. If a part still times out, split it further rather than raising the timeout.

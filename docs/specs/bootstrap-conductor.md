@@ -468,3 +468,56 @@ Fixes made when 1B, the R42–R48 amendments, 1C, 1D and 1E were merged into one
   - **Never fatal:** a git error is logged and retried at the next fetch window; the step goes on.
 
 - **R59 A task's judges skip tests of layer tasks not built yet** (found by Forge's own troubleshooter in the gate run, 2026-10-01). Stage A writes and commits a task's acceptance tests before earlier tasks merge, so the layer branch holds tests whose code doesn't exist yet. The suite judge therefore failed every earlier task, every time. Now each per-task suite judge gets `--exclude <file>` for every test file of another build task in the layer that isn't `done`. A task's own test files are never excluded. A module that isn't excluded still fails the suite as before. The layer gate, where every task is done, and CI run everything.
+## Lanes amendment (2026-10-01)
+
+Module: `core/lanes.py`, with hooks in `core/bootstrap.py`, `core/usage.py`, `core/service.py`, `core/status_page.py` and `scripts/start_conductor.ps1`. Tests: `tests/core/test_lanes.py`. This amendment was requested as "R56"; R56 and R57 were already taken above, so it is numbered **R58**.
+
+- **R60 Lanes: parallel conductors with shared caps.** Within one conductor agents can't run at the same time: the after-run tamper check (R9/R14) would see the conductor's own writes for another task. A lane is a separate conductor process with its own state, so lanes run side by side and each lane's tamper check sees only its own state.
+  - **Command line:** `python -m core.bootstrap <cmd> --lane NAME`. The default lane, `main`, keeps today's paths.
+    - **State:** `state/bootstrap/` for main, `state/lanes/<NAME>/` for every other lane: its own lock (R11), queue, questions, runs, capabilities, ledger and notices.
+    - **Worktrees:** `Forge-work/` for main, `Forge-work/lanes/<NAME>/` for the others.
+    - **Layer branch:** set per lane by `init --layer`. `init` refuses a layer branch that another lane's queue already uses, and adds the lane to `state/lanes.json` (a list of names; main is implied).
+    - **Names:** a lowercase letter, then up to 23 lowercase letters, digits or `_`. No `-` (a question id's lane prefix must be unambiguous). Question kinds, `main` and the state and service folder names are reserved.
+  - **Shared by every lane, in `state/shared/`:**
+    - the token meter (`meter.json`) and holds (`holds.json`), through `Meter(shared, lock=…, runs_dirs=…)`;
+    - the runs-per-day count (R51), counted over every lane's `runs/` folder;
+    - the mail log and budget (`mail_log.json`, R20/R25): `_send` reserves a send in one locked read-modify-write;
+    - `inbox_seen.json` (R26);
+    - the global `KILL`.
+  - **Locking:** every read-modify-write of a shared file holds `state/shared/shared.lock` (`msvcrt.locking` on Windows, `fcntl.flock` elsewhere, non-blocking with retries, `TimeoutError` after 60 s). Writes go to a `.tmp-*` file beside the target and are replaced atomically. On Windows a replace is retried while a reader has the file open.
+  - **Migration:** on any `core.bootstrap` start, if `state/shared/meter.json` doesn't exist, the main lane's `meter.json`, `holds.json`, `mail_log.json` and `inbox_seen.json` are copied into `state/shared/` (the meter last, as the done-marker). The old copies are left in place. Each later start raises the shared meter to the old file's count for any day and provider where the old one is higher, so an older conductor that kept writing the old file can't reset a cap. A count is never lowered.
+  - **KILL:**
+    - **Global KILL** (`state/shared/KILL`) stops every lane: `step()`, `_send`, the service sleep, the watchdog and R49's mid-run stop all check it.
+    - **Lane KILL** (`<lane state>/KILL`) stops one lane.
+    - **These write the global KILL** (plus the writing lane's own KILL): a STOP by email or by the status page, the Stop Forge shortcut, `python -m core.service stop` (`--lane NAME` stops one lane), and a tamper alarm in any lane (the lanes share caps and state, so a tamper alarm stops them all).
+    - **A global KILL appearing during a run** is a stop under R42, not tampering.
+    - **Start Forge** clears every KILL and runs the watchdog, which starts every lane.
+  - **Tamper fingerprint (R9/R14/R15, per lane):** a lane fingerprints its own state folder (as before), its own answer drop folder, and every file in `state/shared/` except:
+    - the accumulate files (`meter.json`, `holds.json`, `mail_log.json`, `inbox_seen.json`);
+    - `shared.lock`;
+    - `.tmp-*` replace temporaries.
+
+    Other lanes' conductors write the accumulate files at any time, and only plain conductor code writes them. An agent writing them is the new risk. So instead of a fingerprint they get a **never-decreases check** around every agent run (`lanes.shrunk`). Each of these is tampering:
+    - any meter count for any day and provider decreasing or disappearing;
+    - a hold shortened or removed;
+    - a send younger than 23 hours, or a recent Message-ID, removed from the mail log;
+    - a handled Message-ID removed from `inbox_seen.json` while the list is under its cap;
+    - a file that was readable becoming missing or unreadable.
+
+    Additions are never tampering.
+  - **Not fingerprinted by a lane:**
+    - other lanes' state folders, written by their own conductors at any time;
+    - `state/lanes.json`, written by Ben's `init`;
+    - `state/service/`: heartbeats.
+  - **Known limit:** an agent in lane A that edits lane B's state (its queue, its questions) is caught only if lane B has an agent run in progress at that moment (B's own fingerprint). Lane A can't tell an agent's write to B's folder from B's conductor's own writes. The strong fix is the one already planned for Layer 3: agents run as a separate Windows user that can't write Forge's state at all.
+  - **Ben's email:**
+    - **Only the main lane reads the mailbox.** Other lanes send through the same `_send`, under the shared budget.
+    - **Question ids:** a non-main lane's question ids carry its name as a prefix (`p2-blocked-3`).
+    - **Routing:** when main reads an owner's reply whose subject names a lane-prefixed question of a listed lane, it doesn't answer it. It appends the reply (from, subject, cleaned body) to `state/bootstrap/routed/<lane>.json` (last 50). That file is in main's own state, written between main's agent runs.
+    - **The lane's inbox:** it reads that file, keeps what it has read in its own `routed_seen.json`, and never writes main's folder. It then handles each reply exactly like an email: owner check, question code, kind.
+    - **STOP** is handled by main itself and writes the global KILL.
+  - **Service and watchdog:**
+    - **Heartbeats:** each lane beats in `state/service/` (main, as before) or `state/service/<lane>/`.
+    - **Watchdog:** `python -m core.service watchdog` checks main and every lane in `state/lanes.json` (R53 per lane: its heartbeat, its lock, its task `Forge conductor <lane>`; main keeps `Forge conductor`).
+    - **`scripts/start_conductor.ps1`** registers one conductor task per listed lane.
+  - **Status page:** the usage bars are the shared meter, runs and mail budget (every lane together). A "Lanes" section shows each other lane's layer, current task, flags and queue. Answers on the page are for main's questions; other lanes' questions are answered by email.
