@@ -654,5 +654,132 @@ class SyncBlockers(ConductorFixture):
         self.assertEqual(self.questions(c, "merge"), {})
 
 
+class ReviewRegressions(ConductorFixture):
+    def test_exhausted_gate_keeps_watching_and_rearms_after_reopen(self):
+        self.merge_exit = 1
+        c = self.conductor()
+        c._update("T1", status="done")
+        c._gate()
+        for _ in range(2):
+            self.now += timedelta(seconds=301)
+            c._blockers_tick()
+        rec = self.only_blocker("gate")
+        self.assertEqual(rec["status"], "ready_for_ben")
+        self.assertEqual(sum(a[:2] == ["pr", "merge"] for a in self.gh_calls), 3)
+        for state in ("OPEN", "OPEN", "CLOSED", "CLOSED"):
+            self.pr_state = state
+            before = len(self.gh_calls)
+            self.now += timedelta(seconds=301)
+            c._blockers_tick()
+            calls = self.gh_calls[before:]
+            self.assertFalse(any(a[:2] == ["pr", "merge"] for a in calls), calls)
+            self.assertIn(["pr", "view", "7", "--json", "state"], calls)
+            self.assertEqual(self.only_blocker("gate")["status"], "ready_for_ben")
+            if state == "CLOSED":
+                self.assertIn("gh pr reopen 7", self.only_blocker("gate")["kit"]["paste"])
+        self.pr_state, self.merge_exit = "OPEN", 0
+        before = len(self.gh_calls)
+        self.now += timedelta(seconds=301)
+        c._blockers_tick()
+        self.assertIn(["pr", "merge", "7", "--merge", "--delete-branch", "--auto"],
+                      self.gh_calls[before:])
+        self.assertEqual(self.store().get(rec["id"])["status"], "fixing")
+        self.assertTrue(next(iter(self.questions(c, "gate").values()))["merge_set"])
+
+    def test_exhausted_drift_clears_stall_and_next_step_skips_keeper(self):
+        c = self.conductor(agents={"drift_keeper": lambda p, cwd: ("not JSON", 1)})
+        c._refresh_readiness()
+        d = drift.adopt([], [], False, c._activity().total())
+        d.update(no_gain=3, stall={"trigger": "no coverage gain in 3 merges", "active_s": 0})
+        drift.save(self.state, d)
+        q = c._queue()
+        q["drift_due"] = True
+        c._save_queue(q)
+        for attempt in range(3):
+            self.assertIsNotNone(drift.load(self.state)["stall"])
+            c._drift_check()
+        self.assertIsNone(drift.load(self.state)["stall"])
+        self.assertIs(c._queue()["drift_due"], False)
+        self.assertEqual(self.only_blocker("drift")["status"], "ready_for_ben")
+        calls = len(c.team.drift_keeper.prompts)
+        self.assertGreaterEqual(calls, 3)
+        with patch.object(c, "_drift_check", wraps=c._drift_check) as check:
+            self.assertEqual(c.step(), "worked")
+            check.assert_not_called()
+        self.assertEqual(len(c.team.drift_keeper.prompts), calls)
+
+    def test_capability_kits_distinguish_login_from_exhausted_install(self):
+        c = self.conductor()
+        cases = (("logged_out", "python -m pip install keyring", "credentials"),
+                 ("error", "gh auth login", "credentials"),
+                 ("missing", "python -m pip install keyring", "exhausted"))
+        for index, (condition, line, category) in enumerate(cases):
+            with self.subTest(condition=condition, line=line):
+                name = f"cap{index}"
+                diagnosis = dict(condition=condition, fix="PowerShell: " + line, troubleshoot=True)
+                c._write("cap_routing.json", {name: {"rounds": 3}})
+                with patch.object(c, "_cap_candidates", return_value=([name], {name: diagnosis}, {})), \
+                        patch.object(c, "_trouble_available", return_value=True):
+                    c._route_capabilities({name: {"ok": False, "detail": "unavailable"}})
+                rec = self.store().find("capability", name)
+                self.assertIsNotNone(rec)
+                self.assertEqual((rec["status"], rec["category"]), ("ready_for_ben", category))
+                if category == "credentials":
+                    self.assertFalse(rec["kit"].get("script"))
+                    self.assertFalse(rec["kit"].get("script_file"))
+                else:
+                    self.assertEqual(rec["kit"]["script"], line)
+                    self.assertEqual((self.state / rec["kit"]["script_file"]).read_bytes(),
+                                     (line + "\n").encode("utf-8"))
+        self.assertEqual(c.team.troubleshooter.prompts, [])
+
+    def test_not_needed_cannot_drop_a_capability_with_a_check(self):
+        c = self.conductor(checks={"gmail": lambda: (False, "no app password in Windows Credential Manager (forge-gmail)")})
+        c._update("T1", needs=["gmail"])
+        c._route_capabilities(c._refresh_readiness())
+        rec = self.only_blocker("capability")
+        questions = self.questions(c, "capability")
+        self.assertEqual(next(iter(questions.values()))["condition"], "no_password")
+        before = c._task("T1")
+        channel.drop_answer(c.channel_in, rec["id"], rec["code"], "not needed", "fix kit")
+        c._take_channel_answers()
+        self.assertEqual(c._task("T1"), before)
+        self.assertIn("gmail", c._task("T1")["needs"])
+        self.assertEqual(self.store().get(rec["id"]), rec)
+        self.assertNotEqual(self.store().get(rec["id"])["status"], "fixed")
+        self.assertEqual(self.questions(c, "capability"), questions)
+
+    def test_gate_notices_wait_for_digest_and_leave_outbox_after_delivery(self):
+        c = self.conductor()
+        c.local_tz = timezone(timedelta(hours=-5))
+        c.limits.update(digest_hour=8, quiet_start=23, quiet_end=7)
+        self.now = datetime(2026, 10, 1, 7, 30, tzinfo=c.local_tz)
+        c._update("T1", status="done")
+        c._gate()
+        c._blockers_tick()
+        self.assertEqual(self.mails, [])
+        self.pr_state = "MERGED"
+        self.now += timedelta(seconds=301)
+        c._blockers_tick()
+        c._channel_tick()
+        self.assertEqual(self.mails, [])
+        notices = c._read("outbox.json", [])
+        self.assertEqual(len(notices), 2)
+        for phrase in ("passed its gate", "is merged into main"):
+            self.assertTrue(any(phrase in n["subject"] and n["digest"] for n in notices))
+        self.now = datetime(2026, 10, 1, 8, 5, tzinfo=c.local_tz)
+        c._channel_tick()
+        self.assertEqual(len(self.mails), 1)
+        subject, body = self.mails[0]
+        self.assertIn("Daily digest", subject)
+        for notice in notices:
+            self.assertIn(notice["subject"], body)
+            self.assertIn(notice["body"], body)
+        self.assertEqual(c._read("outbox.json", []), [])
+        c._blockers_tick()
+        c._channel_tick()
+        self.assertEqual(len(self.mails), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

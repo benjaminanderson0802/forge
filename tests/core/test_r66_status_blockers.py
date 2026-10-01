@@ -244,5 +244,41 @@ class FixHTTP(StatusFixture):
         self.assertEqual(self.calls, [])
 
 
+class DefaultFixRunnerRegression(StatusFixture):
+    def test_default_runner_uses_validated_bytes_after_script_is_overwritten(self):
+        from unittest.mock import Mock, patch
+        from core import blockers
+
+        path = self.state / "fixkits/b-1.ps1"
+        validated = path.read_bytes()
+        pending = []
+        # Hold the real worker until after the overwrite, making the race deterministic.
+        with patch("core.blockers.subprocess.run", return_value=Mock(returncode=0)) as run:
+            with patch("core.blockers.threading.Thread.start", autospec=True, side_effect=pending.append):
+                started, reason = blockers.run_fix(self.state_root, "main", "b-1", self.sha, runner=None)
+            self.assertTrue(started, reason)
+            self.assertEqual(len(pending), 1)
+            path.write_bytes(b"Write-Output overwritten\n")
+            worker = pending[0]
+            worker.start()
+            try:
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    result = blockers.run_status(self.state_root, "b-1")
+                    if result and result.get("finished_at"):
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("default fix runner did not finish within four seconds")
+            finally:
+                worker.join(timeout=1)
+            self.assertEqual(result["exit"], 0)
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0][-2:], ["-Command", "-"])
+            self.assertEqual(run.call_args.args[0][0], "powershell")
+            self.assertEqual(run.call_args.kwargs["input"], validated)
+            self.assertNotEqual(path.read_bytes(), validated)
+
+
 if __name__ == "__main__":
     unittest.main()
