@@ -208,10 +208,29 @@ class EvidenceRewriteTests(Pipeline):
             self.assertEqual(task["status"], "todo")
         with self.subTest(check="feedback survives interruption"):
             self.assertTrue(self.feedback_text(task))
-        with self.subTest(check="deferred builder troubleshooting cleared"):
-            self.assertFalse(task.get("troubleshoot_pending"))
+        with self.subTest(check="deferred builder troubleshooting preserved"):
+            self.assertEqual(task.get("troubleshoot_pending"), {
+                "reason": trouble.call_args.args[1],
+                "output": trouble.call_args.args[2],
+            })
         with self.subTest(check="accepted tests cleared"):
             self.assertFalse(task.get("tests_commit"))
+
+        # Accept a rewrite, then service the deferred handoff before building.
+        self.assertion = "self.assertTrue(feat.value() == 42)"
+        self.assertEqual(c.step(), "worked")
+        accepted = self.queue_task("T1")
+        self.assertEqual(accepted["status"], "tests_ok")
+        self.assertEqual(accepted.get("troubleshoot_pending"), task.get("troubleshoot_pending"))
+        self.assertEqual(accepted["fails_since"], 2)
+        self.assertEqual(accepted["fail_signatures"], task["fail_signatures"])
+        builder_runs = len(self.team.builder.prompts)
+        with patch.object(c, "_troubleshoot", wraps=c._troubleshoot) as resumed:
+            self.assertEqual(c.step(), "worked")
+        resumed.assert_called_once_with("T1", *trouble.call_args.args[1:])
+        self.assertEqual(len(self.team.builder.prompts), builder_runs)
+        self.assertEqual(len(self.team.troubleshooter.prompts), 1)
+        self.assertFalse(self.queue_task("T1").get("troubleshoot_pending"))
 
     def test_mutation_failure_returns_to_tests_when_troubleshooter_capped(self):
         self.assert_interrupted_troubleshooter_returns_evidence(Capped("claude"))
@@ -226,6 +245,75 @@ class EvidenceRewriteTests(Pipeline):
     def test_review_failure_returns_to_tests_when_troubleshooter_not_ready(self):
         self.assert_interrupted_troubleshooter_returns_evidence(
             NotReady({"claude": "probe unavailable"}), review=True)
+
+    def test_identical_mutation_failures_across_rewrite_invoke_troubleshooter(self):
+        c = self.start_evidence()
+        first_result, _ = self.build_attempt(c)
+        failed = self.queue_task("T1")
+        self.assertEqual(failed["status"], "todo")
+        self.assertEqual(failed["fails_since"], 1)
+        self.assertEqual(len(failed["fail_signatures"]), 1)
+        self.assertEqual(self.team.troubleshooter.prompts, [])
+
+        # A real, accepted rewrite that still misses the same mutants.
+        self.assertion = "self.assertTrue(feat.value() is not None)"
+        self.assertEqual(c.step(), "worked")
+        accepted = self.queue_task("T1")
+        self.assertEqual(accepted["status"], "tests_ok")
+        with self.subTest(check="failure count survives acceptance"):
+            self.assertEqual(accepted["fails_since"], failed["fails_since"])
+        with self.subTest(check="failure signatures survive acceptance"):
+            self.assertEqual(accepted["fail_signatures"], failed["fail_signatures"])
+
+        with patch.object(c, "_mutation_judge", wraps=c._mutation_judge) as judge, \
+                patch.object(c, "_troubleshoot", wraps=c._troubleshoot) as trouble:
+            self.assertEqual(c.step(), "worked")
+        judge.assert_called_once()
+        trouble.assert_called_once()
+        self.assertEqual(trouble.call_args.args[0], "T1")
+        self.assertEqual(len(self.team.builder.prompts), 2)
+        self.assertEqual(len(self.team.troubleshooter.prompts), 1)
+        failures = [e for e in Ledger(self.state).events()
+                    if e["action"] == "fail" and e["contract_id"] == "T1"]
+        self.assertEqual(len(failures), 2)
+        self.assertTrue(first_result.survivors)
+        for failure in failures:
+            self.assertEqual(failure["payload"]["gate"], "mutation")
+            self.assertEqual(failure["payload"]["mutation"]["survivors"],
+                             first_result.as_dict()["survivors"])
+        task = self.queue_task("T1")
+        self.assertEqual(task["fail_signatures"], failed["fail_signatures"] * 2)
+        self.assertEqual(task["troubleshoots"], 1)
+        self.assertEqual(task["status"], "todo")
+
+    def test_failure_recording_runtime_error_does_not_return_to_writer(self):
+        c = self.start_evidence()
+        accepted = self.queue_task("T1")
+        real_apply = c._apply
+
+        def apply(pid, action, cid, ident, payload=None):
+            if action == "fail":
+                raise RuntimeError("failure ledger write unavailable")
+            return real_apply(pid, action, cid, ident, payload)
+
+        with patch.object(c, "_apply", side_effect=apply) as ledger_apply:
+            self.assertEqual(c.step(), "error")
+        attempted_failures = [call for call in ledger_apply.call_args_list
+                              if call.args[1] == "fail"]
+        self.assertEqual(len(attempted_failures), 1)
+        self.assertEqual(attempted_failures[0].args[2], "T1")
+        self.assertEqual(attempted_failures[0].args[4]["gate"], "mutation")
+        self.assertFalse(any(e["action"] == "fail" and e["contract_id"] == "T1"
+                             for e in Ledger(self.state).events()))
+        task = self.queue_task("T1")
+        with self.subTest(check="status unchanged"):
+            self.assertEqual(task["status"], accepted["status"])
+        with self.subTest(check="accepted tests retained"):
+            self.assertEqual(task["tests_commit"], accepted["tests_commit"])
+        with self.subTest(check="no rewrite requested"):
+            self.assertEqual(task.get("evidence_rewrites", 0), 0)
+            self.assertFalse(task.get("test_feedback"))
+        self.assertEqual(len(self.team.test_writer.prompts), 1)
 
     def assert_mutation_feedback_without_survivors(self, result):
         c = self.start_evidence()

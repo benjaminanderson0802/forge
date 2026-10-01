@@ -2063,7 +2063,7 @@ class Conductor:
             self._block(tid, reason)
             return
         self._update(tid, status="todo", tests_commit=None, test_rejects=0, evidence_rewrites=n + 1,
-                     troubleshoot_pending=None, test_feedback=[str(x)[:NOTE_CAP] for x in feedback][:40])
+                     test_feedback=[str(x)[:NOTE_CAP] for x in feedback][:40])
 
     @staticmethod
     def _test_feedback_text(t: dict) -> str:
@@ -2121,7 +2121,10 @@ class Conductor:
                 self._block(tid, reason)
             return
         sha = self._commit(changed, f"{tid}: acceptance tests")
-        self._update(tid, status="tests_ok", tests_commit=sha, fails_since=0, fail_signatures=[], test_feedback=[])
+        if t.get("evidence_rewrites"):  # R65: a rewrite keeps the failure history the troubleshooter rules use
+            self._update(tid, status="tests_ok", tests_commit=sha, test_feedback=[])
+        else:
+            self._update(tid, status="tests_ok", tests_commit=sha, fails_since=0, fail_signatures=[], test_feedback=[])
 
     # ------------------------------------------------------------------ stage B: build
     def _ledger(self) -> Ledger:
@@ -2319,22 +2322,27 @@ class Conductor:
             sig = (hashlib.sha256(("mutation:" + "|".join(sorted(ids))).encode("utf-8")).hexdigest()
                    if mres.complete else "mutation-incomplete")
             self._update(tid, review_feedback=survivor_feedback + given)
+            fb = [reason] + [f"{m.file}:{m.line} {m.original} -> {m.replacement} (surviving mutant {m.id})"
+                                                        for m in mres.survivors] + given
             try:
                 fail(reason, sig, self._survivor_listing(mres), submitted=True,
                      payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "mutation"})
-            finally:  # R65: even when a deferred troubleshooter run is interrupted (Capped/NotReady)
-                self._evidence_rewrite(tid, reason, [reason] + [f"{m.file}:{m.line} {m.original} -> {m.replacement} (surviving mutant {m.id})"
-                                                        for m in mres.survivors] + given)
+            except (Capped, NotReady):  # R65: recorded; only the deferred troubleshooter was interrupted
+                self._evidence_rewrite(tid, reason, fb)
+                raise
+            self._evidence_rewrite(tid, reason, fb)
             return
         if verdict != "pass":
             reasons = given or ["no reasons given"]
             self._update(tid, review_feedback=survivor_feedback + reasons)
+            why = "review failed: " + "; ".join(reasons)
             try:
-                fail("review failed: " + "; ".join(reasons), "review:" + "|".join(reasons), submitted=True,
+                fail(why, "review:" + "|".join(reasons), submitted=True,
                      payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "review"})
-            finally:  # R65: as above
-                self._evidence_rewrite(tid, "review failed: " + "; ".join(reasons),
-                                       ["review failed"] + reasons)
+            except (Capped, NotReady):  # R65: as above
+                self._evidence_rewrite(tid, why, ["review failed"] + reasons)
+                raise
+            self._evidence_rewrite(tid, why, ["review failed"] + reasons)
             return
 
         # Reviewed: hand S to the crash-safe finalizer. The ledger pass is applied only there, after the push.
