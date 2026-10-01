@@ -1,13 +1,34 @@
 # Forge progress in the Windows taskbar's notification area (system tray).
-# Icon shows the % to the next checkpoint; hover for both numbers; click opens the status page.
+# Icon shows the % to the next checkpoint; hover for both numbers and who is working; click opens the status page.
+# R64: the numbers come from the status page's /api/live (same as the live dashboard); files if the page is down.
 # Reads only Forge's files; never touches the conductor. Started at logon by the "Forge tray" task.
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $forge = Split-Path -Parent $PSScriptRoot
 $mutex = New-Object System.Threading.Mutex($false, 'Global\ForgeTray')
 if (-not $mutex.WaitOne(0)) { exit }   # one tray icon only
 
+function Get-ForgeLive {
+    # R64: the same numbers as the status page's live dashboard (/api/live); $null when the page is down.
+    try { $s = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/live' -TimeoutSec 5 } catch { return $null }
+    $lane = @($s.lanes)[0]
+    if (-not $lane) { return $null }
+    $cp = $lane.checkpoint
+    # unknown stays unknown (-1 shows as "?"); the page's own state is kept
+    $ckpt = if ($null -eq $cp.tasks_total) { -1 } elseif ($cp.tasks_total) { $cp.tasks_done / $cp.tasks_total } else { 0 }
+    $state = switch ($lane.state) { 'stopped' { 'stopped' } 'paused' { 'paused' } default { $lane.state } }
+    $now = if ($lane.current) { " $($lane.current.role) $($lane.current.task_id)".TrimEnd() } else { '' }
+    $prod = if ($null -eq $s.project.overall) { -1 } else { [int][math]::Floor(([double]$s.project.overall) * 100) }
+    [pscustomobject]@{ Ckpt = $(if ($ckpt -lt 0) { -1 } else { [int][math]::Floor($ckpt * 100) }); Prod = $prod;
+        Done = $cp.tasks_done; Total = $cp.tasks_total; Phase = $s.project.current_phase; State = $state; Now = $now }
+}
+
 function Get-ForgeProgress {
-    try { $q = Get-Content "$forge\state\bootstrap\queue.json" -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $q = $null }
+    $live = Get-ForgeLive
+    if ($live) { return $live }
+    $qbad = $false
+    try { $q = Get-Content "$forge\state\bootstrap\queue.json" -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json }
+    catch { $q = $null; $qbad = Test-Path "$forge\state\bootstrap\queue.json" }   # unreadable is unknown, not empty
+    if ($q -and -not ($q.tasks -is [array])) { $qbad = $true }
     try { $p = Get-Content "$forge\docs\progress.json" -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $p = $null }
     $tasks = @(); if ($q) { $tasks = @($q.tasks | Where-Object { $_.status -ne 'superseded' }) }
     $done = @($tasks | Where-Object { $_.status -eq 'done' }).Count
@@ -17,8 +38,9 @@ function Get-ForgeProgress {
     $cur = ($phases | Where-Object { -not $_.done } | Select-Object -First 1).name
     $prod = if ($phases.Count) { ($pdone + $(if ($pdone -lt $phases.Count) { $ckpt } else { 0 })) / $phases.Count } else { 0 }
     $state = if (Test-Path "$forge\state\bootstrap\KILL") { 'stopped' } elseif (Test-Path "$forge\state\bootstrap\PAUSED") { 'paused' } else { 'running' }
+    if ($qbad) { $ckpt = -0.01; $prod = -0.01 }
     [pscustomobject]@{ Ckpt = [int][math]::Floor($ckpt * 100); Prod = [int][math]::Floor($prod * 100); Done = $done;
-        Total = $tasks.Count; Phase = $cur; State = $state }
+        Total = $tasks.Count; Phase = $cur; State = $state; Now = '' }
 }
 
 function New-NumberIcon([int]$n, [string]$state) {
@@ -27,7 +49,7 @@ function New-NumberIcon([int]$n, [string]$state) {
     $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
     $bg = switch ($state) { 'stopped' { [System.Drawing.Color]::FromArgb(179, 38, 30) } 'paused' { [System.Drawing.Color]::FromArgb(138, 90, 0) } default { [System.Drawing.Color]::FromArgb(30, 107, 52) } }
     $g.FillRectangle((New-Object System.Drawing.SolidBrush $bg), 0, 0, 32, 32)
-    $txt = if ($n -ge 100) { [string][char]0x2713 } else { "$n" }
+    $txt = if ($n -lt 0) { '?' } elseif ($n -ge 100) { [string][char]0x2713 } else { "$n" }
     $font = New-Object System.Drawing.Font 'Segoe UI', $(if ($txt.Length -ge 2) { 15 } else { 18 }), ([System.Drawing.FontStyle]::Bold), ([System.Drawing.GraphicsUnit]::Pixel)
     $fmt = New-Object System.Drawing.StringFormat; $fmt.Alignment = 'Center'; $fmt.LineAlignment = 'Center'
     $g.DrawString($txt, $font, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF 0, 0, 32, 32), $fmt)
@@ -47,7 +69,8 @@ function Update-Tray {
     $old = $tray.Icon
     $tray.Icon = New-NumberIcon $p.Ckpt $p.State
     if ($old) { $old.Dispose() }
-    $t = "Forge $($p.State): checkpoint $($p.Ckpt)% ($($p.Done)/$($p.Total)), build $($p.Prod)%"
+    $c = if ($p.Ckpt -lt 0) { '?' } else { "$($p.Ckpt)%" }; $b = if ($p.Prod -lt 0) { '?' } else { "$($p.Prod)%" }
+    $t = "Forge $($p.State)$($p.Now): ckpt $c ($($p.Done)/$($p.Total)), build $b"
     $tray.Text = $t.Substring(0, [math]::Min(63, $t.Length))   # Windows limits tray tooltips to 63 characters
     $tray.Visible = $true
 }
