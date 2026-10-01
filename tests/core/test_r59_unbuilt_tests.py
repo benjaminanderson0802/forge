@@ -57,3 +57,40 @@ class UnbuiltTests(Harness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRound1Tests(unittest.TestCase):
+    def test_deleted_module_forces_full_suite(self):
+        r = Path(tempfile.mkdtemp())
+        (r / "tests" / "core").mkdir(parents=True)
+        (r / "tests/core/test_x.py").write_text("import unittest\n", encoding="utf-8")
+        picked, why = suite.select(r, ["core/feature.py"])
+        self.assertIsNone(picked)
+        self.assertIn("deleted module", why)
+
+
+class SyncReviewTests(Harness):
+    def test_no_sync_while_a_gate_pr_is_open(self):
+        c = self.init()
+        c._ask("gate", "Layer ready", "approve?")
+        self.assertIn("gate pull request", c._sync_busy(c._queue(), c.wt))
+
+    def test_unregistered_sync_merge_at_head_is_repaired(self):
+        import subprocess
+        from core.finalize import ApprovedMerges
+        c = self.init()
+        wt, layer = c.wt, c._queue()["layer"]
+        base = bootstrap._git(wt, "rev-parse", "HEAD")
+        bootstrap._git(wt, "checkout", "-q", "-b", "side")
+        (wt / "side.txt").write_text("x\n", encoding="utf-8")
+        bootstrap._git(wt, "add", "side.txt")
+        bootstrap._git(wt, "commit", "-q", "-m", "side")
+        bootstrap._git(wt, "checkout", "-q", layer)
+        subprocess.run(["git", "-c", "user.name=Forge", "-c", "user.email=forge@localhost", "merge", "--no-ff",
+                        "-q", "-m", f"Sync {layer} with main", "side"], cwd=str(wt), check=True)
+        head = bootstrap._git(wt, "rev-parse", "HEAD")
+        self.assertFalse(ApprovedMerges(c.state).has(head))
+        c._repair_sync_approval(wt, layer, head)
+        self.assertTrue(ApprovedMerges(c.state).has(head))
+        c._repair_sync_approval(wt, layer, base)  # not a sync merge: nothing registered
+        self.assertFalse(ApprovedMerges(c.state).has(base))

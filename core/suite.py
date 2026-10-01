@@ -155,6 +155,8 @@ def select(root: Path, changed: list[str], include: list[str] | None = None) -> 
     for c in changed:
         if any(c == h or (h.endswith("/") and c.startswith(h)) for h in HIGH_BLAST):
             return None, f"high-blast-radius change: {c}"
+        if c.endswith(".py") and not (root / c).exists():  # a deleted module: its importers are unknowable now
+            return None, f"deleted module: {c}"
     graph, srcs = import_graph(root)
     all_tests = set(modules(root))
     changed_mods: set[str] = set()
