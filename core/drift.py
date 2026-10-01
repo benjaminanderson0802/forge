@@ -53,20 +53,17 @@ def adopt(marks: list[str], done_ids: Iterable[str], drift_due: bool, active_s: 
 
 
 def record_merges(d: dict, marks: list[str], verified: set[str], active_s: float,
-                  score: Optional[Callable[[set[str]], Fraction]], deferred: Iterable[str] = (),
-                  uncovered: Iterable[str] = ()) -> list[dict]:
+                  score: Optional[Callable[[set[str]], Fraction]], deferred: Iterable[str] = ()) -> list[dict]:
     """Record every marked merge not yet counted (skipping `deferred` ones). Each merge's gain is measured on the
     same task set: score(counted ∪ {tid}) > score(counted), counting only verified tasks. With no score function
-    (no spec) the gain is unknown (None): the window still resets but no_gain does not move. R62: a task in
-    `uncovered` (it claims no requirement) is likewise unknown. Mutates d."""
+    (no spec) the gain is unknown (None): the window still resets but no_gain does not move. Mutates d."""
     deferred = set(deferred)
-    uncovered = set(uncovered)
     events = []
     for tid in marks:
         if tid in d["counted"] or tid in deferred:
             continue
         gain = None
-        if score is not None and tid not in uncovered:
+        if score is not None:
             base = set(d["counted"]) & verified
             before, after = score(base), score(base | ({tid} & verified))
             gain = after > before

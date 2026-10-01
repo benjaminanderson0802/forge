@@ -130,50 +130,5 @@ class PlanCoversTests(DriftHarness):
         self.assertIn("blocking", instructions)
 
 
-class UncoveredMergeStateTests(unittest.TestCase):
-    def test_uncovered_merge_is_unknown_preserves_count_and_resets_active_mark(self):
-        d = drift.adopt([], set(), drift_due=False, active_s=5.0)
-        score = score_of({})
-        drift.record_merges(d, ["C1"], {"C1"}, 10.0, score)
-        self.assertEqual(d["no_gain"], 1)
-
-        events = drift.record_merges(d, ["C1", "U1"], {"C1", "U1"}, 25.0,
-                                     score, uncovered={"U1"})
-        self.assertEqual([(e["tid"], e["gain"]) for e in events], [("U1", None)])
-        self.assertIsNone(d["history"][-1]["gain"])
-        self.assertEqual(d["no_gain"], 1)  # Neither increment nor reset.
-        self.assertEqual(d["active_mark"], 25.0)
-        self.assertEqual(d["counted"], ["C1", "U1"])
-
-        events = drift.record_merges(d, ["C1", "U1", "C2"], {"C1", "U1", "C2"},
-                                     40.0, score, uncovered={"U1"})
-        self.assertEqual([(e["tid"], e["gain"]) for e in events], [("C2", False)])
-        self.assertEqual(d["no_gain"], 2)
-        self.assertEqual(d["active_mark"], 40.0)
-
-
-class UncoveredConductorTests(DriftHarness):
-    def test_three_merges_without_covers_never_trigger_no_coverage_gain_stall(self):
-        c = self.conductor(*(btask(f"T{i}") for i in range(1, 4)), manager=False)
-        snapshots = []
-        for tid in ("T1", "T2", "T3"):
-            self.finish(c, tid)
-            snapshots.append(self.dstate())
-        self.assertEqual(self.queue()["drift_marks"], ["T1", "T2", "T3"])
-        self.assertEqual([self.task_rec(tid)["status"] for tid in ("T1", "T2", "T3")],
-                         ["done", "done", "done"])
-        with self.subTest(check="no stall sent to keeper"):
-            self.assertFalse(any("no coverage gain" in p.lower() for p in self.keeper_prompts))
-        with self.subTest(check="no pause or replan question"):
-            self.assertFalse((self.state / "PAUSED").exists())
-            self.assertFalse(any("Q-replan" in subject for subject, _ in self.mails))
-        for index, d in enumerate(snapshots, 1):
-            with self.subTest(merge=index):
-                self.assertEqual(d["no_gain"], 0)
-                self.assertIsNone(d["stall"])
-                self.assertIsNone(d["replan"])
-                self.assertEqual([e["gain"] for e in d["history"]], [None] * index)
-
-
 if __name__ == "__main__":
     unittest.main()

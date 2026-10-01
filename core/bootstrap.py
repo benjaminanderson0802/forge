@@ -2502,8 +2502,7 @@ class Conductor:
 
             def score(done: set, reqs=reqs):
                 return cov_mod.compute(reqs, tasks, done).score
-        uncovered = {t["id"] for t in tasks if not t.get("covers")}  # R62
-        if drift_mod.record_merges(d, marks, verified, activity, score, deferred, uncovered):
+        if drift_mod.record_merges(d, marks, verified, activity, score, deferred):
             dirty = True
         if not d.get("stall") and not d.get("replan"):
             n = int(self._int_limit("drift_no_gain_merges", 3))
