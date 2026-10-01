@@ -182,6 +182,12 @@ def _dur(s) -> str:
     return fmt_dur(s)
 
 
+def _elapsed(s: float) -> str:
+    """A ticking timer's text: seconds shown under an hour (the page's script uses the same format)."""
+    s = max(0, int(s))
+    return f"{s // 60}m {s % 60:02d}s" if s < 3600 else _dur(s)
+
+
 def _clock(iso, local_tz, fmt: str = "%H:%M") -> str:
     try:
         return channel.to_local(datetime.fromisoformat(iso), local_tz).strftime(fmt)
@@ -221,7 +227,7 @@ def _live_lane(lane: dict, med: dict, local_tz) -> str:
             f"{_e(ROLE_LETTER.get(str(role), '?'))}</span><div><div><span class=rolename>{_e(_role_label(role))}"
             f"</span> {'are' if role == 'judge' else 'is'} working on {what}</div>"
             f"<div class='muted small'>started {_e(_clock(cur.get('started'), local_tz))} &middot; "
-            f"<span data-since=\"{_e(cur.get('started'))}\">{_e(_dur(el))}</span> elapsed</div></div></div>"
+            f"<span data-since=\"{_e(cur.get('started'))}\">{_e(_elapsed(el))}</span> elapsed</div></div></div>"
             f"<div class=meter><div class=lbl><span class=small>Stage: {_e(stage_txt)}</span>"
             f"<span class='muted small'>estimate{': ' + _e(src) if src else ''}</span></div>"
             f"<div class=bar role=progressbar aria-label=\"stage progress\" aria-valuenow=\"{round(frac * 100)}\" "
@@ -423,7 +429,7 @@ def live_section(snap: dict, local_tz=None) -> str:
 
 
 _LIVE_JS = """(function(){
-function fmt(s){s=Math.max(0,Math.round(s));if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';
+function fmt(s){s=Math.max(0,Math.floor(s));if(s<3600)return Math.floor(s/60)+'m '+(s%60<10?'0':'')+s%60+'s';
 if(s<86400){var m=Math.floor(s%3600/60);return Math.floor(s/3600)+'h '+(m<10?'0':'')+m+'m';}
 return Math.floor(s/86400)+'d '+Math.floor(s%86400/3600)+'h';}
 function tick(){var now=Date.now();document.querySelectorAll('[data-since]').forEach(function(el){
