@@ -322,8 +322,10 @@ class BootstrapTests(Harness):
         """Spec: drift keeper replan result creates PAUSED and emails a replan question."""
         c=self.init(agents={"test_writer":self.write_tests,"builder":self.build_feature,"drift_keeper":lambda p,c: ('{"status":"replan","reasons":"design drift"}',1)})
         c.step(); c.step(); c.step()
-        self.assertTrue((self.state/"PAUSED").exists())
-        self.assertTrue(any("replan" in s.lower() for s,b in self.mails))
+        self.assertFalse((self.state/"PAUSED").exists())
+        self.assertEqual(sum(s.startswith("[Forge] FYI:") for s, b in self.mails), 1)
+        self.assertFalse(any(q.get("kind") == "replan" and q.get("status") == "open"
+                             for q in c._read("questions.json", {}).values()))
 
     def test_plan_task_commits_plan_and_appends_build_tasks(self):
         """Spec: reviewed plan task commits plan_file and appends normalized build tasks."""
@@ -495,8 +497,10 @@ class BootstrapTests(Harness):
         c=self.init(agents={"test_writer":self.write_tests,"builder":self.build_feature,"drift_keeper":lambda p,c: ("not json",1)})
         c.step(); c.step()
         for _ in range(3): c.step()
-        self.assertTrue((self.state/"PAUSED").exists())
-        self.assertTrue(any("[Forge Q-" in s for s,b in self.mails))
+        self.assertFalse((self.state/"PAUSED").exists())
+        self.assertEqual(sum(s.startswith("[Forge] FYI:") for s, b in self.mails), 1)
+        self.assertFalse(any(q.get("kind") == "replan" and q.get("status") == "open"
+                             for q in c._read("questions.json", {}).values()))
 
     def test_r7_mail_and_inbox_failures_are_recovered(self):
         """R7: failed sends are retried and inbox exceptions are logged without escaping."""
