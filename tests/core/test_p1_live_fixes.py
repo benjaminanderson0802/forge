@@ -187,7 +187,7 @@ class TreeKillTests(Harness):
         self.assertTrue(self.gone(int(self.pidfile.read_text())))
 
     def test_judge_honours_kill(self):
-        self.c.limits["test_timeout_s"] = 60
+        self.c.limits["test_timeout_s"] = self.c.limits["judge_timeout_s"] = 60  # R55
         threading.Timer(0.5, lambda: (self.state / "KILL").write_text("stop")).start()
         t0 = time.monotonic()
         with self.assertRaises(Stopped):
