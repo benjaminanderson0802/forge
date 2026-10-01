@@ -9,6 +9,7 @@ the Team's agents (core.agents interface). Ben is reached only by email.
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
 import hashlib
 import inspect
@@ -112,6 +113,7 @@ S_PLAN = _obj({"tasks": {"type": "array", "items": _obj(
     {"id": _STR, "title": _STR, "section": _STR, "files_in_scope": _STRS, "test_files": _STRS, "test_cmd": _STR,
      "needs": {"type": "array", "items": {"type": "string"}},
      "covers": {"type": "array", "items": {"type": "string"}},
+     "evidence": {"type": "boolean"},
      "depends_on": {"type": "array", "items": {"type": "string"}}},
     list(TASK_FIELDS))}}, ["tasks"])
 
@@ -1797,11 +1799,37 @@ class Conductor:
                 f"Done means this passes: {t.get('test_cmd', '')}\n")
 
     # ------------------------------------------------------------------ stage A: tests
+    def _covers_text(self, t: dict) -> str:
+        """R63: the requirements an evidence task proves, with their spec text when the spec has them."""
+        spec = self._spec()
+        reqs = spec[1] if spec else {}
+        ids = [str(c) for c in t.get("covers") or []]
+        return ("\nREQUIREMENTS TO PROVE (covers):\n" + "\n".join(f"{c}: {reqs.get(c, '')}".rstrip(": ")
+                                                           for c in ids) + "\n") if ids else ""
+
+    def _evidence_review(self, t: dict, sha: str, twt) -> str:
+        """R63: an evidence task is judged on its tests: they must prove every requirement in covers."""
+        if t.get("evidence") is not True:
+            return ""
+        text = []
+        for f in t["test_files"]:
+            try:
+                text.append(f"--- {f}\n" + _git(twt, "show", f"{sha}:{_norm(f)}"))
+            except Exception:  # noqa: BLE001 - a missing file is shown as missing
+                text.append(f"--- {f}: missing")
+        return ("\nEVIDENCE TASK (R63): the code already existed, so the diff may be empty. Fail it when the "
+                "tests below don't prove every requirement in covers." + self._covers_text(t) +
+                "\nTESTS:\n" + "\n".join(text)[:40000] + "\n")
+
     def _tests_stage(self, tid: str) -> None:
         t = self._task(tid)
         self._reset_wt()
+        evidence = t.get("evidence") is True  # R63
+        goal = (" The code already exists: these are evidence tests (R63). They must prove the requirements in "
+                "covers against the existing code, so they must pass now, and must fail if the in-scope code were "
+                "emptied." + self._covers_text(t) if evidence else " The tests must fail until the feature exists.")
         prompt = (role_text(self.repo, "test_writer") + "\n\nWrite only these files: " + ", ".join(t["test_files"]) +
-                  ". The tests must fail until the feature exists. Do not write any other file.\n\n" +
+                  "." + goal + " Do not write any other file.\n\n" +
                   self._task_prompt(t) + "\nAnswer with JSON: {\"files\": [...], \"summary\": \"...\"}")
         try:
             r = self._call("test_writer", prompt, S_TESTS)
@@ -1820,7 +1848,15 @@ class Conductor:
         else:
             code, out, timed_out = self._run_tests(t)
             why = real_failing_run(code, out, timed_out)
-            if why == "passed":
+            if evidence:  # R63: a real passing run, then the unchanged empty-implementation check
+                if why == "passed":
+                    reason = self._empty_impl_check(t, changed)
+                elif why:
+                    reason = f"tests rejected: no real passing run ({why})"
+                else:
+                    reason = ("tests rejected: evidence tests fail on the current code (re-cut as an ordinary "
+                              "task that fixes the gap): " + (out or "")[-1500:])
+            elif why == "passed":
                 reason = "tests rejected: weak (they pass before the feature exists)"
             elif why:
                 reason = "tests rejected: no real failing run (timed out or no tests ran)"
@@ -1888,6 +1924,9 @@ class Conductor:
 
         prompt = role_text(self.repo, "builder") + "\n\nMake the tests pass by changing only the files you may change.\n\n" + \
                  self._task_prompt(t)
+        if t.get("evidence") is True:  # R63
+            prompt += ("\nEVIDENCE TASK (R63): the tests already pass on the current code. Change nothing unless a "
+                       "test or judge fails; then answer done.\n")
         if t.get("review_feedback"):
             prompt += "\nREVIEW FEEDBACK:\n" + "\n".join(f"- {x}" for x in t["review_feedback"]) + "\n"
         if t.get("trouble_notes"):
@@ -2003,7 +2042,8 @@ class Conductor:
         try:
             rv = self._call("reviewer", role_text(self.repo, "reviewer") + "\n\nCheck this change against the task. "
                                         "Reject shortcuts, bare-minimum work, drift from the task, and anything that "
-                                        "weakens tests.\n\n" + self._task_prompt(t) + "\nDIFF:\n" + diff[:60000] +
+                                        "weakens tests.\n\n" + self._task_prompt(t) + self._evidence_review(t, sha, twt) +
+                            "\nDIFF:\n" + diff[:60000] +
                             self._mutation_evidence(mres) +
                             "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...]}", S_REVIEW,
                             cwd=twt)  # the task worktree is at exactly S
@@ -2190,20 +2230,64 @@ class Conductor:
         """Layer-1 design 3.4: mutate the builder's changed in-scope lines (base..sha) and run the task tests on each
         mutant, in `root`, a throwaway worktree at exactly sha. It must be exactly sha afterwards (else an R13
         stage error)."""
-        tests = {_norm(x) for x in t["test_files"]}
-        diff = _git(root, "diff", "-U0", f"{base}..{sha}")
-        changed = {f: lines for f, lines in changed_lines(diff).items()
-                   if f not in tests and any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])}
+        changed = self._mutation_targets(t, base, sha, root)
         timeout = float(self.limits.get("test_timeout_s", 600))
         t0 = self.clock()
         try:
             mres = self._run_mutation(root, changed, t, timeout, baseline)
+            if t.get("evidence") is True and mres.total == 0:  # R63: no mutants proves nothing
+                mres.passed = False
+                mres.reason = ("evidence task: no mutants were generated from the in-scope code its tests "
+                               "name, so the tests prove nothing about it")
         finally:
             self._activity().add(self._since(t0))  # T1C4: judges are active work
         if self._changed(cwd=root) or _git(root, "rev-parse", "HEAD") != sha:
             self._reset_to(root, sha)
             raise RuntimeError("mutation left changes")
         return mres
+
+    def _mutation_targets(self, t: dict, base: str, sha: str, root: Path) -> dict[str, set[int]]:
+        """Changed in-scope lines (base..sha). R63: an evidence task also targets every line of each in-scope
+        function or method its test files name as a word; if nothing is selected, every line of the in-scope .py
+        files."""
+        tests = {_norm(x) for x in t["test_files"]}
+
+        def in_scope(f: str) -> bool:
+            return f not in tests and any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])
+
+        diff = _git(root, "diff", "-U0", f"{base}..{sha}")
+        out: dict[str, set[int]] = {f: set(lines) for f, lines in changed_lines(diff).items() if in_scope(f)}
+        if t.get("evidence") is not True:
+            return out
+
+        def is_test(f: str) -> bool:  # R63: evidence never mutates any test file, this task's or another's
+            return f.startswith("tests/") or "/tests/" in f or Path(f).name.startswith("test_")
+
+        out = {f: lines for f, lines in out.items() if not is_test(f)}
+        words = set()
+        for f in tests:
+            try:
+                words |= set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", (root / f).read_text(encoding="utf-8")))
+            except (OSError, UnicodeDecodeError):
+                pass
+        files = [_norm(x) for x in _git(root, "ls-files").splitlines() if x.strip()]
+        files = [f for f in files if f.endswith(".py") and in_scope(f) and not is_test(f)]
+        named: dict[str, set[int]] = {}
+        texts: dict[str, str] = {}
+        for f in files:
+            try:
+                texts[f] = (root / f).read_text(encoding="utf-8")
+                tree = ast.parse(texts[f])
+            except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in words:
+                    named.setdefault(f, set()).update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+        if not named:  # the tests name no in-scope code: target it all
+            named = {f: set(range(1, len(texts[f].splitlines()) + 1)) for f in texts}
+        for f, lines in named.items():
+            out.setdefault(f, set()).update(lines)
+        return out
 
     def _run_mutation(self, root: Path, changed: dict, t: dict, timeout: float, baseline: float):
         return run_mutation(root, changed,
@@ -2652,6 +2736,9 @@ class Conductor:
                            "Each task may also list \"depends_on\": ids of earlier tasks in this plan whose code it "
                            "uses. It is not started (tests or build) until those are done and merged, and its "
                            "builder works on top of their code (R55).\n" + cover_text +
+                           "A task may set \"evidence\": true (R63) when the existing code already meets its "
+                           "requirements: its tests must then pass on the current code and prove them, and the "
+                           "builder changes nothing. Requirements the code does not meet yet get ordinary tasks.\n"
                            "IMPORTANT (R41): each task's section is the ONLY instruction the test writer and the "
                            "builder will see. Make it complete and self-contained: what to build, exact interfaces "
                            "and signatures, behaviour, edge cases, dependencies on earlier tasks, and the acceptance "
@@ -2747,6 +2834,8 @@ class Conductor:
             nt["kind"], nt["status"] = "build", "todo"
             if isinstance(x.get("needs"), list):
                 nt["needs"] = list(x["needs"])
+            if x.get("evidence") is True:  # R63
+                nt["evidence"] = True
             if reqs:  # R62: validated above; ignored without a spec or under no_coverage
                 nt["covers"] = list(x["covers"])
             deps = x.get("depends_on")
