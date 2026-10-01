@@ -8,7 +8,7 @@ files and never writes them, with one exception: the Stop button creates `state/
 applied here; they go to the conductor through the answer drop folder (core.channel), which checks each one exactly
 like an email reply. Standard library only.
 
-R58 lanes: with the shared folder (state/shared) the usage bars are the shared meter's and mail budget's (every lane
+R60 lanes: with the shared folder (state/shared) the usage bars are the shared meter's and mail budget's (every lane
 together), Stop also writes the global KILL that stops every lane, and a "Lanes" section shows each other lane's
 queue and current task. Answers on this page are for the main lane's questions; other lanes are answered by email.
 """
@@ -99,7 +99,7 @@ def progress(forge_root: Path, tasks: list[dict]) -> dict:
 
 
 def _lanes_html(state_root: Path) -> str:
-    """R58: each lane other than main: its layer, current task, flags and queue."""
+    """R60: each lane other than main: its layer, current task, flags and queue."""
     out = []
     for name in lanes.listed(state_root)[1:]:
         st = lanes.state_dir(state_root, name)
@@ -126,7 +126,7 @@ def _lanes_html(state_root: Path) -> str:
 def render(state: Path, limits: dict, now: datetime | None = None, *, local_tz=None,
            shared: Path | None = None) -> str:
     """The whole page as HTML. Pure apart from reading state files; every value is escaped.
-    R58: with `shared`, usage is every lane's together and the other lanes are listed."""
+    R60: with `shared`, usage is every lane's together and the other lanes are listed."""
     state = Path(state)
     mail_state = Path(shared) if shared is not None else state
     now = now or datetime.now(timezone.utc)
@@ -367,7 +367,7 @@ def make_server(state: Path, channel_dir: Path, limits: dict, host: str = "127.0
             form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace")).items()}
             if path == "/stop":  # D-024: one of the three equal ways to stop Forge
                 (state / "KILL").write_text("stopped from the status page\n", encoding="utf-8")
-                if shared is not None:  # R58: the global KILL stops every lane
+                if shared is not None:  # R60: the global KILL stops every lane
                     (Path(shared) / "KILL").write_text("stopped from the status page\n", encoding="utf-8")
                 return self._send(303, "", location="/")
             qid, code, answer = form.get("qid", ""), form.get("code", ""), form.get("answer", "").strip()

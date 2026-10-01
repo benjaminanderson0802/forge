@@ -237,7 +237,7 @@ class Stopped(Capped):
 
 
 STOP_FILES = ("KILL", "PAUSED")
-SHARED_PREFIX = "shared/"  # R58: fingerprint keys of files in state/shared
+SHARED_PREFIX = "shared/"  # R60: fingerprint keys of files in state/shared
 DROP_PREFIX = "channel/in/"  # fingerprint keys of the answer drop folder (never a state/ path: state has no channel/)
 STOP_MARK = "agent stopped:"  # R49: core.agents.Stopped's message; an agent killed by a stop flag reports it
 
@@ -307,7 +307,7 @@ class Conductor:
                  checks: dict | None = None, probes: dict | None = None, manager=None,
                  shared: Path | None = None, lane: str = lanes_mod.MAIN):
         self.repo, self.work, self.state = Path(repo), Path(work), Path(state)
-        # R58 lanes: `shared` is state/shared (meter, holds, mail log, inbox_seen, the global KILL), shared by every
+        # R60 lanes: `shared` is state/shared (meter, holds, mail log, inbox_seen, the global KILL), shared by every
         # lane. None keeps the single-conductor layout where all of those live in `state`.
         self.shared = Path(shared) if shared is not None else None
         self.lane = lane
@@ -373,7 +373,7 @@ class Conductor:
     def _queue(self) -> dict:
         return self._read("queue.json", {"layer": "", "tasks": []})
 
-    # ------------------------------------------------------------------ R58 lanes: shared files and stops
+    # ------------------------------------------------------------------ R60 lanes: shared files and stops
     def _shared_read(self, name: str, default):
         """A shared accumulate file (mail_log.json): in state/shared with lanes, else in this conductor's state."""
         if self.shared is None:
@@ -550,7 +550,7 @@ class Conductor:
             raise RuntimeError("state file unreadable before agent run: " + ", ".join(unreadable))
         if not before.get(LOCK_NAME, "lock:0:").startswith("lock:0:"):  # R15: only an empty lock is trusted
             raise RuntimeError(f"state file {LOCK_NAME} is not empty before agent run")
-        try:  # R58: the shared accumulate files are checked for loss instead of fingerprinted
+        try:  # R60: the shared accumulate files are checked for loss instead of fingerprinted
             acc_before = lanes_mod.accumulators(self.shared) if self.shared is not None else None
         except OSError as e:
             raise RuntimeError(f"shared state could not be read before agent run: {type(e).__name__}: {e}") from e
@@ -583,7 +583,7 @@ class Conductor:
         try:
             after = self._fingerprint()
             changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
-            if acc_before is not None:  # R58: the meter (and the other accumulate files) may never decrease
+            if acc_before is not None:  # R60: the meter (and the other accumulate files) may never decrease
                 changed += lanes_mod.shrunk(acc_before, lanes_mod.accumulators(self.shared), self.clock())
         except Exception as e:  # noqa: BLE001 - R15: a check that can't complete counts as tampering
             changed = [f"state could not be fingerprinted after the run: {type(e).__name__}: {e}"]
@@ -596,7 +596,7 @@ class Conductor:
             raise Stopped(", ".join(changed))
         if changed:
             (self.state / "KILL").write_text("state tampered during an agent run\n")
-            if self.shared is not None:  # R58: the lanes share caps and state; a tamper alarm stops them all
+            if self.shared is not None:  # R60: the lanes share caps and state; a tamper alarm stops them all
                 self._stop_all(f"state tampered during a {role} run in lane {self.lane}\n")
             try:
                 self._log(f"TAMPER during {role} run {run_id}: {changed}")
@@ -674,7 +674,7 @@ class Conductor:
 
     def _stop_flags(self) -> list[str]:
         flags = [f for f in STOP_FILES if (self.state / f).exists()]
-        if self.shared is not None and (self.shared / "KILL").exists():  # R58: the global KILL
+        if self.shared is not None and (self.shared / "KILL").exists():  # R60: the global KILL
             flags.append(SHARED_PREFIX + "KILL")
         return flags
 
@@ -711,7 +711,7 @@ class Conductor:
                     f = Path(root) / name
                     rel = DROP_PREFIX + f.relative_to(drop).as_posix()
                     fp[rel] = self._signature(f, rel)
-        # R58: with lanes, the shared folder too, except the files other lanes legitimately write at any time: the
+        # R60: with lanes, the shared folder too, except the files other lanes legitimately write at any time: the
         # accumulate files (checked by _shrunk_shared: they may only grow), the shared lock, and atomic-replace
         # temporaries. Anything else there (the global KILL, a stray file) is fingerprinted like this lane's own.
         if self.shared is not None and self.shared.is_dir():
@@ -1191,7 +1191,7 @@ class Conductor:
         seq = self._read("q_seq.json", {"n": len(qs)})
         seq["n"] = int(seq.get("n", 0)) + 1
         self._write("q_seq.json", seq)
-        qid = f"{kind}-{seq['n']}" if self.lane == lanes_mod.MAIN else f"{self.lane}-{kind}-{seq['n']}"  # R58
+        qid = f"{kind}-{seq['n']}" if self.lane == lanes_mod.MAIN else f"{self.lane}-{kind}-{seq['n']}"  # R60
         code = secrets.token_urlsafe(6)[:8]
         qs[qid] = {"kind": kind, "status": "open", "code": code, "subject": str(subject)[:SUBJECT_CAP],
                    "body": str(body)[:BODY_CAP], "delivered": False, **extra}  # R28
@@ -1219,7 +1219,7 @@ class Conductor:
                 return False
         from email.utils import make_msgid
 
-        def reserve(log: dict) -> str | None:  # R58: one locked transaction when every lane shares the budget
+        def reserve(log: dict) -> str | None:  # R60: one locked transaction when every lane shares the budget
             sent = [x for x in log.get("sent", []) if (now - datetime.fromisoformat(x)).total_seconds() < 86400]
             hour = [x for x in sent if (now - datetime.fromisoformat(x)).total_seconds() < 3600]
             if len(hour) >= int(self.limits.get("mail_per_hour", 6)) or \
@@ -1320,14 +1320,14 @@ class Conductor:
                     continue
                 subject, body = str(m.get("subject", "")), clean_reply(str(m.get("body", "")))
                 if is_stop(subject, body):
-                    self._stop_all("stopped by owner email\n")  # R58: a STOP stops every lane
+                    self._stop_all("stopped by owner email\n")  # R60: a STOP stops every lane
                     rest = [dict(x, body=clean_reply(str(x.get("body", "")))) for x in batch[i + 1:]
                             if isinstance(x, dict)]
                     if rest:  # R35: kept for after the restart, never lost
                         self._write("inbox_pending.json", rest[-50:])
                     return  # R24: nothing after a STOP is processed now
                 mq = re.search(r"\[Forge Q-([\w-]+) ([\w-]{8})\]", subject)
-                if mq and lanes_mod.qid_lane(mq.group(1), names):  # R58: main hands it to the lane that asked
+                if mq and lanes_mod.qid_lane(mq.group(1), names):  # R60: main hands it to the lane that asked
                     lanes_mod.route(self.state, lanes_mod.qid_lane(mq.group(1), names),
                                     {"from": m.get("from", ""), "subject": subject, "body": body,
                                      "message_id": m.get("message_id", "")})
@@ -2852,9 +2852,9 @@ class Conductor:
                        f"{failed[:3000]}\n\nNo pull request was opened. Forge runs it again when the layer changes.")
         return not failed
 
-    # ------------------------------------------------------------------ R58: layers stay current with main
+    # ------------------------------------------------------------------ R60: layers stay current with main
     def _sync_busy(self, q: dict, wt: Path) -> str:
-        """R58: why the layer can't take a main merge right now ("" when it can)."""
+        """R60: why the layer can't take a main merge right now ("" when it can)."""
         if Journal(self.state).active():
             return "a finalization is active"
         contracts = self._ledger().contracts()
@@ -2873,7 +2873,7 @@ class Conductor:
         return ""
 
     def _sync_with_main(self) -> str:
-        """R58: when nothing is mid-stage, merge origin/main into the layer (no-ff, by Forge) so new task
+        """R60: when nothing is mid-stage, merge origin/main into the layer (no-ff, by Forge) so new task
         worktrees start from current main code. Fetches at most every MAIN_SYNC_EVERY_S. A conflict is aborted
         and asked about once ("merge" question); the layer keeps its old base. Returns what happened."""
         try:
@@ -3070,7 +3070,7 @@ def gmail_inbox(owner: str, state: Path, imap_factory: Callable | None = None,
                 m.logout()
             except Exception:  # noqa: BLE001
                 pass
-        lanes_mod.write_bytes_atomic(seen_path, json.dumps(seen[-2000:]).encode("utf-8"))  # R58: other lanes read it
+        lanes_mod.write_bytes_atomic(seen_path, json.dumps(seen[-2000:]).encode("utf-8"))  # R60: other lanes read it
         return out
     return read
 
@@ -3254,7 +3254,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--tasks")
     ap.add_argument("--owner", default="benjaminanderson0802@gmail.com")
     ap.add_argument("--work", default=str(Path.home() / "Forge-work"))
-    ap.add_argument("--lane", default=lanes_mod.MAIN, help="R58: which lane's conductor (default: main)")
+    ap.add_argument("--lane", default=lanes_mod.MAIN, help="R60: which lane's conductor (default: main)")
     a = ap.parse_args(argv)
     problem = lanes_mod.name_problem(a.lane)
     if problem:
@@ -3262,7 +3262,7 @@ def main(argv: list[str]) -> int:
         return 2
     limits = load_limits(forge)
     root = forge / "state"
-    lanes_mod.migrate(root)  # R58: today's main-lane meter, holds and mail log become the shared ones (once)
+    lanes_mod.migrate(root)  # R60: today's main-lane meter, holds and mail log become the shared ones (once)
     state, shared = lanes_mod.state_dir(root, a.lane), lanes_mod.shared_dir(root)
     work = lanes_mod.work_dir(Path(a.work), a.lane)
     if a.cmd == "status":
@@ -3283,7 +3283,7 @@ def main(argv: list[str]) -> int:
         if (shared / "KILL").exists():
             print("global KILL is set (every lane is stopped)")
         return 0
-    # R58: only the main lane reads Ben's email; it routes replies to other lanes' questions to those lanes.
+    # R60: only the main lane reads Ben's email; it routes replies to other lanes' questions to those lanes.
     inbox = gmail_inbox(a.owner, shared) if a.lane == lanes_mod.MAIN else \
         lanes_mod.routed_inbox(lanes_mod.state_dir(root, lanes_mod.MAIN), a.lane, state)
     c = Conductor(forge, work, state, real_team(limits), limits, owner_email=a.owner,
@@ -3316,7 +3316,7 @@ def main(argv: list[str]) -> int:
     health = None
     try:
         if a.cmd == "run":
-            health = service.Health(lanes_mod.service_dir(root, a.lane), limits).start()  # T1D2, R58: per lane
+            health = service.Health(lanes_mod.service_dir(root, a.lane), limits).start()  # T1D2, R60: per lane
             if not _start_session(c, health):
                 return 0
         if a.cmd == "smoke" or _smoke_stale(c.state, c.clock()):

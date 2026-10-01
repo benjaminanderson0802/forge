@@ -16,7 +16,7 @@ from typing import Callable
 
 
 class Meter:
-    """R58 (lanes): with `lock` (a core.lanes.SharedLock) the meter and holds are shared by several conductor
+    """R60 (lanes): with `lock` (a core.lanes.SharedLock) the meter and holds are shared by several conductor
     processes: every read-modify-write happens under that lock, and `runs_dirs` lists every lane's runs/ folder so
     agent_runs_per_day counts launches across all lanes. Without them it is the single-conductor meter."""
 
@@ -57,7 +57,7 @@ class Meter:
     def add(self, provider: str, tokens: int) -> None:
         if tokens < 0:
             raise ValueError("tokens must be >= 0")
-        with self._locked():  # R58: one read-modify-write at a time across every lane
+        with self._locked():  # R60: one read-modify-write at a time across every lane
             data = self._read()
             day = data.setdefault(self._day(), {})
             day[provider] = int(day.get(provider, 0)) + tokens

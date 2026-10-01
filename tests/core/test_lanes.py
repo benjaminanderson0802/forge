@@ -1,4 +1,4 @@
-"""R58 lanes: several conductors side by side, each with its own queue, layer branch and worktrees, sharing one set of
+"""R60 lanes: several conductors side by side, each with its own queue, layer branch and worktrees, sharing one set of
 caps (token meter, holds, runs per day, mail budget) and one kill switch. Driven by local fakes and, for the shared
 lock, real processes."""
 import json
@@ -267,7 +267,7 @@ class TamperAcrossLanes(LaneHarness):
 
     def test_editing_another_lanes_queue(self):
         """Caught when that lane has an agent running (its own fingerprint); not caught by the editing lane, which
-        can't tell an agent's write to another lane's state from that lane's conductor (the known limit, R58)."""
+        can't tell an agent's write to another lane's state from that lane's conductor (the known limit, R60)."""
         def edit_main_queue(cwd):
             q = self.sroot / "bootstrap" / "queue.json"
             data = json.loads(q.read_text())

@@ -1,4 +1,4 @@
-"""Lanes (amendment R58 of docs/specs/bootstrap-conductor.md): several conductors side by side, sharing one set of caps.
+"""Lanes (amendment R60 of docs/specs/bootstrap-conductor.md): several conductors side by side, sharing one set of caps.
 
 Within one conductor agents run one at a time, because the after-run tamper check (R9/R14) would see the
 conductor's own writes for another task. A lane is a separate conductor process with its own state dir, queue,

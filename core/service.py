@@ -8,7 +8,7 @@ state/bootstrap/, so the heartbeat thread can write while an agent runs without 
     python -m core.service wake        # end the service's sleep now
     python -m core.service watchdog    # run every 5 minutes by the "Forge watchdog" task
 
-R58 lanes: `stop` writes the global KILL (state/shared/KILL), which stops every lane (`--lane NAME` stops one);
+R60 lanes: `stop` writes the global KILL (state/shared/KILL), which stops every lane (`--lane NAME` stops one);
 the watchdog checks every lane in state/lanes.json plus main; each lane beats in its own service folder
 (state/service/ for main, state/service/<lane>/ for the others).
 """
@@ -229,7 +229,7 @@ class Service:
         self.mode = mode(None, limits)
 
     def _killed(self) -> bool:
-        kill_set = getattr(self.c, "_kill_set", None)  # R58: the lane's KILL or the global one
+        kill_set = getattr(self.c, "_kill_set", None)  # R60: the lane's KILL or the global one
         return bool(kill_set()) if callable(kill_set) else (Path(self.c.state) / "KILL").exists()
 
     def nap(self, seconds: float) -> None:
@@ -281,7 +281,7 @@ def _next_utc_midnight(now: datetime) -> datetime:
 
 def snapshot(bootstrap_state: Path, root: Path, limits: dict, now: datetime | None = None,
              shared: Path | None = None) -> dict:
-    """Everything the status page and the daily digest (1E) need, read-only. With `shared` (R58 lanes) the usage
+    """Everything the status page and the daily digest (1E) need, read-only. With `shared` (R60 lanes) the usage
     is the shared meter's (every lane together) and the global KILL counts as a stop."""
     from core.usage import Meter
     st, root = Path(bootstrap_state), Path(root)
@@ -341,7 +341,7 @@ def snapshot(bootstrap_state: Path, root: Path, limits: dict, now: datetime | No
 
 
 def shared_meter(shared: Path, clock):
-    """R58: the meter every lane shares (state/shared), counting runs across all lanes."""
+    """R60: the meter every lane shares (state/shared), counting runs across all lanes."""
     from core import lanes
     from core.usage import Meter
     shared = Path(shared)
@@ -372,7 +372,7 @@ def watchdog(forge: Path, limits: dict, *, now: float | None = None,
     """Every 5 minutes. A dead service (lock free, heartbeat stale) is started; a hung one (lock still held,
     heartbeat stale) is ended and started, because while its task instance runs the task's own 5-minute
     trigger is ignored. Never acts while KILL is set, and never on a lock holder that wrote no heartbeat.
-    R58: one lane at a time (its state, heartbeat and "Forge conductor <lane>" task); the global KILL stops all."""
+    R60: one lane at a time (its state, heartbeat and "Forge conductor <lane>" task); the global KILL stops all."""
     from core import lanes
     sroot = Path(forge) / "state"
     st, root = lanes.state_dir(sroot, lane), lanes.service_dir(sroot, lane)
@@ -407,7 +407,7 @@ def watchdog(forge: Path, limits: dict, *, now: float | None = None,
 
 
 def watchdog_all(forge: Path, limits: dict, **kw) -> dict[str, str]:
-    """R58: the watchdog for every lane in state/lanes.json, plus main. One lane's error never skips the others."""
+    """R60: the watchdog for every lane in state/lanes.json, plus main. One lane's error never skips the others."""
     from core import lanes
     out = {}
     for lane in lanes.listed(Path(forge) / "state"):
@@ -425,7 +425,7 @@ def main(argv: list[str], forge: Path | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m core.service")
     ap.add_argument("cmd", choices=["status", "stop", "wake", "watchdog"])
     ap.add_argument("--reason", default="stopped from the command line")
-    ap.add_argument("--lane", default=None, help="R58: one lane only (stop, wake, status)")
+    ap.add_argument("--lane", default=None, help="R60: one lane only (stop, wake, status)")
     a = ap.parse_args(argv)
     from core import lanes
     lane = a.lane or lanes.MAIN
@@ -442,7 +442,7 @@ def main(argv: list[str], forge: Path | None = None) -> int:
     if a.cmd == "stop":
         request_stop(st, a.reason)  # this lane's KILL (main: state/bootstrap/KILL, as before)
         if a.lane is None:
-            request_stop(lanes.shared_dir(sroot), a.reason)  # R58: and the global KILL, which stops every lane
+            request_stop(lanes.shared_dir(sroot), a.reason)  # R60: and the global KILL, which stops every lane
         print("Forge is stopped. Nothing new will start. Run Start Forge to resume.")
     elif a.cmd == "wake":
         wake(root)

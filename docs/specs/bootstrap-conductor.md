@@ -468,9 +468,10 @@ Fixes made when 1B, the R42–R48 amendments, 1C, 1D and 1E were merged into one
   - **Never fatal:** a git error is logged and retried at the next fetch window; the step goes on.
 
 - **R59 A task's judges skip tests of layer tasks not built yet** (found by Forge's own troubleshooter in the gate run, 2026-10-01). Stage A writes and commits a task's acceptance tests before earlier tasks merge, so the layer branch holds tests whose code doesn't exist yet. The suite judge therefore failed every earlier task, every time. Now each per-task suite judge gets `--exclude <file>` for every test file of another build task in the layer that isn't `done`. A task's own test files are never excluded. A module that isn't excluded still fails the suite as before. The layer gate, where every task is done, and CI run everything.
+
 ## Lanes amendment (2026-10-01)
 
-Module: `core/lanes.py`, with hooks in `core/bootstrap.py`, `core/usage.py`, `core/service.py`, `core/status_page.py` and `scripts/start_conductor.ps1`. Tests: `tests/core/test_lanes.py`. This amendment was requested as "R56"; R56 and R57 were already taken above, so it is numbered **R58**.
+Module: `core/lanes.py`, with hooks in `core/bootstrap.py`, `core/usage.py`, `core/service.py`, `core/status_page.py` and `scripts/start_conductor.ps1`. Tests: `tests/core/test_lanes.py`. This amendment was requested as "R56"; R56 and R57 were already taken above, so it is numbered **R60**.
 
 - **R60 Lanes: parallel conductors with shared caps.** Within one conductor agents can't run at the same time: the after-run tamper check (R9/R14) would see the conductor's own writes for another task. A lane is a separate conductor process with its own state, so lanes run side by side and each lane's tamper check sees only its own state.
   - **Command line:** `python -m core.bootstrap <cmd> --lane NAME`. The default lane, `main`, keeps today's paths.
