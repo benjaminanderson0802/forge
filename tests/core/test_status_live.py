@@ -189,3 +189,28 @@ class LiveTests(ForgeFixture, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRound3(unittest.TestCase):
+    """R64 review round 3: a bad state file never takes the page's controls down."""
+
+    def test_bad_queue_and_meter_keep_live_stop_and_answers(self):
+        import tempfile
+        from datetime import timezone
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            state = root / "state" / "bootstrap"
+            state.mkdir(parents=True)
+            (state / "queue.json").write_text('{"tasks": null}', encoding="utf-8")
+            (state / "meter.json").write_text('{"2026-10-01": {"claude": "x", "codex": 1e999}}', encoding="utf-8")
+            (state / "questions.json").write_text(json.dumps({"gate-1": {
+                "kind": "gate", "status": "open", "code": "gatecode", "subject": "Ready?", "body": "b",
+                "delivered": True}}), encoding="utf-8")
+            html = status_page.render(state, {"claude_daily_token_cap": 10}, datetime(2026, 10, 1, 17, tzinfo=timezone.utc),
+                                      forge_root=root, nonce="n")
+            self.assertIn("<section id=live", html)
+            self.assertIn('action="/stop"', html)
+            self.assertIn('action="/answer"', html)
+            self.assertIn("Ready?", html)
+

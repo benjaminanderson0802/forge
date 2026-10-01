@@ -484,36 +484,43 @@ def render(state: Path, limits: dict, now: datetime | None = None, *, local_tz=N
         out.append(live_section(snap, local_tz))
     except Exception as e:  # noqa: BLE001
         out.append(f"<section id=live><p class=bad>Live view unavailable: {_e(type(e).__name__)}</p></section>")
-    tasks_all = [t for t in _read(state, "queue.json", {}).get("tasks", []) if isinstance(t, dict)]
-    pr = progress(state.parent.parent, tasks_all)
-    out.append("<h2>Progress</h2>")
-    if pr["phases"]:
-        out.append(_bar("Whole build (roadmap)", pr["overall"], 1.0,
-                        f"{pr['done']} of {pr['phases']} phases done; now: {pr['current'] or 'all done'}"))
-    out.append(_bar("Current phase's queue", pr["tasks_done"], pr["tasks"] or 1,
-                    f"{pr['tasks_done']} of {pr['tasks']} tasks done"))
-    if shared is not None:
-        from core.service import shared_meter
-        meter0 = shared_meter(Path(shared), lambda: now)
-    else:
-        meter0 = Meter(state, clock=lambda: now)
-    reset = channel.to_local(now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1), local_tz)
-    out.append("<h2>Usage today</h2>")
-    for p in PROVIDERS:
-        cap = limits.get(f"{p}_daily_token_cap")
-        used = meter0.used_today(p)
-        out.append(_bar(f"{p.capitalize()} tokens", used, cap or 1,
-                        f"{used / 1e6:.1f}M of {(cap or 0) / 1e6:.0f}M (resets {reset.strftime('%H:%M')})", usage=True))
-    rcap = limits.get("agent_runs_per_day")
-    if rcap:
-        try:
-            runs = meter0.runs_today()
-        except Exception:  # noqa: BLE001 - the page never breaks on a counter
-            runs = 0
-        out.append(_bar("Agent runs", runs, rcap, f"{runs} of {rcap}", usage=True))
-    mh0, md0 = _mail_used(mail_state, now)
-    out.append(_bar("Email to you", md0, limits.get("mail_per_day", 30),
-                    f"{md0} of {limits.get('mail_per_day', 30)} today, {mh0} this hour", usage=True))
+    meter0 = None
+    try:  # R64 review: a bad state file never takes the controls (Stop, Answer, Approve) down
+        tasks_all = [t for t in _read(state, "queue.json", {}).get("tasks", []) if isinstance(t, dict)]
+        pr = progress(state.parent.parent, tasks_all)
+        out.append("<h2>Progress</h2>")
+        if pr["phases"]:
+            out.append(_bar("Whole build (roadmap)", pr["overall"], 1.0,
+                            f"{pr['done']} of {pr['phases']} phases done; now: {pr['current'] or 'all done'}"))
+        if dashboard._jread(state / "queue.json", dict) is dashboard.BAD:
+            out.append("<p class=bad>Current phase's queue: unknown (queue.json can't be read right now)</p>")
+        else:
+            out.append(_bar("Current phase's queue", pr["tasks_done"], pr["tasks"] or 1,
+                            f"{pr['tasks_done']} of {pr['tasks']} tasks done"))
+        if shared is not None:
+            from core.service import shared_meter
+            meter0 = shared_meter(Path(shared), lambda: now)
+        else:
+            meter0 = Meter(state, clock=lambda: now)
+        reset = channel.to_local(now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1), local_tz)
+        out.append("<h2>Usage today</h2>")
+        for p in PROVIDERS:
+            cap = limits.get(f"{p}_daily_token_cap")
+            used = meter0.used_today(p)
+            out.append(_bar(f"{p.capitalize()} tokens", used, cap or 1,
+                            f"{used / 1e6:.1f}M of {(cap or 0) / 1e6:.0f}M (resets {reset.strftime('%H:%M')})", usage=True))
+        rcap = limits.get("agent_runs_per_day")
+        if rcap:
+            try:
+                runs = meter0.runs_today()
+            except Exception:  # noqa: BLE001 - the page never breaks on a counter
+                runs = 0
+            out.append(_bar("Agent runs", runs, rcap, f"{runs} of {rcap}", usage=True))
+        mh0, md0 = _mail_used(mail_state, now)
+        out.append(_bar("Email to you", md0, limits.get("mail_per_day", 30),
+                        f"{md0} of {limits.get('mail_per_day', 30)} today, {mh0} this hour", usage=True))
+    except Exception as e:  # noqa: BLE001
+        out.append(f"<p class=bad>The progress and usage section couldn't be read: {_e(type(e).__name__)}</p>")
     if (state / "KILL").exists() or (shared is not None and (Path(shared) / "KILL").exists()):
         out.append("<div class='banner stop'>Forge is stopped (KILL is set). It restarts only when you clear the "
                    "stop yourself.</div>")
@@ -543,54 +550,57 @@ def render(state: Path, limits: dict, now: datetime | None = None, *, local_tz=N
             "<textarea name=answer placeholder='Your answer (y, n, or free text)'></textarea>"
             f"{approve}<button type=submit>Answer</button></form></div>")
 
-    q = _read(state, "queue.json", {})
-    tasks = [t for t in q.get("tasks", []) if isinstance(t, dict)]
-    current = next((t for t in tasks if t.get("status") in ("todo", "tests_ok")), None)
-    out.append(f"<h2>Work{(' on ' + _e(q.get('layer'))) if q.get('layer') else ''}</h2>")
-    if current:
-        out.append(f"<p>Now: <strong>{_e(current.get('id'))}</strong> {_e(current.get('title', ''))} "
-                   f"<span class=muted>({_e(current.get('status'))})</span></p>")
-    hb = (state / "conductor.heartbeat")
-    if hb.exists():
-        try:
-            age = now.timestamp() - float(hb.read_text(encoding="utf-8").split()[1])
-            out.append(f"<p class=muted>Conductor heartbeat {int(age // 60)} min ago.</p>")
-        except (OSError, ValueError, IndexError):
-            pass
-    if tasks:
-        rows = "".join(f"<tr><td>{_e(t.get('id'))}</td><td>{_e(t.get('title', ''))}</td>"
-                       f"<td>{_e(t.get('status'))}</td></tr>" for t in tasks)
-        out.append(f"<div class=row><table><tr><th>Task</th><th>Title</th><th>Status</th></tr>{rows}</table></div>")
-    else:
-        out.append("<p class=muted>No tasks queued.</p>")
+    try:  # R64 review: a bad state file never takes the controls (Stop, Answer, Approve) down
+        q = _read(state, "queue.json", {})
+        tasks = [t for t in q.get("tasks", []) if isinstance(t, dict)]
+        current = next((t for t in tasks if t.get("status") in ("todo", "tests_ok")), None)
+        out.append(f"<h2>Work{(' on ' + _e(q.get('layer'))) if q.get('layer') else ''}</h2>")
+        if current:
+            out.append(f"<p>Now: <strong>{_e(current.get('id'))}</strong> {_e(current.get('title', ''))} "
+                       f"<span class=muted>({_e(current.get('status'))})</span></p>")
+        hb = (state / "conductor.heartbeat")
+        if hb.exists():
+            try:
+                age = now.timestamp() - float(hb.read_text(encoding="utf-8").split()[1])
+                out.append(f"<p class=muted>Conductor heartbeat {int(age // 60)} min ago.</p>")
+            except (OSError, ValueError, IndexError):
+                pass
+        if tasks:
+            rows = "".join(f"<tr><td>{_e(t.get('id'))}</td><td>{_e(t.get('title', ''))}</td>"
+                           f"<td>{_e(t.get('status'))}</td></tr>" for t in tasks)
+            out.append(f"<div class=row><table><tr><th>Task</th><th>Title</th><th>Status</th></tr>{rows}</table></div>")
+        else:
+            out.append("<p class=muted>No tasks queued.</p>")
 
-    meter = meter0
-    rows = []
-    for p in PROVIDERS:
-        cap = limits.get(f"{p}_daily_token_cap")
-        rows.append(f"<tr><td>{p} tokens today</td><td>{meter.used_today(p)} of {_e(cap if cap is not None else '-')}"
-                    "</td></tr>")
-    mh, md = _mail_used(mail_state, now)
-    rows.append(f"<tr><td>email</td><td>{mh} of {_e(limits.get('mail_per_hour', 6))} this hour, "
-                f"{md} of {_e(limits.get('mail_per_day', 30))} today</td></tr>")
-    out.append("<h2>Caps</h2><div class=row><table>" + "".join(rows) + "</table></div>")
-
-    if shared is not None:
-        out.append(_lanes_html(Path(shared).parent))
-    caps = _read(state, "capabilities.json", {})
-    out.append("<h2>Capabilities</h2>")
-    if not caps:
-        out.append("<p class=muted>No readiness evidence yet.</p>")
-    else:
+        meter = meter0 if meter0 is not None else Meter(state, clock=lambda: now)
         rows = []
-        for name in sorted(caps):
-            e = caps[name]
-            why = readiness.broken(e, now, readiness.max_age_for(name, limits))
-            st = "<span class=ok>OK</span>" if why is None else f"<span class=bad>BROKEN</span> {_e(why)}"
-            detail = e.get("detail", "") if isinstance(e, dict) else ""
-            at = e.get("checked_at", "?") if isinstance(e, dict) else "?"
-            rows.append(f"<tr><td>{_e(name)}</td><td>{st}</td><td>{_e(detail)}</td><td class=muted>{_e(at)}</td></tr>")
-        out.append("<div class=row><table>" + "".join(rows) + "</table></div>")
+        for p in PROVIDERS:
+            cap = limits.get(f"{p}_daily_token_cap")
+            rows.append(f"<tr><td>{p} tokens today</td><td>{meter.used_today(p)} of {_e(cap if cap is not None else '-')}"
+                        "</td></tr>")
+        mh, md = _mail_used(mail_state, now)
+        rows.append(f"<tr><td>email</td><td>{mh} of {_e(limits.get('mail_per_hour', 6))} this hour, "
+                    f"{md} of {_e(limits.get('mail_per_day', 30))} today</td></tr>")
+        out.append("<h2>Caps</h2><div class=row><table>" + "".join(rows) + "</table></div>")
+
+        if shared is not None:
+            out.append(_lanes_html(Path(shared).parent))
+        caps = _read(state, "capabilities.json", {})
+        out.append("<h2>Capabilities</h2>")
+        if not caps:
+            out.append("<p class=muted>No readiness evidence yet.</p>")
+        else:
+            rows = []
+            for name in sorted(caps):
+                e = caps[name]
+                why = readiness.broken(e, now, readiness.max_age_for(name, limits))
+                st = "<span class=ok>OK</span>" if why is None else f"<span class=bad>BROKEN</span> {_e(why)}"
+                detail = e.get("detail", "") if isinstance(e, dict) else ""
+                at = e.get("checked_at", "?") if isinstance(e, dict) else "?"
+                rows.append(f"<tr><td>{_e(name)}</td><td>{st}</td><td>{_e(detail)}</td><td class=muted>{_e(at)}</td></tr>")
+            out.append("<div class=row><table>" + "".join(rows) + "</table></div>")
+    except Exception as e:  # noqa: BLE001
+        out.append(f"<p class=bad>The work, caps and capabilities section couldn't be read: {_e(type(e).__name__)}</p>")
     return ("<!doctype html><html lang=en><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             "<noscript><meta http-equiv=refresh content=30></noscript>"
