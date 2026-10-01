@@ -668,3 +668,41 @@ class ReviewRound1(ForgeFixture, unittest.TestCase):
         target = self.raw("state/bootstrap/queue.json", '{"x": 1}')
         with d.open_shared(target) as f:
             self.assertEqual(f.read(), b'{"x": 1}')
+
+
+class ReviewRound2(ForgeFixture, unittest.TestCase):
+    """R64 review round 2: huge integers, structurally bad queues, unreadable roadmap, unknown shown as unknown."""
+
+    def test_huge_integer_meter_is_unknown(self):
+        self.raw("state/bootstrap/meter.json", '{"2026-10-01": {"claude": 1%s, "codex": 50}}' % ("0" * 400))
+        self.assertIsNone(self.snap()["tokens"]["providers"]["claude"]["used"])
+
+    def test_structurally_bad_queue_is_unknown(self):
+        for text in ('{"layer": "layer-1", "tasks": null}', '{"layer": "layer-1", "tasks": [null, 7]}',
+                     '{"layer": "layer-1"}', '[]'):
+            with self.subTest(text=text):
+                self.raw("state/bootstrap/queue.json", text)
+                cp = self.main_lane()["checkpoint"]
+                self.assertIsNone(cp["tasks_total"])
+                self.assertIsNone(cp["eta_s"])
+
+    def test_unreadable_roadmap_is_unknown(self):
+        for text in (None, "{broken", '{"phases": "x"}'):
+            with self.subTest(text=text):
+                path = self.root / "docs/progress.json"
+                if text is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    self.raw("docs/progress.json", text)
+                p = self.snap()["project"]
+                self.assertIsNone(p["phases_total"])
+                self.assertIsNone(p["eta_s"])
+                self.assertIsNone(p["overall"])
+
+    def test_page_shows_unknown_progress_not_zero(self):
+        from core import status_page
+        self.raw("state/bootstrap/queue.json", "{broken")
+        html = status_page.live_section(self.snap())
+        self.assertIn("Whole project: unknown", html)
+        self.assertIn("Tasks unknown", html)
+

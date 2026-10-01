@@ -13,6 +13,7 @@ function Get-ForgeLive {
     $lane = @($s.lanes)[0]
     if (-not $lane) { return $null }
     $cp = $lane.checkpoint
+    if ($null -eq $cp.tasks_total -or $null -eq $s.project.overall) { return $null }   # unknown: read the files
     $ckpt = if ($cp.tasks_total) { $cp.tasks_done / $cp.tasks_total } else { 0 }
     $state = switch ($lane.state) { 'stopped' { 'stopped' } 'paused' { 'paused' } default { $lane.state } }
     $now = if ($lane.current) { " $($lane.current.role) $($lane.current.task_id)".TrimEnd() } else { '' }

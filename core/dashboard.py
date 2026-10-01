@@ -118,7 +118,10 @@ def _json(path: Path, default=None, typ=None):
 
 def _num(x) -> float | None:
     if isinstance(x, (int, float)) and not isinstance(x, bool):
-        x = float(x)
+        try:
+            x = float(x)
+        except OverflowError:  # an integer too big for a float
+            return None
         return x if math.isfinite(x) else None
     return None
 
@@ -517,7 +520,8 @@ def _lane(forge_root: Path, state_root: Path, name: str, now: datetime, limits: 
           med: dict, tokens: dict, per_plan: tuple, attempts: dict | None = None) -> dict:
     sdir = lanes_mod.state_dir(state_root, name)
     q = _jread(sdir / "queue.json", dict)
-    queue_ok = q is not BAD and (q is None or q.get("tasks") is None or isinstance(q.get("tasks"), list))
+    queue_ok = q is None or (q is not BAD and isinstance(q.get("tasks"), list)
+                             and all(isinstance(t, dict) and isinstance(t.get("id"), str) for t in q["tasks"]))
     q = q if isinstance(q, dict) else {}  # missing: no queue yet (empty); unreadable: unknown (queue_ok False)
     raw = q.get("tasks") if isinstance(q.get("tasks"), list) else []
     all_tasks = [t for t in raw if isinstance(t, dict) and isinstance(t.get("id"), str)]
@@ -618,9 +622,13 @@ def _timeline(names: list[str], runs_by_lane: dict, lanes_out: list[dict], now: 
 
 
 def _project(forge_root: Path, lanes_out: list[dict], running: int) -> dict:
-    doc = _json(Path(forge_root) / "docs" / "progress.json", {}, dict)
-    phases = [{"name": str(p.get("name", "")), "done": bool(p.get("done"))}
-              for p in (doc.get("phases") if isinstance(doc.get("phases"), list) else []) if isinstance(p, dict)]
+    doc = _jread(Path(forge_root) / "docs" / "progress.json", dict)
+    raw = doc.get("phases") if isinstance(doc, dict) else None
+    if not isinstance(raw, list) or not all(isinstance(p, dict) for p in raw):
+        return {"phases": None, "phases_done": None, "phases_total": None, "current_phase": None,
+                "current_fraction": None, "overall": None, "eta_s": None,
+                "eta_basis": "unknown: docs/progress.json is missing or can't be read"}
+    phases = [{"name": str(p.get("name", "")), "done": bool(p.get("done"))} for p in raw]
     done = sum(1 for p in phases if p["done"])
     current = next((p["name"] for p in phases if not p["done"]), None)
     main = lanes_out[0]["checkpoint"] if lanes_out else {}

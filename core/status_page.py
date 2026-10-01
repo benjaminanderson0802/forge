@@ -242,8 +242,10 @@ def _live_lane(lane: dict, med: dict, local_tz) -> str:
                             f"style='--rc:{_role_var(s)}'>{_e(_role_label(s))}</span>" for i, s in enumerate(stages))
             out.append(f"<div class=chips aria-label=\"task stages\">{chips}</div>")
             if t.get("eta_s") is not None:
-                out.append(f"<div class=small>Task {_e(t['id'])} done in about <strong>{_e(_dur(t['eta_s']))}"
-                           f"</strong> <span class=muted>({_e(t.get('eta_basis'))})</span></div>")
+                when = (f"done in about <strong>{_e(_dur(t['eta_s']))}</strong>" if t["eta_s"] >= 60 else
+                        "<strong>past its estimate</strong>: by the medians it would be done by now")
+                out.append(f"<div class=small>Task {_e(t['id'])} {when} "
+                           f"<span class=muted>({_e(t.get('eta_basis'))})</span></div>")
     else:
         why = {"stopped": "Nothing runs: a stop is set or the conductor is not running.",
                "paused": "Nothing runs while the lane is paused.",
@@ -253,7 +255,7 @@ def _live_lane(lane: dict, med: dict, local_tz) -> str:
     rows = "".join(
         f"<tr><td>{_e(t.get('id'))}</td><td>{_e(t.get('title'))}</td><td>{_e(t.get('status'))}</td>"
         f"<td>{_e(_role_label(t['stage']) if t.get('stage') else '-')}</td>"
-        f"<td title=\"{_e(t.get('eta_basis'))}\">{_e('-' if t.get('status') == 'done' else _dur(t.get('eta_s')))}"
+        f"<td title=\"{_e(t.get('eta_basis'))}\">{_e(_task_eta_cell(t))}"
         "</td></tr>" for t in lane.get("tasks") or [])
     if rows:
         out.append("<details><summary class=small>Tasks</summary><div class=row><table><tr><th>Task</th>"
@@ -268,11 +270,20 @@ def _eta_line(eta, basis) -> str:
         "<div class='small muted'>ETA unknown</div>"
 
 
+def _task_eta_cell(t: dict) -> str:
+    if t.get("status") == "done":
+        return "-"
+    eta = t.get("eta_s")
+    return "unknown" if eta is None else "past estimate" if eta < 60 else _dur(eta)
+
+
 def _live_checkpoint(cp: dict) -> str:
     out = ["<h3 class=small>Next checkpoint: " + _e(cp.get("layer") or "unknown") + " complete</h3>"]
     td, tt = cp.get("tasks_done"), cp.get("tasks_total")
     if tt is not None:
         out.append(_bar("Tasks done", td or 0, tt or 1, f"{td} of {tt}"))
+    else:
+        out.append("<div class='small bad'>Tasks unknown: the queue can't be read right now.</div>")
     if cp.get("requirements_total"):
         out.append(_bar("Spec requirements covered", cp.get("covered") or 0, cp["requirements_total"],
                         f"{cp.get('covered')} of {cp['requirements_total']} covered, {cp.get('partial') or 0} partial"
@@ -286,7 +297,7 @@ def _live_checkpoint(cp: dict) -> str:
 def _live_project(pr: dict) -> str:
     phases = pr.get("phases") or []
     if not phases:
-        return "<p class=muted>Project phases unknown (docs/progress.json).</p>"
+        return "<p class=muted>Project phases unknown (docs/progress.json is missing or can't be read).</p>"
     n = len(phases)
     segs = []
     for i, p in enumerate(phases):
@@ -295,6 +306,10 @@ def _live_project(pr: dict) -> str:
         segs.append(f"<div title=\"{_e(p.get('name'))}: {round(f * 100)}%\" style=\"flex:1;height:100%;"
                     f"border-right:{'2px solid var(--bg)' if i < n - 1 else '0'};background:linear-gradient(90deg,"
                     f"var(--ok) {f * 100:.1f}%,transparent {f * 100:.1f}%)\"></div>")
+    if pr.get("overall") is None:
+        return ("<div class=meter><div class=lbl><span>Whole project: unknown</span><span class=muted>"
+                f"{_e(pr.get('phases_done'))} of {_e(pr.get('phases_total'))} phases done; the current phase's progress "
+                "can't be read right now</span></div><div class=bar></div></div>")
     overall = pr.get("overall") or 0.0
     return (f"<div class=meter><div class=lbl><span>Whole project: {round(overall * 100)}%</span><span class=muted>"
             f"{_e(pr.get('phases_done'))} of {_e(pr.get('phases_total'))} phases done; now "
