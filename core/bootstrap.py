@@ -2053,6 +2053,24 @@ class Conductor:
                 "tests below don't prove every requirement in covers." + self._covers_text(t) +
                 "\nTESTS:\n" + "\n".join(text)[:40000] + "\n")
 
+    def _evidence_rewrite(self, tid: str, reason: str, feedback: list) -> None:
+        """R65: an evidence task's tests are what failed, so it goes back to its test writer (at most 3 times)."""
+        t = self._task(tid)
+        if t.get("evidence") is not True or t.get("status") == "blocked":
+            return
+        n = int(t.get("evidence_rewrites", 0))
+        if n >= 3:
+            self._block(tid, reason)
+            return
+        self._update(tid, status="todo", tests_commit=None, test_rejects=0, evidence_rewrites=n + 1,
+                     test_feedback=[str(x)[:NOTE_CAP] for x in feedback][:40])
+
+    @staticmethod
+    def _test_feedback_text(t: dict) -> str:
+        fb = t.get("test_feedback") or []
+        return ("\nTEST FEEDBACK (R65): your earlier tests for this task were not strong enough. Write stronger tests "
+                "that catch every item below:\n" + "\n".join(f"- {x}" for x in fb) + "\n") if fb else ""
+
     def _tests_stage(self, tid: str) -> None:
         t = self._task(tid)
         self._reset_wt()
@@ -2062,7 +2080,8 @@ class Conductor:
                 "emptied." + self._covers_text(t) if evidence else " The tests must fail until the feature exists.")
         prompt = (role_text(self.repo, "test_writer") + "\n\nWrite only these files: " + ", ".join(t["test_files"]) +
                   "." + goal + " Do not write any other file.\n\n" +
-                  self._task_prompt(t) + "\nAnswer with JSON: {\"files\": [...], \"summary\": \"...\"}")
+                  self._task_prompt(t) + self._test_feedback_text(t) +
+                  "\nAnswer with JSON: {\"files\": [...], \"summary\": \"...\"}")
         try:
             r = self._call("test_writer", prompt, S_TESTS)
         except (Capped, NotReady):
@@ -2102,7 +2121,7 @@ class Conductor:
                 self._block(tid, reason)
             return
         sha = self._commit(changed, f"{tid}: acceptance tests")
-        self._update(tid, status="tests_ok", tests_commit=sha, fails_since=0, fail_signatures=[])
+        self._update(tid, status="tests_ok", tests_commit=sha, fails_since=0, fail_signatures=[], test_feedback=[])
 
     # ------------------------------------------------------------------ stage B: build
     def _ledger(self) -> Ledger:
@@ -2300,13 +2319,16 @@ class Conductor:
             sig = (hashlib.sha256(("mutation:" + "|".join(sorted(ids))).encode("utf-8")).hexdigest()
                    if mres.complete else "mutation-incomplete")
             self._update(tid, review_feedback=survivor_feedback + given)
-            return fail(reason, sig, self._survivor_listing(mres), submitted=True,
-                        payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "mutation"})
+            fail(reason, sig, self._survivor_listing(mres), submitted=True,
+                 payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "mutation"})
+            return self._evidence_rewrite(tid, reason, [f"{m.file}:{m.line} {m.original} -> {m.replacement} (surviving mutant {m.id})"
+                                                        for m in mres.survivors] + given)
         if verdict != "pass":
             reasons = given or ["no reasons given"]
             self._update(tid, review_feedback=survivor_feedback + reasons)
-            return fail("review failed: " + "; ".join(reasons), "review:" + "|".join(reasons), submitted=True,
-                        payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "review"})
+            fail("review failed: " + "; ".join(reasons), "review:" + "|".join(reasons), submitted=True,
+                 payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "review"})
+            return self._evidence_rewrite(tid, "review failed: " + "; ".join(reasons), reasons)
 
         # Reviewed: hand S to the crash-safe finalizer. The ledger pass is applied only there, after the push.
         # The evidence is exactly the pass payload the build stage prepares (P1B1): verdict, reasons, mutation.

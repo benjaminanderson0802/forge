@@ -633,3 +633,9 @@ Module: `core/lanes.py`, with hooks in `core/bootstrap.py`, `core/usage.py`, `co
   - The test writer's prompt for that task includes `TEST FEEDBACK` with those lines, and asks for stronger tests that kill them. The writer rewrites only the task's `test_files`; the R63 checks (pass now, fail on an empty implementation) apply again.
   - `test_feedback` is cleared when new tests are accepted. An ordinary task is unchanged.
   - **Bounded:** an evidence task returns to its test writer at most 3 times (`evidence_rewrites`); after that a failure blocks it with the last reason, like any blocked task.
+
+- **R66a A re-plan never pauses Forge** (Ben, 2026-10-01: "if theres a blocker, i just want you to tell me, prepare the fix, do it on your own if you can"; D-037). Until now three paths wrote `PAUSED` and asked Ben to reply: the drift keeper failing 3 times, a drift-keeper re-plan with no Manager, and `_escalate_replan` (the Manager's proposals rejected twice). Each lane then idled for hours. Now none of them writes `PAUSED` or opens a `replan` question:
+  - Forge keeps building every task it can. The stall's pending re-plan is cleared and the stall window restarts exactly as before (`auto_replans` 0, `restart_window`), so the same stall does not fire again at once.
+  - Ben gets one notice (the capped `_send`; subject starts `[Forge] FYI:`), saying what stalled, the reasons and rejected proposals, and that Forge is continuing and the supervisor re-cuts the plan. It asks for no reply.
+  - The event is logged in `errors.log` with the trigger.
+  - `PAUSED` itself keeps working as before when Ben (or a tamper alarm, or the status page) sets it.
