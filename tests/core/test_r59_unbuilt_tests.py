@@ -94,3 +94,37 @@ class SyncReviewTests(Harness):
         self.assertTrue(ApprovedMerges(c.state).has(head))
         c._repair_sync_approval(wt, layer, base)  # not a sync merge: nothing registered
         self.assertFalse(ApprovedMerges(c.state).has(base))
+
+
+class SyncRepairRound2Tests(Harness):
+    def test_repair_finds_sync_and_main_merges_behind_later_commits(self):
+        import subprocess
+        from core.finalize import ApprovedMerges
+        c = self.init()
+        wt, layer = c.wt, c._queue()["layer"]
+        g = lambda *a: bootstrap._git(wt, *a)
+        # a "main" with its own merge commit
+        g("checkout", "-q", "-b", "fake-main")
+        g("checkout", "-q", "-b", "pr")
+        (wt / "pr.txt").write_text("x\n", encoding="utf-8"); g("add", "pr.txt"); g("commit", "-q", "-m", "pr")
+        g("checkout", "-q", "fake-main")
+        subprocess.run(["git", "merge", "--no-ff", "-q", "-m", "Merge pull request #1", "pr"], cwd=str(wt), check=True)
+        main_merge = g("rev-parse", "HEAD")
+        g("update-ref", "refs/remotes/origin/main", main_merge)
+        g("checkout", "-q", layer)
+        subprocess.run(["git", "-c", "user.name=Forge", "-c", "user.email=forge@localhost", "merge", "--no-ff", "-q",
+                        "-m", f"Sync {layer} with main", "fake-main"], cwd=str(wt), check=True)
+        sync = g("rev-parse", "HEAD")
+        (wt / "later.txt").write_text("y\n", encoding="utf-8"); g("add", "later.txt"); g("commit", "-q", "-m", "later")
+        c._repair_sync_approval(wt, layer)
+        a = ApprovedMerges(c.state)
+        self.assertTrue(a.has(sync))
+        self.assertTrue(a.has(main_merge))
+
+    def test_repair_runs_even_when_rate_limited(self):
+        c = self.init()
+        calls = []
+        c._repair_sync_approval = lambda wt, layer, head="HEAD": calls.append(layer)
+        c._write("main_sync.json", {"fetched_at": c.clock().isoformat()})
+        (c.wt / ".git").exists() and c._sync_with_main()
+        self.assertEqual(len(calls), 1)

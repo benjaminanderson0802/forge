@@ -2769,19 +2769,32 @@ class Conductor:
         return not failed
 
     # ------------------------------------------------------------------ R58: layers stay current with main
-    def _repair_sync_approval(self, wt: Path, layer: str, head: str) -> None:
-        """R58: a crash between git's merge commit and its registration leaves an unapproved sync merge that safe
-        push would refuse forever. A HEAD that is Forge's own "Sync <layer> with main" merge is registered here."""
+    def _repair_sync_approval(self, wt: Path, layer: str, head: str = "HEAD") -> None:
+        """R58: a crash between git's merge commit and its registration leaves merges safe push would refuse
+        forever. Every merge in the layer's history that is Forge's own "Sync <layer> with main" merge, or a merge
+        that came from main (reachable from the local origin/main ref), is registered if it isn't. Runs on every
+        sync call, before the rate limit, so a restart repairs at once even after later commits moved HEAD."""
         try:
-            msg = _git(wt, "log", "-1", "--format=%s", head)
-            parents = _git(wt, "rev-list", "--parents", "-n", "1", head).split()[1:]
-            if msg != f"Sync {layer} with main" or len(parents) != 2:
-                return
+            log = _git(wt, "log", "--merges", "--format=%H %P%x1f%s", head, check=False)
+            main = _git(wt, "rev-parse", "--verify", "-q", "refs/remotes/origin/main^{commit}", check=False)
+            from_main = set(_git(wt, "rev-list", "--merges", main).split()) if main else set()
             approved = ApprovedMerges(self.state)
-            if not approved.has(head):
-                approved.add(head, {"kind": "main_sync", "base": parents[0], "other": parents[1], "parents": parents,
-                                    "repaired": True})
-                self._log(f"main sync: registered an unregistered sync merge {head[:12]} (interrupted sync)")
+            for line in log.splitlines():
+                ids, _, subject = line.partition("\x1f")
+                parts = ids.split()
+                if len(parts) < 3:
+                    continue
+                sha, parents = parts[0], parts[1:]
+                if approved.has(sha):
+                    continue
+                if subject == f"Sync {layer} with main" and len(parents) == 2:
+                    approved.add(sha, {"kind": "main_sync", "base": parents[0], "other": parents[1],
+                                       "parents": parents, "repaired": True})
+                elif sha in from_main:
+                    approved.add(sha, {"kind": "main", "repaired": True})
+                else:
+                    continue
+                self._log(f"main sync: registered unregistered merge {sha[:12]} (interrupted sync)")
         except (RuntimeError, OSError) as e:
             self._log(f"main sync: approval repair failed: {e!r}"[:300])
 
@@ -2816,6 +2829,7 @@ class Conductor:
             wt = self.work / layer
             if not layer or not (wt / ".git").exists():
                 return "no layer"
+            self._repair_sync_approval(wt, layer)  # first, so a restart repairs even when rate-limited
             st = self._read("main_sync.json", {})
             now = self.clock()
             last = st.get("fetched_at")
@@ -2841,7 +2855,6 @@ class Conductor:
             head = _git(wt, "rev-parse", "HEAD")
             if not main or subprocess.run(["git", "merge-base", "--is-ancestor", main, head], cwd=str(wt),
                                           capture_output=True, stdin=subprocess.DEVNULL, **NOWIN).returncode == 0:
-                self._repair_sync_approval(wt, layer, head)
                 return "current"  # nothing on main that the layer lacks
             qs = self._read("questions.json", {})
             c = st.get("conflict") or {}
