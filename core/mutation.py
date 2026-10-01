@@ -223,6 +223,7 @@ class MutationResult:
     score: float = 1.0
     passed: bool = True
     reason: str = ""
+    sampled: int | None = None  # R67: how many mutants ran (None: all of total)
 
     def survivor_ids(self) -> list[str]:
         return [m.id for m in self.survivors]
@@ -235,6 +236,7 @@ class MutationResult:
             "complete": self.complete,
             "passed": self.passed,
             "reason": self.reason,
+            "sampled": self.total if self.sampled is None else self.sampled,
             "not_run": list(self.not_run),
             "survivors": [{"id": m.id, "file": m.file, "line": m.line,
                            "original": m.original, "replacement": m.replacement}
@@ -300,7 +302,7 @@ def run_mutation(root: Path, changed: dict[str, set[int]], test_argv: list[str],
                  mutation_min: float, budget_s: float, per_mutant_timeout_s: float,
                  clock: Callable[[], float] = time.monotonic,
                  run: Callable[[list[str], Path, float, dict], tuple[int, bool]]
-                 | None = None) -> MutationResult:
+                 | None = None, max_mutants: int | None = None) -> MutationResult:
     """Run each mutant's tests under one hard total budget (layer-1 design 3.4).
 
     A mutant only gets a verdict if its run finished inside the budget; anything
@@ -324,6 +326,12 @@ def run_mutation(root: Path, changed: dict[str, set[int]], test_argv: list[str],
         if found:
             originals[rel] = raw
             mutants.extend(found)
+
+    generated = len(mutants)
+    if max_mutants is not None and max_mutants > 0 and generated > max_mutants:  # R67: deterministic sample
+        ordered = sorted(mutants, key=lambda m: m.id)
+        step = generated / max_mutants
+        mutants = [ordered[int(i * step)] for i in range(max_mutants)]
 
     killed = 0
     survivors: list[Mutant] = []
@@ -384,6 +392,8 @@ def run_mutation(root: Path, changed: dict[str, set[int]], test_argv: list[str],
         plural = "survivor" if len(survivors) == 1 else "survivors"
         reason = (f"killed {killed} of {judged} ({score:.2f} {sign} "
                   f"{mutation_min:.2f}); {len(survivors)} {plural}")
-    return MutationResult(total=len(mutants), killed=killed, survivors=survivors,
+    if len(mutants) < generated:
+        reason += f" (sampled {len(mutants)} of {generated})"
+    return MutationResult(total=generated, killed=killed, survivors=survivors,
                           not_run=not_run, complete=complete, score=score,
-                          passed=passed, reason=reason)
+                          passed=passed, reason=reason, sampled=len(mutants))
