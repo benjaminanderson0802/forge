@@ -639,3 +639,7 @@ Module: `core/lanes.py`, with hooks in `core/bootstrap.py`, `core/usage.py`, `co
   - Ben gets one notice (the capped `_send`; subject starts `[Forge] FYI:`), saying what stalled, the reasons and rejected proposals, and that Forge is continuing and the supervisor re-cuts the plan. It asks for no reply.
   - The event is logged in `errors.log` with the trigger.
   - `PAUSED` itself keeps working as before when Ben (or a tamper alarm, or the status page) sets it.
+- **R67 Mutation testing samples large mutant sets** (found 2026-10-01: evidence task L1B1_1 generated 199 mutants in core/bootstrap.py; under load only 7 ran inside the budget, so the gate failed as incomplete on every attempt and nothing could merge). Now:
+  - When more mutants are generated than `mutation_max_mutants` (limits, default 25), the judge runs a deterministic sample of that many: mutants sorted by id, then every k-th one (evenly spaced, k = total / max), so the same commit always gets the same sample. Fewer than the maximum: all of them run, as before.
+  - The score, `mutation_min`, the budget and the incomplete rule apply to the sample unchanged. `total` stays the number generated; the result also reports `sampled` (how many ran), and the reason says `sampled N of M`.
+  - Survivors listed are the sample's survivors (they feed R65 test feedback and the builder's review feedback as before).
