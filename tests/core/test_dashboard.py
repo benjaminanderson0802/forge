@@ -596,3 +596,75 @@ class DashboardTests(ForgeFixture, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRound1(ForgeFixture, unittest.TestCase):
+    """R64 review round 1: unreadable is unknown, never zero; stale runs; reads never block a writer."""
+
+    def test_unparseable_queue_is_unknown_not_empty(self):
+        self.raw("state/bootstrap/queue.json", '{"layer": "layer-1", "tasks": [')
+        s = self.snap()
+        cp = s["lanes"][0]["checkpoint"]
+        self.assertIsNone(cp["tasks_total"])
+        self.assertIsNone(cp["tasks_done"])
+        self.assertIsNone(cp["eta_s"])
+        self.assertIsNone(s["project"]["eta_s"])
+        self.assertIsNone(s["project"]["current_fraction"])
+
+    def test_missing_queue_is_empty(self):
+        (self.root / "state/bootstrap/queue.json").unlink()
+        cp = self.main_lane()["checkpoint"]
+        self.assertEqual((cp["tasks_done"], cp["tasks_total"]), (0, 0))
+
+    def test_unparseable_questions_is_unknown(self):
+        self.raw("state/bootstrap/questions.json", "{broken")
+        self.assertIsNone(self.main_lane()["open_questions"])
+
+    def test_bad_meter_numbers_are_unknown_and_never_crash(self):
+        for value in ("1e309", '"damaged"', "-5"):
+            with self.subTest(value=value):
+                self.raw("state/bootstrap/meter.json", '{"2026-10-01": {"claude": %s, "codex": 50}}' % value)
+                tok = self.snap()["tokens"]["providers"]
+                self.assertIsNone(tok["claude"]["used"])
+                self.assertEqual(tok["codex"]["used"], 50)
+
+    def test_run_far_past_the_agent_timeout_is_abandoned(self):
+        self.add_run("builder", 600 * 2 + 301)
+        self.assertIsNone(self.main_lane()["current"])
+        self.add_run("reviewer", 60)
+        self.assertEqual(self.main_lane()["current"]["role"], "reviewer")
+
+    def test_judging_is_not_inferred_hours_later(self):
+        self.add_run("builder", 7 * 3600, 100)
+        self.assertIsNone(self.main_lane()["current"])
+
+    def test_conductor_write_retries_a_rename_refused_by_a_reader(self):
+        from unittest import mock
+        from core import bootstrap
+        target = self.raw("state/bootstrap/queue.json", "{}")
+        tmp = self.raw("state/bootstrap/queue.json.tmp", '{"tasks": []}')
+        real, calls = os.replace, []
+
+        def flaky(src, dst):
+            calls.append(src)
+            if len(calls) < 3:
+                raise PermissionError(13, "sharing violation (a reader has it open)")
+            real(src, dst)
+        with mock.patch.object(bootstrap.os, "replace", side_effect=flaky), mock.patch.object(bootstrap.time, "sleep"):
+            bootstrap.replace_retry(tmp, target)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(target.read_bytes(), b'{"tasks": []}')
+
+    def test_conductor_write_gives_up_after_its_retries(self):
+        from unittest import mock
+        from core import bootstrap
+        with mock.patch.object(bootstrap.os, "replace", side_effect=PermissionError(13, "x")), \
+                mock.patch.object(bootstrap.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                bootstrap.replace_retry(self.root / "a", self.root / "b")
+
+    def test_snapshot_reads_run_through_the_shared_reader(self):
+        d = importlib.import_module("core.dashboard")
+        target = self.raw("state/bootstrap/queue.json", '{"x": 1}')
+        with d.open_shared(target) as f:
+            self.assertEqual(f.read(), b'{"x": 1}')

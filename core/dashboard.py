@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import statistics
@@ -43,6 +44,7 @@ TASK_RE = re.compile(r"^TASK (\S+?): ?(.*)$", re.M)
 PROMPT_READ = 262144
 _CACHE: dict = {}  # (kind, path) -> (stamp, value): in memory only, never on disk
 _CACHE_MAX = 20000
+BAD = object()  # a file that exists but can't be read or parsed: "unknown", never "empty"
 
 
 # ------------------------------------------------------------------ small readers (never raise)
@@ -50,18 +52,81 @@ def _iso(dt: datetime | None) -> str | None:
     return None if dt is None else dt.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
-def _json(path: Path, default=None, typ=None):
+def read_bytes(path: Path, limit: int | None = None) -> bytes:
+    """Read a file without ever getting in a writer's way. On Windows an ordinary open() denies delete sharing,
+    so a conductor's os.replace() of that file during the read would fail; this opens it with FILE_SHARE_DELETE
+    (and retries the brief sharing violation of a replace in progress). Raises OSError like open()."""
+    path = Path(path)
+    for i in range(5):
+        try:
+            with open_shared(path) as f:
+                return f.read() if limit is None else f.read(limit)
+        except PermissionError:
+            if i == 4:
+                raise
+            import time
+            time.sleep(0.02 * (i + 1))
+    raise OSError("unreachable")
+
+
+def open_shared(path: Path):
+    """A binary read handle that lets other processes replace or delete the file while it is open."""
+    if os.name != "nt":
+        return open(path, "rb")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    h = k32.CreateFileW(str(path), 0x80000000, 0x7, None, 3, 0x80, None)  # GENERIC_READ, share all, OPEN_EXISTING
+    if h is None or h == wintypes.HANDLE(-1).value:
+        err = ctypes.get_last_error()
+        if err in (2, 3):
+            raise FileNotFoundError(2, "not found", str(path))
+        if err in (5, 32):
+            raise PermissionError(13, "sharing violation", str(path))
+        raise OSError(err, "CreateFileW failed", str(path))
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
-        return default
-    if typ is not None and not isinstance(data, typ):
-        return default
-    return data
+        fd = msvcrt.open_osfhandle(h, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except OSError:
+        k32.CloseHandle(h)
+        raise
+    return os.fdopen(fd, "rb")
+
+
+def read_text(path: Path, limit: int | None = None) -> str:
+    return read_bytes(path, limit).decode("utf-8", "replace" if limit else "strict")
+
+
+def _jread(path: Path, typ=None):
+    """The parsed file; None if it doesn't exist; BAD if it exists but can't be read, parsed or is the wrong type."""
+    try:
+        data = json.loads(read_bytes(path).decode("utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        return BAD
+    return BAD if typ is not None and not isinstance(data, typ) else data
+
+
+def _json(path: Path, default=None, typ=None):
+    data = _jread(path, typ)
+    return default if data is None or data is BAD else data
 
 
 def _num(x) -> float | None:
-    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+    if isinstance(x, (int, float)) and not isinstance(x, bool):
+        x = float(x)
+        return x if math.isfinite(x) else None
+    return None
+
+
+def _count(x) -> int | None:
+    """A non-negative whole count (tokens), or None when the value is not a usable number."""
+    x = _num(x)
+    return int(x) if x is not None and 0 <= x < 1e18 else None
 
 
 def _exists(path: Path) -> bool:
@@ -107,7 +172,7 @@ def fmt_dur(s: float | None) -> str:
 
 # ------------------------------------------------------------------ run history
 def _load_output(path: Path) -> dict:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(read_bytes(path).decode("utf-8"))
     if not isinstance(data, dict):
         raise ValueError("output.json is not an object")
     inner = data.get("data")
@@ -115,14 +180,13 @@ def _load_output(path: Path) -> dict:
     ok = data.get("ok")
     tokens = data.get("tokens")
     return {"ok": ok if isinstance(ok, bool) else None,
-            "tokens": int(tokens) if isinstance(tokens, (int, float)) and not isinstance(tokens, bool) else None,
+            "tokens": _count(tokens),
             "provider": data.get("provider") if isinstance(data.get("provider"), str) else None,
             "ntasks": ntasks}
 
 
 def _load_task(path: Path) -> tuple:
-    with open(path, "rb") as f:
-        head = f.read(PROMPT_READ).decode("utf-8", "replace")
+    head = read_bytes(path, PROMPT_READ).decode("utf-8", "replace")
     m = TASK_RE.search(head)
     return (m.group(1), m.group(2).strip()) if m else (None, None)
 
@@ -222,7 +286,9 @@ def conductor(state_root: Path, lane: str, sdir: Path, now: datetime, limits: di
         return {"alive": age <= HEARTBEAT_STALE_S and phase != "exited", "heartbeat_age_s": max(0.0, age),
                 "_phase": phase, "_last_status": last}
     try:
-        stamp = float((sdir / "conductor.heartbeat").read_text(encoding="utf-8").split()[1])
+        stamp = _num(float(read_text(sdir / "conductor.heartbeat").split()[1]))
+        if stamp is None:
+            raise ValueError("not a time")
     except (OSError, ValueError, IndexError, UnicodeDecodeError):
         return {"alive": False, "heartbeat_age_s": None, "_phase": None, "_last_status": None}
     age = now.timestamp() - stamp
@@ -234,7 +300,7 @@ def ledger_passes(sdir: Path) -> set:
     """Contract ids with a `pass` event in the lane's hash-chained ledger log. Read-only: a torn last line is
     skipped (never repaired); a broken chain or an unreadable log gives no credit."""
     try:
-        lines = [x for x in (sdir / "ledger" / "events.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()]
+        lines = [x for x in read_text(sdir / "ledger" / "events.jsonl").splitlines() if x.strip()]
     except (OSError, UnicodeDecodeError):
         return set()
     events = []
@@ -266,19 +332,20 @@ def spec_requirements(forge_root: Path, rel) -> dict | None:
             or re.match(r"^([A-Za-z]:|[/\\])", rel):
         return None
     try:
-        reqs = cov_mod.parse_requirements((Path(forge_root) / rel).read_text(encoding="utf-8"))
+        reqs = cov_mod.parse_requirements(read_text(Path(forge_root) / rel))
     except (OSError, UnicodeDecodeError, ValueError):
         return None
     return reqs or None
 
 
 def _day_usage(data, day: str) -> dict | None:
+    """{provider: tokens} for one day; a provider whose value is unusable is None (unknown), never 0."""
     if not isinstance(data, dict):
         return None
     d = data.get(day, {})
     if not isinstance(d, dict):
         return None
-    return {p: int(d.get(p, 0)) if isinstance(d.get(p, 0), (int, float)) else 0 for p in PROVIDERS}
+    return {p: _count(d.get(p, 0)) for p in PROVIDERS}
 
 
 def meter_by_lane(state_root: Path, day: str) -> dict:
@@ -293,11 +360,11 @@ def meter_by_lane(state_root: Path, day: str) -> dict:
     except OSError:
         files = []
     if files:
-        return {n[:-5]: _day_usage(_json(folder / n), day) for n in files}
+        return {n[:-5]: _day_usage(_jread(folder / n, dict), day) for n in files}
     path = Path(state_root) / "bootstrap" / "meter.json"
     if not _exists(path):
         return {lanes_mod.MAIN: {p: 0 for p in PROVIDERS}}
-    return {lanes_mod.MAIN: _day_usage(_json(path), day)}
+    return {lanes_mod.MAIN: _day_usage(_jread(path, dict), day)}
 
 
 def holds(state_root: Path, now: datetime) -> dict:
@@ -384,13 +451,17 @@ def build_task_s(med: dict, attempts: dict) -> float:
             + med["reviewer"]["median_s"] + med["merge"]["median_s"])
 
 
-def _current(runs: list[dict], cond: dict, now: datetime, titles: dict) -> dict | None:
+def _current(runs: list[dict], cond: dict, now: datetime, titles: dict, limits: dict | None = None) -> dict | None:
     if not runs or not cond["alive"]:
         return None
     last = runs[-1]
+    timeout = _num((limits or {}).get("agent_timeout_s")) or 1800.0
     if last["end"] is None:
         role, start, tid, title = last["role"], last["start"], last["task_id"], last["task_title"]
-    elif last["role"] == "builder" and cond.get("_phase") != "sleep":
+        if (now - start).total_seconds() > 2 * timeout + 300:  # agents are killed at their timeout: abandoned
+            return None
+    elif last["role"] == "builder" and cond.get("_phase") != "sleep" \
+            and (now - last["end"]).total_seconds() < JUDGE_GAP_MAX_S:
         role, start, tid, title = "judge", last["end"], last["task_id"], last["task_title"]
     else:
         return None
@@ -445,14 +516,16 @@ def _capped(tokens: dict) -> bool:
 def _lane(forge_root: Path, state_root: Path, name: str, now: datetime, limits: dict, runs: list[dict],
           med: dict, tokens: dict, per_plan: tuple, attempts: dict | None = None) -> dict:
     sdir = lanes_mod.state_dir(state_root, name)
-    q = _json(sdir / "queue.json", {}, dict)
+    q = _jread(sdir / "queue.json", dict)
+    queue_ok = q is not BAD and (q is None or q.get("tasks") is None or isinstance(q.get("tasks"), list))
+    q = q if isinstance(q, dict) else {}  # missing: no queue yet (empty); unreadable: unknown (queue_ok False)
     raw = q.get("tasks") if isinstance(q.get("tasks"), list) else []
     all_tasks = [t for t in raw if isinstance(t, dict) and isinstance(t.get("id"), str)]
     tasks = [t for t in all_tasks if t.get("status") != "superseded"]
     titles = {t["id"]: str(t.get("title", "")) for t in all_tasks}
     cond = conductor(state_root, name, sdir, now, limits)
     service = {"phase": cond.pop("_phase", None), "last_status": cond.pop("_last_status", None)}
-    current = _current(runs, dict(cond, _phase=service["phase"]), now, titles)
+    current = _current(runs, dict(cond, _phase=service["phase"]), now, titles, limits)
     if _exists(sdir / "KILL") or _exists(Path(state_root) / "shared" / "KILL") or not cond["alive"]:
         state = "stopped"
     elif _exists(sdir / "PAUSED"):
@@ -463,10 +536,13 @@ def _lane(forge_root: Path, state_root: Path, name: str, now: datetime, limits: 
         state = "capped"
     else:
         state = "idle"
+    qs = _jread(sdir / "questions.json", dict)
     try:
-        open_q = len(_channel_items(_json(sdir / "questions.json", {}, dict)))
+        items = [] if qs is None else _channel_items(qs) if qs is not BAD else None
     except Exception:  # noqa: BLE001
-        open_q = None
+        items = None
+    open_q = None if items is None else len(items)
+    open_ids = None if items is None else sorted(str(i.get("id")) for i in items)
     attempts = attempts or {"median": 1.0, "n": 0, "source": "default"}
     builds: dict = {}
     for r in runs:
@@ -482,10 +558,11 @@ def _lane(forge_root: Path, state_root: Path, name: str, now: datetime, limits: 
     spec_rel = q.get("spec_file") or limits.get("spec_file") or DEFAULT_SPEC
     reqs = spec_requirements(forge_root, spec_rel)
     cp = {"layer": q.get("layer") if isinstance(q.get("layer"), str) else None,
-          "tasks_done": sum(1 for t in tasks if t.get("status") == "done"), "tasks_total": len(tasks),
+          "tasks_done": sum(1 for t in tasks if t.get("status") == "done") if queue_ok else None,
+          "tasks_total": len(tasks) if queue_ok else None,
           "spec_file": spec_rel if isinstance(spec_rel, str) else None, "covered": None, "partial": None,
           "requirements_total": None, "score": None, "requirements": []}
-    if reqs:
+    if reqs and queue_ok:
         try:
             passed = ledger_passes(sdir)
             verified = {t["id"] for t in tasks if t.get("kind", "build") == "build"
@@ -509,10 +586,12 @@ def _lane(forge_root: Path, state_root: Path, name: str, now: datetime, limits: 
                 f" x {fmt_dur(build_s)} per build task (with {attempts['median']:g} attempts)" if plans else "")
              + (f"; {blocked} blocked task(s) not counted (they wait for Ben)" if blocked else "")
              + (f"; {unknown} task(s) with an unknown status not counted" if unknown else ""))
-    cp.update(remaining_work_s=known + unplanned, eta_s=None, eta_basis=basis)
+    if not queue_ok:
+        basis = "unknown: the lane's queue.json can't be read right now"
+    cp.update(remaining_work_s=(known + unplanned) if queue_ok else None, eta_s=None, eta_basis=basis)
     return {"name": name, "layer": cp["layer"], "state": state, "conductor": cond, "service": service,
-            "current": current,
-            "open_questions": open_q, "tasks": rows, "checkpoint": cp}
+            "current": current, "open_questions": open_q, "open_question_ids": open_ids, "queue_ok": queue_ok,
+            "tasks": rows, "checkpoint": cp}
 
 
 def _channel_items(qs: dict) -> list:
@@ -547,19 +626,24 @@ def _project(forge_root: Path, lanes_out: list[dict], running: int) -> dict:
     main = lanes_out[0]["checkpoint"] if lanes_out else {}
     if current is None:
         frac = 0.0
-    elif main.get("requirements_total"):
+    elif main.get("requirements_total") and main.get("score") is not None:
         frac = main["score"] / main["requirements_total"]
+    elif main.get("tasks_total") is None:
+        frac = None  # main's queue can't be read right now: unknown, not 0
     elif main.get("tasks_total"):
         frac = main["tasks_done"] / main["tasks_total"]
     else:
         frac = 0.0
-    work = sum(lane["checkpoint"].get("remaining_work_s") or 0.0 for lane in lanes_out)
+    works = [lane["checkpoint"].get("remaining_work_s") for lane in lanes_out]
+    work = None if any(w is None for w in works) else sum(works)
     basis = (f"estimate: the current phase's planned work in {len(lanes_out)} lane(s) ({fmt_dur(work)} of agent "
              f"and judge time) / {running} lane(s) running; later phases are not planned yet, so they are not "
-             "included")
+             "included") if work is not None else "unknown: a lane's queue can't be read right now"
     return {"phases": phases, "phases_done": done, "phases_total": len(phases), "current_phase": current,
-            "current_fraction": frac, "overall": ((done + frac) / len(phases)) if phases else None,
-            "eta_s": (work / running) if current is not None else 0.0, "eta_basis": basis}
+            "current_fraction": frac,
+            "overall": ((done + frac) / len(phases)) if phases and frac is not None else None,
+            "eta_s": 0.0 if current is None else (work / running) if work is not None else None,
+            "eta_basis": basis}
 
 
 def snapshot(forge_root, now: datetime | None = None) -> dict:

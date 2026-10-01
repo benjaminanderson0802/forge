@@ -425,7 +425,9 @@ def live_section(snap: dict, local_tz=None) -> str:
                 + "<h2>Spec coverage</h2>" + _live_coverage(lanes_))
     except Exception as e:  # noqa: BLE001 - the dashboard never takes the page down
         body = f"<h2>Live</h2><p class=bad>Could not build the live view: {_e(type(e).__name__)}: {_e(e)}</p>"
-    return f"<section id=live aria-live=polite>{body}</section>"
+    main = (snap.get("lanes") or [{}])[0] if isinstance(snap, dict) else {}
+    qsig = ",".join(main.get("open_question_ids") or []) if isinstance(main, dict) else ""
+    return f"<section id=live aria-live=polite data-questions=\"{_e(qsig)}\">{body}</section>"
 
 
 _LIVE_JS = """(function(){
@@ -436,11 +438,15 @@ function tick(){var now=Date.now();document.querySelectorAll('[data-since]').for
 var t=Date.parse(el.getAttribute('data-since'));if(isNaN(t))return;var s=(now-t)/1000,tot=+el.getAttribute('data-total');
 if(el.hasAttribute('data-total')){if(tot>0)el.style.width=Math.min(100,100*s/tot).toFixed(1)+'%';}
 else el.textContent=fmt(s);});}
-var busy=false,lost=document.getElementById('live-lost');
+var busy=false,lost=document.getElementById('live-lost'),first=document.getElementById('live'),
+q0=first?first.getAttribute('data-questions'):null,qnote=document.getElementById('live-questions');
+function typing(){var a=document.activeElement;if(a&&(a.tagName==='TEXTAREA'||a.tagName==='INPUT'))return true;
+return Array.prototype.some.call(document.querySelectorAll('textarea'),function(t){return t.value.trim()!=='';});}
 function poll(){if(busy)return;busy=true;fetch('/api/live?format=html',{cache:'no-store',credentials:'same-origin'})
 .then(function(r){if(!r.ok)throw new Error(r.status);return r.text();}).then(function(t){
 var el=document.getElementById('live');if(el&&t.indexOf('<section id=live')===0)el.outerHTML=t;
-if(lost)lost.hidden=true;tick();}).catch(function(){if(lost)lost.hidden=false;})
+if(lost)lost.hidden=true;tick();var n=document.getElementById('live');
+if(n&&q0!==null&&n.getAttribute('data-questions')!==q0){if(!typing())location.reload();else if(qnote)qnote.hidden=false;}}).catch(function(){if(lost)lost.hidden=false;})
 .then(function(){busy=false;});}
 setInterval(poll,3000);setInterval(tick,1000);tick();})();"""
 
@@ -455,7 +461,9 @@ def render(state: Path, limits: dict, now: datetime | None = None, *, local_tz=N
     local = channel.to_local(now, local_tz)
     out = [f"<h1>Forge status</h1><p class=muted>{_e(local.strftime('%A %d %B %Y, %H:%M'))} "
            "&middot; live (without JavaScript: refreshes every 30 seconds) "
-           "<span id=live-lost class=bad hidden>&middot; lost contact with the page server, retrying</span></p>"]
+           "<span id=live-lost class=bad hidden>&middot; lost contact with the page server, retrying</span>"
+           "<span id=live-questions class=warn hidden>&middot; your questions changed: reload the page when you "
+           "finish typing</span></p>"]
     try:  # R64: the live dashboard first; it never takes the page down
         snap = dashboard.snapshot(Path(forge_root) if forge_root is not None else state.parent.parent, now)
         out.append(live_section(snap, local_tz))

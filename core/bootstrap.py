@@ -321,6 +321,19 @@ def validate_task(t: dict) -> str | None:
     return None
 
 
+
+def replace_retry(src: Path, dst: Path, tries: int = 6) -> None:
+    """os.replace, retried briefly on Windows' sharing violation: a reader (the status page, the live dashboard
+    (R64), the tray) that has the target open for a moment makes the rename fail with PermissionError."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.02 * (i + 1))
+
 class Conductor:
     def __init__(self, repo: Path, work: Path, state: Path, team: Team, limits: dict, *,
                  owner_email: str, mailer: Callable[[str, str], None], inbox: Callable[[], list[dict]],
@@ -377,13 +390,13 @@ class Conductor:
             self._write_ben_queue(data)  # 1E: queue.jsonl, the design's view of the open questions
         if not durable:
             tmp.write_bytes(raw)
-            os.replace(tmp, p)
+            replace_retry(tmp, p)
             return
         with open(tmp, "wb") as f:  # durable: the bytes reach the disk before the rename, the rename after it
             f.write(raw)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, p)
+        replace_retry(tmp, p)
         if os.name != "nt":
             try:
                 fd = os.open(str(self.state), os.O_RDONLY)
