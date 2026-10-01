@@ -180,6 +180,27 @@ def run_tree(args, cwd: Path, timeout_s: float, *, env: dict | None = None,
     return (p.returncode if p.returncode is not None else -9), text, why
 
 
+_SUITE_CMD = re.compile(r"(^|\s)-m\s+core\.suite(\s|$)")
+_TASK_TEST = re.compile(r"tests/core/test_\w+\.py")
+MAIN_SYNC_EVERY_S = 600  # R58: origin is fetched for the main sync at most this often
+
+
+def task_judge_cmds(cmds: list[str], base: str, sha: str, test_files=()) -> list[str]:
+    """R57: a per-task judge runs the suite only for what base..sha can affect. Every `-m core.suite` command
+    gets --changed <base>..<sha> and --include for each of the task's own tests/core test files; other judge
+    commands (the drills) are unchanged. The layer gate and CI run the commands as written: the full suite."""
+    out = []
+    for cmd in cmds:
+        if _SUITE_CMD.search(cmd) and "--changed" not in cmd:
+            cmd = f"{cmd} --changed {base}..{sha}"
+            for f in test_files or ():
+                f = str(f).replace("\\", "/")
+                if _TASK_TEST.fullmatch(f):
+                    cmd += f" --include {f}"
+        out.append(cmd)
+    return out
+
+
 def _cmd_args(cmd: str):
     """A judge command string without a shell: POSIX splits it like a shell would (quotes only); Windows hands the
     command line to CreateProcess as written."""
@@ -1446,6 +1467,7 @@ class Conductor:
         except (RuntimeError, OSError, Rejected) as e:
             self._log(f"reconcile error: {e!r}")
             return "error"
+        self._sync_with_main()  # R58: plain git, never an agent; never fails the step
         try:
             routed = self._route_capabilities(fresh)
         except Tampered:
@@ -1549,6 +1571,8 @@ class Conductor:
                 return "not_ready"
             try:
                 self._gate()
+            except Capped:  # R42/R49: a stop during the gate's full suite is never a failure
+                return self._held()
             except (RuntimeError, OSError) as e:  # e.g. a refused push: no pull request is opened
                 self._log(f"gate error: {e!r}")
                 return "error"
@@ -1918,7 +1942,7 @@ class Conductor:
             try:
                 results = [("task tests", *self._run_tests(t, cwd=jw)[:2])]
                 baseline = time.monotonic() - started
-                for cmd in self.judge_cmds:
+                for cmd in task_judge_cmds(self.judge_cmds, base, sha, t.get("test_files") or []):
                     if results[-1][1] != 0:
                         break
                     results.append((cmd, *self._run_cmd(cmd, cwd=jw)))
@@ -2089,9 +2113,11 @@ class Conductor:
                 and t.get("test_cmd")]
         run_id = f"ci-merge-{tid}-{sha[:12]}"
         passed, output = True, ""
+        cand = next(c for c in rec.get("candidates") or [] if c.get("sha") == sha)
+        cmds = task_judge_cmds(self.judge_cmds, cand["base"], sha, mine[0].get("test_files") if mine else [])
         with self.trees.throwaway(sha) as jw:
             checks = [(f"tests of {t['id']}", lambda t=t: self._run_tests(t, cwd=jw)[:2]) for t in mine + done]
-            checks += [(cmd, lambda cmd=cmd: self._run_cmd(cmd, cwd=jw)) for cmd in self.judge_cmds]
+            checks += [(cmd, lambda cmd=cmd: self._run_cmd(cmd, cwd=jw)) for cmd in cmds]  # R57: fast
             for name, run in checks:
                 code, out = run()
                 if code != 0:
@@ -2674,6 +2700,8 @@ class Conductor:
 
     # ------------------------------------------------------------------ gate
     def _gate(self) -> None:
+        if not self._gate_suite():  # R57: the full suite passes at the layer tip before any PR to main
+            return
         q = self._queue()
         self._push()
         report = f"{q['layer']} finished its queue. Every task passed tests at its exact commit, the judges, and " \
@@ -2694,6 +2722,141 @@ class Conductor:
         pr = m.group(1)
         self._ask("gate", f"{q['layer']} is ready: reply y to approve",
                   report + f"\n\nPull request: {out.strip()}\n\nReply y to approve and merge into main.", pr=pr)
+
+
+    def _gate_suite(self) -> bool:
+        """R57: per-task judges run only the affected modules, so the layer gate runs every judge command as
+        written (the drills and the FULL suite) at exactly the layer tip, once per tip. A failure is logged and
+        told to Ben once per tip; no pull request is opened until a later tip passes."""
+        if not self.judge_cmds:
+            return True
+        sha = _git(self.wt, "rev-parse", "HEAD")
+        prev = self._queue().get("gate_suite") or {}
+        if prev.get("sha") == sha:
+            return bool(prev.get("passed"))
+        failed = ""
+        with self.trees.throwaway(sha) as jw:
+            for cmd in self.judge_cmds:
+                code, out = self._run_cmd(cmd, cwd=jw)  # Stopped propagates: nothing is recorded
+                if code != 0:
+                    failed = f"{cmd} failed (exit {code}):\n" + "\n".join(out.splitlines()[-30:])
+                    break
+        q = self._queue()
+        q["gate_suite"] = {"sha": sha, "passed": not failed, "at": self.clock().isoformat()}
+        self._save_queue(q)
+        if failed:
+            self._log(f"gate full suite failed at {sha}: {failed}"[:1000])
+            self._send(f"[Forge] {q['layer']} is done but the full suite fails",
+                       f"Before opening the pull request to main, Forge ran the full suite at {sha}. It failed:\n\n"
+                       f"{failed[:3000]}\n\nNo pull request was opened. Forge runs it again when the layer changes.")
+        return not failed
+
+    # ------------------------------------------------------------------ R58: layers stay current with main
+    def _sync_busy(self, q: dict, wt: Path) -> str:
+        """R58: why the layer can't take a main merge right now ("" when it can)."""
+        if Journal(self.state).active():
+            return "a finalization is active"
+        contracts = self._ledger().contracts()
+        for t in q.get("tasks", []):
+            if t.get("status") == "tests_ok" and contracts.get(t["id"], {}).get("status") in ("claimed", "submitted"):
+                return f"task {t['id']} has an active claim"
+        for t in q.get("tasks", []):
+            try:
+                tp = self.trees.task_path(t["id"])
+            except ValueError:
+                continue
+            if (tp / ".git").exists() and self._changed(cwd=tp):
+                return f"task worktree {t['id']} has uncommitted work"
+        if self._changed(cwd=wt):
+            return "the layer worktree has uncommitted work"
+        return ""
+
+    def _sync_with_main(self) -> str:
+        """R58: when nothing is mid-stage, merge origin/main into the layer (no-ff, by Forge) so new task
+        worktrees start from current main code. Fetches at most every MAIN_SYNC_EVERY_S. A conflict is aborted
+        and asked about once ("merge" question); the layer keeps its old base. Returns what happened."""
+        try:
+            q = self._queue()
+            layer = q.get("layer") or ""
+            wt = self.work / layer
+            if not layer or not (wt / ".git").exists():
+                return "no layer"
+            st = self._read("main_sync.json", {})
+            now = self.clock()
+            last = st.get("fetched_at")
+            if last:
+                try:
+                    if (now - datetime.fromisoformat(last)).total_seconds() < MAIN_SYNC_EVERY_S:
+                        return "rate limited"
+                except (TypeError, ValueError):
+                    pass
+            if not _git(wt, "remote", "get-url", "origin", check=False):
+                return "no origin"
+            busy = self._sync_busy(q, wt)
+            if busy:
+                return "busy: " + busy
+            st["fetched_at"] = now.isoformat()
+            self._write("main_sync.json", st)
+            try:
+                _git(wt, "fetch", "-q", "origin", "main")
+            except RuntimeError as e:
+                self._log(f"main sync: fetch failed: {e}"[:500])
+                return "fetch failed"
+            main = _git(wt, "rev-parse", "--verify", "-q", "refs/remotes/origin/main^{commit}", check=False)
+            head = _git(wt, "rev-parse", "HEAD")
+            if not main or subprocess.run(["git", "merge-base", "--is-ancestor", main, head], cwd=str(wt),
+                                          capture_output=True, stdin=subprocess.DEVNULL, **NOWIN).returncode == 0:
+                return "current"  # nothing on main that the layer lacks
+            qs = self._read("questions.json", {})
+            c = st.get("conflict") or {}
+            if c.get("main") == main and c.get("layer") == head and (qs.get(c.get("qid")) or {}).get("status") == "open":
+                return "conflict pending"  # asked already; nothing has moved and Ben hasn't answered
+            p = subprocess.run(["git", "-c", "user.name=Forge", "-c", "user.email=forge@localhost", "merge", "--no-ff",
+                                "--no-edit", "-m", f"Sync {layer} with main", main], cwd=str(wt), capture_output=True,
+                               text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, **NOWIN)
+            if p.returncode != 0:
+                files = _git(wt, "diff", "--name-only", "--diff-filter=U", check=False).split()
+                _git(wt, "merge", "--abort", check=False)
+                self._reset_to(wt, head)
+                if not files:
+                    self._log(f"main sync: merge of {main[:12]} failed: {(p.stdout + p.stderr).strip()}"[:500])
+                    return "merge failed"
+                self._log(f"main sync: {layer} conflicts with main {main[:12]} in {', '.join(files)}; merge aborted, "
+                          f"keeping the old base"[:500])
+                qid = next((k for k, v in qs.items() if v.get("kind") == "merge" and v.get("sync")
+                            and v.get("status") == "open"), None)
+                if qid is None:
+                    qid = self._ask("merge", f"Forge: {layer} can't take the latest main (merge conflict)",
+                                    f"Merging origin/main ({main[:12]}) into {layer} ({head[:12]}) conflicts in:\n"
+                                    + "\n".join(f"- {f}" for f in files) +
+                                    f"\n\nThe merge was aborted. {layer} keeps building on its old base. Resolve the "
+                                    "conflict on the layer branch (or tell Forge what to do) and reply; Forge tries "
+                                    "again after your answer or when main or the layer moves.",
+                                    sync=True, main=main, layer_sha=head,
+                                    default=f"{layer} keeps building on its old base")
+                st["conflict"] = {"main": main, "layer": head, "qid": qid, "files": files}
+                self._write("main_sync.json", st)
+                return "conflict"
+            new = _git(wt, "rev-parse", "HEAD")
+            approved = ApprovedMerges(self.state)  # safe_push only pushes merges it knows: this one, and main's own
+            for m in [x for x in _git(wt, "rev-list", "--merges", main, f"^{head}").split() if x]:
+                if not approved.has(m):
+                    approved.add(m, {"kind": "main", "via": new})
+            approved.add(new, {"kind": "main_sync", "base": head, "other": main, "parents": [head, main]})
+            st.pop("conflict", None)
+            self._write("main_sync.json", st)
+            stale = [v for v in qs.values() if v.get("kind") == "merge" and v.get("sync") and v.get("status") == "open"]
+            for v in stale:  # a sync question that no longer applies is closed
+                v.update(status="answered", answer=f"resolved: synced cleanly at {new}", closed_at=now.isoformat())
+            if stale:
+                self._write("questions.json", qs)
+            self._log(f"main sync: merged origin/main {main[:12]} into {layer} ({head[:12]} -> {new[:12]})")
+            if self.push:
+                self._push()
+            return "synced"
+        except (RuntimeError, OSError, ValueError) as e:  # never fails the step; retried at the next fetch
+            self._log(f"main sync error: {e!r}"[:500])
+            return "error"
 
 
 # ---------------------------------------------------------------------- real I/O

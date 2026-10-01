@@ -1,0 +1,28 @@
+# R57: tests/core modules that ran in under 20 s; every per-task judge runs them.
+# Generated 2026-10-01 with --jobs 2. Regenerate: python -m core.suite --write-fast
+test_agents  6.4
+test_channel  0.2
+test_coverage  2.0
+test_drift_state  0.3
+test_layer1_integration  19.3
+test_manager  0.9
+test_mutation_run  9.1
+test_mutation_sites  0.1
+test_p1_live_fixes  16.0
+test_r55_deps_and_suite  2.8
+test_readiness  1.1
+test_readiness_cycle  9.3
+test_readiness_gate  1.7
+test_readiness_gating  19.8
+test_roles  12.2
+test_service  1.0
+test_service_activity  0.1
+test_service_drills  9.6
+test_status_bars  0.3
+test_status_outbox  0.1
+test_status_page  4.8
+test_usage  0.1
+test_usage_holds  0.1
+test_weak_empty  17.4
+test_weaktest  0.1
+test_worktrees  18.8
