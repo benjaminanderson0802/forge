@@ -31,10 +31,16 @@ def _bs():
     return bootstrap
 
 
+def retry_dir(state_root: Path, lane: str) -> Path:
+    """R66e: the lane's retry folder, beside (not inside) its fingerprinted answer drop folder."""
+    return lanes_mod.channel_dir(state_root, lane) / "retry"
+
+
 def retry_request(state_root: Path, lane: str, bid: str, not_needed: bool = False, wait_s: float = 0,
                   between_runs=None) -> tuple[int, str]:
-    """`python -m core.bootstrap retry` (R66e): hand Forge Ben's retry through the lane's answer drop folder. Writes
-    nothing in the lane's state; waits (up to wait_s) until the lane's conductor is between agent runs."""
+    """`python -m core.bootstrap retry` (R66e): hand Forge Ben's retry through the lane's retry folder. Writes
+    nothing in the lane's state or its fingerprinted drop folder, so it is safe during an agent run (review round
+    2); the conductor takes it between runs. wait_s and between_runs are accepted for compatibility, unused."""
     state_root = Path(state_root)
     if lane != lanes_mod.MAIN and lanes_mod.name_problem(lane):
         return 2, f"bad lane: {lanes_mod.name_problem(lane)}"
@@ -46,15 +52,7 @@ def retry_request(state_root: Path, lane: str, bid: str, not_needed: bool = Fals
         return 2, f"blocker {bid} is {rec.get('status')}: nothing to retry"
     if rec.get("category") == "unpark":
         return 2, f"blocker {bid} needs the unpark email from its fix kit, not a retry"
-    if between_runs is None:
-        from core.status_page import conductor_between_runs as between_runs
-    service = lanes_mod.service_dir(state_root, lane)
-    deadline = time.time() + max(0.0, float(wait_s))
-    while not between_runs(service):
-        if time.time() >= deadline:
-            return 2, "Forge is in the middle of an agent run; try again in a few minutes"
-        time.sleep(2)
-    channel.drop_answer(lanes_mod.channel_dir(state_root, lane) / "in", rec["id"], rec["code"],
+    channel.drop_answer(retry_dir(state_root, lane), rec["id"], rec["code"],
                         "not needed" if not_needed else "retry", "fix kit")
     return 0, f"Forge will retry on its next step: {rec.get('summary')}. You'll get an email when it's fixed."
 
@@ -197,11 +195,22 @@ class SelfFixMixin:
     def _blockers_tick(self) -> None:
         if not self._self_fix or self._kill_set():
             return
-        for part in (self._sf_migrate, self._sf_verify, self._sf_merge_retry, self._sf_gate_watch, self._sf_flush):
+        for part in (self._sf_migrate, self._sf_take_retries, self._sf_verify, self._sf_merge_retry,
+                     self._sf_gate_watch, self._sf_flush):
             try:
                 part()
             except Exception as e:  # noqa: BLE001 - a blocker problem never stops the conductor
                 self._log(f"blockers {part.__name__} error: {e!r}"[:500])
+
+    def _sf_take_retries(self) -> None:
+        """R66e: Ben's retries from fix kits, taken between agent runs (the folder is never fingerprinted; a retry
+        needs the blocker's code and only ever gives Forge more bounded attempts, never an approval)."""
+        for a in channel.take_answers(self.channel_in.parent / "retry"):
+            try:
+                if not self._sf_take_retry(a):
+                    self._log(f"ignored a retry for unknown blocker {a.get('qid')}"[:300])
+            except Exception as e:  # noqa: BLE001 - one bad retry never blocks the rest
+                self._log(f"retry failed: {e!r}"[:500])
 
     def _sf_verify(self) -> None:
         tasks = {t.get("id"): t for t in self._queue().get("tasks", []) if isinstance(t, dict)}
@@ -418,11 +427,11 @@ class SelfFixMixin:
             return False
         rec = self.blockers.attempt(rec["id"])
         if int(rec.get("attempts") or 0) >= self._sf_limit():
-            line = f"cd {self.repo}; gh pr merge {pr} --merge --delete-branch --auto"
-            self._sf_ready(rec, {
-                "why": f"GitHub refused to merge pull request #{pr} for Forge ({str(o2 or o1)[:300]}).",
-                "category": "exhausted", "where": "PowerShell", "paste": line, "script": line,
-                "expect": f"Pull request #{pr} shows auto-merge on, and Forge emails you when it's in main."})
+            self._sf_ready(rec, self._sf_retry_kit(
+                rec, f"GitHub refused to label or merge pull request #{pr} for Forge ({str(o2 or o1)[:300]}). Once "
+                     "GitHub works again, this line makes Forge label it human-approved and turn on auto-merge.",
+                f"Pull request #{pr} shows the human-approved label and auto-merge, and Forge emails you when it's "
+                "in main."))
         return False
 
     def _sf_gate_watch(self) -> None:

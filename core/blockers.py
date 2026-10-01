@@ -314,7 +314,7 @@ def script_text(state, rec: dict) -> str | None:
     return raw.decode("utf-8", "replace")
 
 
-def powershell_text_runner(text: str):
+def powershell_text_runner(text: str, cwd: Path | None = None):
     """A runner that feeds PowerShell exactly the validated script bytes on stdin (`-Command -`), so the file on
     disk can't be swapped between the check and the run (R66i review P1)."""
     def run(script: Path, log: Path, timeout_s: float) -> int:
@@ -324,7 +324,7 @@ def powershell_text_runner(text: str):
             try:
                 p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                                     "-Command", "-"], input=text.encode("utf-8"), stdout=f, stderr=subprocess.STDOUT,
-                                   timeout=timeout_s, creationflags=flags, cwd=str(log.parent))
+                                   timeout=timeout_s, creationflags=flags, cwd=str(cwd or log.parent))
                 return p.returncode
             except subprocess.TimeoutExpired:
                 f.write(f"\n[Forge] the fix ran longer than {int(timeout_s)} s and was stopped\n".encode())
@@ -376,7 +376,7 @@ def run_fix(state_root, lane: str, bid: str, sha: str, runner=None) -> tuple[boo
                  "finished_at": None, "exit": None, "pid": os.getpid()}
         _atomic(d / f"{bid}.json", json.dumps(start, indent=2).encode("utf-8"))
     script = state / str(kit["script_file"])  # named for the record; the real run never re-reads it
-    run = runner or powershell_text_runner(text)  # exactly the validated bytes, fed on stdin
+    run = runner or powershell_text_runner(text, cwd=Path(state_root).parent)  # the validated bytes, in the repo
 
     def work() -> None:
         code = None

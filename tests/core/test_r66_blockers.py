@@ -262,7 +262,7 @@ class BlockerFiles(unittest.TestCase):
                 code, message = bootstrap.retry_request(self.root, lane, rec["id"], not_needed=not_needed, wait_s=0)
                 self.assertEqual(code, 0)
                 self.assertTrue(message)
-                answers = channel.take_answers(lanes.channel_dir(self.root, lane) / "in")
+                answers = channel.take_answers(lanes.channel_dir(self.root, lane) / "retry")
                 self.assertEqual(len(answers), 1)
                 self.assertEqual({k: answers[0][k] for k in ("qid", "code", "answer", "source")},
                                  dict(qid=rec["id"], code=rec["code"], source="fix kit",
@@ -273,7 +273,7 @@ class BlockerFiles(unittest.TestCase):
                 getattr(store, "back_to_fixing" if status == "fixing" else "fixed")(rec["id"])
                 self.assertEqual(bootstrap.retry_request(self.root, lane, rec["id"], wait_s=0)[0], 2)
             self.assertEqual(bootstrap.retry_request(self.root, lane, "unknown", wait_s=0)[0], 2)
-            self.assertEqual(channel.take_answers(lanes.channel_dir(self.root, lane) / "in"), [])
+            self.assertEqual(channel.take_answers(lanes.channel_dir(self.root, lane) / "retry"), [])
 
 
 class ConductorFixture(unittest.TestCase):
