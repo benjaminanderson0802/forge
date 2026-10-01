@@ -6,6 +6,17 @@
 
 ## Now
 
+- **Phase 1 (orchestrator loop) gate passed, 2026-10-01 (D-039).** Each roadmap gate item and its evidence on Ben's PC:
+  - full cycle from the ledger alone: drills 5 (crash and restart mid-project) and 13 (a fresh Manager sees the ledger only) pass;
+  - kill switch mid-cycle: drill 14 passes (and the R49 mid-run stop was exercised live today);
+  - daily cap: drill 4 passes (over-budget work parked);
+  - stall detector: drill 12 passes (and it fired for real today);
+  - coverage map: drill 11 passes;
+  - weak-test check: 39 unit tests in `test_weaktest` and `test_weak_empty` pass, and real weak tests were rejected on the PC on 2026-09-30;
+  - live build of a small project with no human help: `projects/entry_ledger`, planned, built, judged, reviewed and merged by Forge (PR #32).
+  All 21 drills passed in one run on the PC at 21:00 UTC.
+- **Next: Phase 2 (Auditor and Challenger)** from `docs/specs/phase-2-design.md`: Codex re-audits every finished task with fresh eyes (findings become fix tasks), and a Challenger tries to overturn every "impossible" claim.
+
 - **Building 24/7 (D-037).** Builders label and merge their own tested, Codex-reviewed changes. The supervisor's brief is `docs/SUPERVISOR.md`; its log is `C:\Users\benja\Forge-work\supervisor-log.md`.
 - **Phase 1 gate project passed (PR #32, 2026-10-01).** Forge built `projects/entry_ledger` from its spec with no human code: plan, 3 build tasks, judges, Codex reviews, the full-suite layer gate and CI.
 - **Layer 1 coverage was 0 of 40.** Most Layer 1 code was built through reviewed pull requests before the coverage ledger, and the plan stage dropped `covers`, so nothing could be credited. The drift keeper paused Forge for it. Fixes:
