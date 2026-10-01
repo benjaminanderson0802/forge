@@ -3,6 +3,7 @@ import json
 import unittest
 
 from core import coverage, drift
+from core.bootstrap import PLAN_ATTEMPTS
 from tests.core.test_drift_state import score_of
 from tests.core.test_planning_drift import DriftHarness, SPEC, btask
 
@@ -98,6 +99,71 @@ class PlanCoversTests(DriftHarness):
 
     def test_repeated_requirement_rejects_the_whole_plan(self):
         self.assert_covers_rejected(self.planned_task(covers=["1.1", "1.1"]), r"repeat|duplicat|unique")
+
+    def test_string_covers_rejects_the_whole_plan_before_review(self):
+        self.assert_covers_rejected(self.planned_task(covers="1.1"), r"list|array")
+
+    def test_non_string_cover_rejects_the_whole_plan_before_review(self):
+        self.assert_covers_rejected(self.planned_task(covers=["1.1", 12]), r"list|string|type")
+
+    def test_covers_rejections_block_at_plan_attempts_without_review_or_appending(self):
+        c = self.run_plan(self.planned_task("GOOD", covers=["1.2"]),
+                          self.planned_task("BAD", covers=["9.9"]))
+        for attempt in range(1, PLAN_ATTEMPTS + 1):
+            if attempt > 1:
+                self.assertEqual(c.step(), "worked")
+            with self.subTest(attempt=attempt):
+                plan = self.task_rec("P1")
+                self.assertEqual(plan.get("plan_rejects", 0), attempt)
+                self.assertEqual(plan["status"],
+                                 "blocked" if attempt == PLAN_ATTEMPTS else "todo")
+                notes = [n for n in plan["notes"] if n.startswith("plan rejected: covers")]
+                self.assertGreaterEqual(len(notes), attempt)
+                self.assertTrue(all("BAD" in n for n in notes))
+                self.assertEqual(len(self.team.planner.prompts), attempt)
+                self.assertEqual(self.team.reviewer.prompts, [])
+                self.assertEqual([t["id"] for t in self.queue()["tasks"]], ["P1"])
+
+    def assert_reviewer_ignores_covers(self, **options):
+        claims = ["1.1", "IGNORED-COVER-CLAIM-9.9"]
+        self.run_plan(self.planned_task(covers=claims), **options)
+        self.assert_accepted("T1")
+        self.assertEqual(len(self.team.reviewer.prompts), 1)
+        prompt = self.team.reviewer.prompts[0]
+        for claim in claims:
+            with self.subTest(ignored_claim=claim):
+                self.assertNotIn(claim, prompt)
+        with self.subTest(check="no covers field"):
+            self.assertNotRegex(prompt, r'"covers"\s*:')
+        # Generic R44 prose uses "covers" too; exclude only the R62 rule
+        # connecting coverage claims to acceptance criteria, not all coverage prose.
+        instructions = prompt.split("\nPLAN:\n", 1)[0].lower()
+        with self.subTest(check="no covers acceptance-criteria rule"):
+            self.assertNotRegex(
+                instructions,
+                r"covers[^.\n]*acceptance criteria|acceptance criteria[^.\n]*covers")
+
+    def test_no_coverage_reviewer_prompt_omits_ignored_claims_and_covers_rule(self):
+        self.assert_reviewer_ignores_covers(no_coverage=True)
+
+    def test_no_usable_spec_reviewer_prompt_omits_ignored_claims_and_covers_rule(self):
+        self.assert_reviewer_ignores_covers(
+            limits={"spec_file": "docs/specs/missing.md",
+                    "claude_daily_token_cap": 10 ** 9,
+                    "codex_daily_token_cap": 10 ** 9})
+
+    def test_reviewer_prompt_lists_only_claimed_requirement_ids_and_text(self):
+        self.run_plan(self.planned_task(covers=["2.1"]),
+                      self.planned_task("T2", covers=["1.1"]))
+        self.assert_accepted("T1", "T2")
+        self.assertEqual(len(self.team.reviewer.prompts), 1)
+        prompt = self.team.reviewer.prompts[0]
+        for rid, text in coverage.parse_requirements(SPEC).items():
+            with self.subTest(requirement=rid):
+                if rid in {"1.1", "2.1"}:
+                    self.assertIn(f"{rid}: {text}", prompt)
+                else:
+                    self.assertNotIn(f"{rid}: {text}", prompt)
 
     def test_no_coverage_plan_accepts_missing_covers_and_ignores_claims(self):
         self.run_plan(self.planned_task(), self.planned_task("T2", covers=["1.1"]),

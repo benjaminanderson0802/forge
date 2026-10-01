@@ -2734,9 +2734,16 @@ class Conductor:
                 reason = "plan rejected: task ids clash with existing tasks"
         if not reason and reqs:  # R62
             reason = _covers_problem(tasks, reqs)
+        if not reason and not reqs and isinstance(tasks, list):  # R62: ignored claims never reach the reviewer
+            tasks = [{k: v for k, v in x.items() if k != "covers"} for x in tasks]
+        claimed = ""
+        if not reason and reqs:  # R62: the reviewer sees what each claimed requirement says
+            ids = [c for x in tasks for c in x["covers"]]
+            claimed = ("\nREQUIREMENTS CLAIMED IN covers (id: text):\n" +
+                       "\n".join(f"{k}: {reqs[k]}" for k in dict.fromkeys(ids)) + "\n")
         if not reason:
             plan_text = (self.wt / plan_file).read_text(encoding="utf-8")
-            size = len(plan_text) + len(json.dumps(tasks))
+            size = len(plan_text) + len(json.dumps(tasks)) + len(claimed)
             if size > PLAN_REVIEW_MAX:  # R44: the reviewer must see the whole plan
                 reason = f"plan rejected: plan too large for review ({size} characters); split this plan task"
         if not reason:
@@ -2746,15 +2753,16 @@ class Conductor:
                                             "Fail ONLY for blocking problems (R44): a requirement of this plan task "
                                             "that no task covers; a task that contradicts docs/DECISIONS.md or the "
                                             "design; a task that can't be done within its files_in_scope; wrong "
-                                            "ordering or dependencies between tasks; placeholders or thin sections; "
-                                            "a task whose covers claims a requirement that no acceptance criteria "
-                                            "in its section prove (R62: covers must be backed by matching "
-                                            "acceptance criteria in the task's section, or it is blocking). "
+                                            "ordering or dependencies between tasks; placeholders or thin sections" +
+                                            ("; a task whose covers claims a requirement that no acceptance "
+                                             "criteria in its section prove (R62: covers must be backed by "
+                                             "matching acceptance criteria in the task's section, or it is "
+                                             "blocking)" if reqs else "") + ". "
                                             "Edge cases, extra tests and implementation details are NOT reasons to "
                                             "fail: put each in task_notes against the task id it affects, and they "
                                             "will be added to that task's instructions.\n\n" +
                                 self._task_prompt(t) + "\nPLAN:\n" + plan_text + "\nTASKS JSON:\n" +
-                                json.dumps(tasks) +
+                                json.dumps(tasks) + claimed +
                                 "\nAnswer with JSON: {\"verdict\": \"pass\" | \"fail\", \"reasons\": [...], "
                                 "\"task_notes\": [{\"task\": \"<task id>\", \"note\": \"...\"}]}",
                                 S_PLAN_REVIEW)
