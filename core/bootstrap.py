@@ -9,6 +9,7 @@ the Team's agents (core.agents interface). Ben is reached only by email.
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
 import hashlib
 import inspect
@@ -2229,10 +2230,7 @@ class Conductor:
         """Layer-1 design 3.4: mutate the builder's changed in-scope lines (base..sha) and run the task tests on each
         mutant, in `root`, a throwaway worktree at exactly sha. It must be exactly sha afterwards (else an R13
         stage error)."""
-        tests = {_norm(x) for x in t["test_files"]}
-        diff = _git(root, "diff", "-U0", f"{base}..{sha}")
-        changed = {f: lines for f, lines in changed_lines(diff).items()
-                   if f not in tests and any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])}
+        changed = self._mutation_targets(t, base, sha, root)
         timeout = float(self.limits.get("test_timeout_s", 600))
         t0 = self.clock()
         try:
@@ -2243,6 +2241,44 @@ class Conductor:
             self._reset_to(root, sha)
             raise RuntimeError("mutation left changes")
         return mres
+
+    def _mutation_targets(self, t: dict, base: str, sha: str, root: Path) -> dict[str, set[int]]:
+        """Changed in-scope lines (base..sha). R63: an evidence task also targets every line of each in-scope
+        function or method its test files name as a word; if nothing is selected, every line of the in-scope .py
+        files."""
+        tests = {_norm(x) for x in t["test_files"]}
+
+        def in_scope(f: str) -> bool:
+            return f not in tests and any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])
+
+        diff = _git(root, "diff", "-U0", f"{base}..{sha}")
+        out: dict[str, set[int]] = {f: set(lines) for f, lines in changed_lines(diff).items() if in_scope(f)}
+        if t.get("evidence") is not True:
+            return out
+        words = set()
+        for f in tests:
+            try:
+                words |= set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", (root / f).read_text(encoding="utf-8")))
+            except (OSError, UnicodeDecodeError):
+                pass
+        files = [_norm(x) for x in _git(root, "ls-files").splitlines() if x.strip()]
+        files = [f for f in files if f.endswith(".py") and in_scope(f)]
+        named: dict[str, set[int]] = {}
+        texts: dict[str, str] = {}
+        for f in files:
+            try:
+                texts[f] = (root / f).read_text(encoding="utf-8")
+                tree = ast.parse(texts[f])
+            except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in words:
+                    named.setdefault(f, set()).update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+        if not named:  # the tests name no in-scope code: target it all
+            named = {f: set(range(1, len(texts[f].splitlines()) + 1)) for f in texts}
+        for f, lines in named.items():
+            out.setdefault(f, set()).update(lines)
+        return out
 
     def _run_mutation(self, root: Path, changed: dict, t: dict, timeout: float, baseline: float):
         return run_mutation(root, changed,

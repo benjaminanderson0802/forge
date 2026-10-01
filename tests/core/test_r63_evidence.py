@@ -8,7 +8,7 @@ from core.agents import schema_ok
 from core.bootstrap import S_PLAN
 from core.ledger import Ledger
 from tests.core import test_r62_plan_covers as r62
-from tests.core.test_bootstrap import git
+from tests.core.test_bootstrap import Harness, git
 from tests.core.test_merge_pipeline import Pipeline
 from tests.core.test_planning_drift import DriftHarness, SPEC, btask
 
@@ -171,6 +171,77 @@ class EvidenceTestsStageTests(DriftHarness):
 
 
 class EvidenceBuildTests(Pipeline):
+    def run_empty_diff_mutation(self, assertion):
+        self.agents["builder"] = lambda prompt, cwd: ('{"status":"done"}', 1)
+        c = self.conductor()
+        task = self.task(evidence=True, covers=["1.1"])
+        c.init_queue(self.layer, [task])
+        (c.wt / "feat.py").write_bytes(b"def value():\n    return 42\n")
+        path = c.wt / task["test_files"][0]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(("import unittest\nimport feat\n"
+                          "class T(unittest.TestCase):\n"
+                          "    def test_value(self):\n"
+                          f"        {assertion}\n").encode())
+        git(c.wt, "add", "feat.py", task["test_files"][0])
+        git(c.wt, "commit", "-q", "-m", "existing function and accepted evidence tests")
+        head = git(c.wt, "rev-parse", "HEAD")
+        c._update("T1", status="tests_ok", tests_commit=head)
+        git(self.repo, "push", "-q", "origin", self.layer)
+        results = []
+        real_judge = c._mutation_judge
+
+        def judge(t, base, sha, baseline, root):
+            self.assertEqual(base, head)
+            self.assertEqual(sha, head)
+            self.assertEqual(git(root, "diff", base, sha), "")
+            result = real_judge(t, base, sha, baseline, root)
+            results.append(result)
+            return result
+
+        with patch.object(c, "_mutation_judge", side_effect=judge):
+            self.assertEqual(c.step(), "worked")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(self.review_log), 1)  # the fake reviewer passes
+        self.assertEqual(self.review_log[0]["head"], head)
+        return results[0], head
+
+    def test_empty_diff_weak_evidence_runs_surviving_mutant_and_cannot_finish(self):
+        result, head = self.run_empty_diff_mutation("self.assertIsNotNone(feat.value())")
+        with self.subTest(check="real mutation run"):
+            self.assertGreater(result.total, 0)
+            self.assertTrue(result.complete)
+            self.assertEqual(result.not_run, [])
+            self.assertEqual(result.killed, 0)
+            self.assertEqual(len(result.survivors), result.total)
+            self.assertEqual({(m.file, m.line) for m in result.survivors}, {("feat.py", 2)})
+            self.assertFalse(result.passed)
+        with self.subTest(check="mutation overrides passing reviewer"):
+            self.assertNotEqual(self.queue_task("T1")["status"], "done")
+            self.assertEqual(self.passes("T1"), [])
+            failures = [e for e in Ledger(self.state).events() if e["action"] == "fail"]
+            self.assertTrue(failures)
+            self.assertEqual(failures[-1]["payload"]["verdict"], "pass")
+            self.assertEqual(failures[-1]["payload"]["gate"], "mutation")
+            self.assertEqual(failures[-1]["payload"]["mutation"], result.as_dict())
+
+    def test_empty_diff_strong_evidence_kills_nonzero_mutants_and_finishes(self):
+        result, head = self.run_empty_diff_mutation("self.assertEqual(feat.value(), 42)")
+        with self.subTest(check="real mutation run"):
+            self.assertGreater(result.total, 0)
+            self.assertEqual(result.killed, result.total)
+            self.assertEqual(result.survivors, [])
+            self.assertEqual(result.not_run, [])
+            self.assertTrue(result.complete)
+            self.assertTrue(result.passed)
+        with self.subTest(check="verified completion"):
+            self.assertEqual(self.queue_task("T1")["status"], "done")
+            completion = Ledger(self.state).completion("T1")
+            self.assertIsNotNone(completion)
+            self.assertEqual(completion["payload"]["mutation"], result.as_dict())
+            self.assertEqual(self.task_commit("T1"), head)
+            self.check_invariants("T1")
+
     def test_no_change_build_is_judged_reviewed_submitted_and_credited(self):
         self.agents["builder"] = lambda prompt, cwd: ('{"status":"done"}', 1)
         c = self.conductor(judge_cmds=['python -c "print(\'drill judge\')"',
@@ -222,6 +293,77 @@ class EvidenceBuildTests(Pipeline):
             self.assertIn("covers", prompt)
             self.assertIn("1.1", prompt)
             self.assertRegex(prompt, r"(?:fail|reject).*tests.*(?:prove|demonstrat|cover)")
+
+
+class EvidenceMutationTargetTests(Harness):
+    SOURCE = ("TOP = 10\n"                     # 1
+              "def value():\n"                # 2
+              "    answer = 42\n"             # 3
+              "    return answer\n"           # 4
+              "\n"                            # 5
+              "def unused():\n"               # 6
+              "    return 99\n"               # 7
+              "\n"                            # 8
+              "class Box:\n"                  # 9
+              "    def read(self):\n"         # 10
+              "        return 7\n")           # 11
+
+    def target_fixture(self, *, evidence=True, names="value read"):
+        c = self.make_conductor()
+        # Broad scope deliberately includes test files and a non-Python file.
+        task = self.task(files_in_scope=["*.py", "notes.txt"])
+        if evidence:
+            task["evidence"] = True
+        files = {"feat.py": self.SOURCE,
+                 "extra.py": "def unmentioned():\n    return 5\n",
+                 "outside.txt": "value read\n",
+                 "notes.txt": "value read\n",
+                 task["test_files"][0]: f"# {names}\ndef test_proof():\n    assert True\n"}
+        for name, source in files.items():
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(source.encode())
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-q", "-m", "target selection fixture")
+        head = git(self.repo, "rev-parse", "HEAD")
+        # A matching untracked file must never be selected.
+        (self.repo / "untracked.py").write_bytes(b"def value():\n    return 8\n")
+        return c, task, head
+
+    def targets(self, c, task, base, sha):
+        # R63's selection seam; keep this separate from subprocess mutation runs.
+        helper = getattr(c, "_mutation_targets", None)
+        self.assertTrue(callable(helper), "Conductor._mutation_targets(t, base, sha, root) is missing")
+        return helper(task, base, sha, self.repo)
+
+    def change_targets(self, task):
+        (self.repo / "feat.py").write_bytes(self.SOURCE.replace("TOP = 10", "TOP = 11").encode())
+        (self.repo / task["test_files"][0]).write_bytes(b"# value read\ndef test_proof():\n    assert 2\n")
+        git(self.repo, "add", "feat.py", task["test_files"][0])
+        git(self.repo, "commit", "-q", "-m", "change code and tests")
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def test_evidence_targets_named_functions_and_methods_as_whole_words_only(self):
+        c, task, head = self.target_fixture(names="value read unused_suffix prefix_unused")
+        self.assertEqual(self.targets(c, task, head, head), {"feat.py": {2, 3, 4, 10, 11}})
+
+    def test_evidence_targets_union_changed_lines_and_named_definitions_excluding_tests(self):
+        c, task, base = self.target_fixture()
+        sha = self.change_targets(task)
+        self.assertEqual(self.targets(c, task, base, sha), {"feat.py": {1, 2, 3, 4, 10, 11}})
+
+    def test_evidence_without_named_functions_targets_every_in_scope_python_line(self):
+        c, task, head = self.target_fixture(names="value_suffix prefix_read unused_suffix")
+        self.assertEqual(self.targets(c, task, head, head),
+                         {"feat.py": set(range(1, 12)), "extra.py": {1, 2}})
+
+    def test_ordinary_targets_only_changed_lines_even_when_tests_name_functions(self):
+        c, task, base = self.target_fixture(evidence=False)
+        with self.subTest(diff="empty"):
+            self.assertEqual(self.targets(c, task, base, base), {})
+        sha = self.change_targets(task)
+        with self.subTest(diff="code and tests"):
+            self.assertEqual(self.targets(c, task, base, sha), {"feat.py": {1}})
 
 
 if __name__ == "__main__":
