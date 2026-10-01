@@ -2,25 +2,17 @@
 
 > Forge updates this file after every cycle once Layer 1 runs. Until then, whoever finishes a piece of work updates it. Keep it short: where things stand now, not history (history is in git and the ledger).
 
-**Updated:** 2026-09-30 (10:30 UTC)
+**Updated:** 2026-10-01 (14:45 UTC)
 
 ## Now
 
-- **Building 24/7 (D-037).** Builders label and merge their own tested, Codex-reviewed changes. The hourly supervisor's brief is `docs/SUPERVISOR.md`; its log is `C:\Users\benja\Forge-work\supervisor-log.md`.
-- **Conductor fixes merged today, each with tests written first by Codex, a Codex review, and CI:**
-  - **R42 (#15):** a stop during a run is a stop, not tampering.
-  - **R43 (#17):** cached input counts at one tenth.
-  - **R44 (#20):** the plan reviewer blocks only for blocking problems; its notes travel with the tasks; it sees the whole plan (it had been cut at 20,000 characters).
-  - **R45 (#22):** plans get 3 attempts, and the planner checks itself against the rules.
-  - **R46 (#23):** killed or timed-out Claude runs are metered from their session logs.
-  - **R47 (#24):** the planner sees every earlier rejection.
-  - **Also:** D-038, the mutation gate is a rate (#21); CI runs the core unit tests (#19).
-- **Layer 1 queue:**
-  - **Plans passed:** P1B1 (judges; T1B1a-e queued) and P1B3 (role files, worktrees, safe merge; T1B3a-e queued).
-  - **P1B2 (readiness):** re-planning with the full rejection history after 3 attempts, each finding one real gap.
-  - **Still to plan:** P1C, P1D, P1E.
-  - **Then** the 10 queued build tasks run.
-- **Token caps:** today's Claude meter was recounted from session logs with R43 weighting (the cap is unchanged). Planning uses about 1.7M weighted tokens an hour, so the 10M daily cap is reached around midday UTC. Raising it is Ben's call.
+- **Building 24/7 (D-037).** Builders label and merge their own tested, Codex-reviewed changes. The supervisor's brief is `docs/SUPERVISOR.md`; its log is `C:\Users\benja\Forge-work\supervisor-log.md`.
+- **Phase 1 gate project passed (PR #32, 2026-10-01).** Forge built `projects/entry_ledger` from its spec with no human code: plan, 3 build tasks, judges, Codex reviews, the full-suite layer gate and CI.
+- **Layer 1 coverage was 0 of 40.** Most Layer 1 code was built through reviewed pull requests before the coverage ledger, and the plan stage dropped `covers`, so nothing could be credited. The drift keeper paused Forge for it. Fixes:
+  - **R62 (#34):** planned tasks name the requirements they cover; the reviewer checks each claim.
+  - **R63:** evidence tasks prove requirements the existing code already meets (tests pass now, fail on an empty implementation, mutation-test the code they name, Codex review).
+- **Next queue (layer `layer-1r`):** one plan task per sub-plan, 1A to 1E, covering all 40 requirements of `docs/specs/layer-1-design.md`. Evidence tasks where the code exists, ordinary tasks for gaps. Spec coverage on the status page is the Layer 1 progress measure.
+- **Also today:** R55 (parallel suite judge, task ordering), R57 to R59 (fast per-task judges, layers track main, skip tests of unbuilt tasks), the taskbar tray icon (#33), Claude daily cap 20M (Ben, #27). Lanes (parallel conductors, PR #31) are paused by Ben.
 
 ## Known risks
 
@@ -36,14 +28,14 @@
 
 ## Needs Ben (not build approvals; building continues around these)
 
-- Decide whether to raise `claude_daily_token_cap` (10M a day, weighted) to 20M. It shares his Claude plan allowance.
-
 - Turn on **"Require this computer"** for the "Forge supervisor (hourly builder)" scheduled task in the Claude desktop app, so it can reach the PC.
 - Keep the PC awake. In PowerShell as admin: `powercfg /change standby-timeout-ac 0`
 
 ## Open items
 
-- **Lanes (R58, 2026-10-01):** parallel conductors with shared caps (`--lane NAME`). Known limit: an agent can edit another lane's state undetected unless that lane has an agent run in progress; the strong fix is Layer 3's separate Windows user. To add a lane: `init --lane NAME`, then re-run `scripts/start_conductor.ps1`.
+- **Flaky test:** `test_live_run.R39SmokeCleanupTests.test_R39_guarded_smoke_logs_busy_folder_without_failing` and `test_R40_cli_waits_for_unpause_before_stale_smoke_and_run` each failed once in CI and passed on rerun. Likely cause: they patch `core.bootstrap.time.sleep`, which is the global `time.sleep`, so a background thread left running by another test (the R39 failure saw millions of sleep calls) is counted too. Fix: patch a module-local sleep hook, or find and stop the leaked thread.
+- **Flaky on Windows:** `test_service.HealthTests.test_thread_beats_until_stopped_then_marks_exited` hit PermissionError reading heartbeat.json while the thread replaced it (passed on rerun). Fix: retry the read, or write the heartbeat via a temp file and `os.replace` with a read retry.
+- **tests/acceptance vs tests/core:** the design (2.2) puts the test writer's files in `tests/acceptance/`; the conductor and Manager use `tests/core/`. Plans are told it is a known open item, not a reason to fail.
 - **ChatGPT Dots evaluated (2026-09-30):** not adopted for now. Email stays Forge's channel. A Dot round-trip trial is part of 1E, and the criteria are in `docs/specs/layer-1-design.md`.
 - **Codex runs that time out are not metered.** Codex keeps no session log under `--ephemeral` and reports usage only on a completed turn (see R46).
 - **Plan size:** a planner call has 30 minutes. If a part still times out, split it further rather than raising the timeout.
