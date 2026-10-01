@@ -3,7 +3,9 @@ import json
 import unittest
 from unittest.mock import patch
 
+from core.bootstrap import Capped, NotReady
 from core.ledger import Ledger
+from core.mutation import MutationResult
 from tests.core.test_bootstrap import git
 from tests.core.test_merge_pipeline import Pipeline
 
@@ -183,6 +185,89 @@ class EvidenceRewriteTests(Pipeline):
         self.assertEqual(task["evidence_rewrites"], 1)
         with self.subTest(check="clear accepted feedback"):
             self.assertFalse(task.get("test_feedback"))
+
+    def assert_interrupted_troubleshooter_returns_evidence(self, interruption, *, review=False):
+        reasons = ["Assert the integer return type."] if review else None
+        c = self.start_evidence(strong=review, review_reasons=reasons)
+        # The next failure must invoke the real failure/handoff bookkeeping.
+        c._update("T1", fails_since=1)
+        with patch.object(c, "_troubleshoot", side_effect=interruption) as trouble:
+            c.step()
+        trouble.assert_called_once()
+        self.assertEqual(trouble.call_args.args[0], "T1")
+        failures = [e for e in Ledger(self.state).events()
+                    if e["action"] == "fail" and e["contract_id"] == "T1"]
+        self.assertEqual(len(failures), 1)
+        payload = failures[0]["payload"]
+        self.assertEqual(payload["gate"], "review" if review else "mutation")
+        self.assertEqual(payload["verdict"], "fail" if review else "pass")
+        self.assertEqual(payload["mutation"]["passed"], review)
+        self.assertEqual(self.passes("T1"), [])
+        task = self.queue_task("T1")
+        with self.subTest(check="return to tests despite interruption"):
+            self.assertEqual(task["status"], "todo")
+        with self.subTest(check="feedback survives interruption"):
+            self.assertTrue(self.feedback_text(task))
+        with self.subTest(check="deferred builder troubleshooting cleared"):
+            self.assertFalse(task.get("troubleshoot_pending"))
+        with self.subTest(check="accepted tests cleared"):
+            self.assertFalse(task.get("tests_commit"))
+
+    def test_mutation_failure_returns_to_tests_when_troubleshooter_capped(self):
+        self.assert_interrupted_troubleshooter_returns_evidence(Capped("claude"))
+
+    def test_mutation_failure_returns_to_tests_when_troubleshooter_not_ready(self):
+        self.assert_interrupted_troubleshooter_returns_evidence(
+            NotReady({"claude": "probe unavailable"}))
+
+    def test_review_failure_returns_to_tests_when_troubleshooter_capped(self):
+        self.assert_interrupted_troubleshooter_returns_evidence(Capped("claude"), review=True)
+
+    def test_review_failure_returns_to_tests_when_troubleshooter_not_ready(self):
+        self.assert_interrupted_troubleshooter_returns_evidence(
+            NotReady({"claude": "probe unavailable"}), review=True)
+
+    def assert_mutation_feedback_without_survivors(self, result):
+        c = self.start_evidence()
+        self.team.reviewer.script = lambda p, cwd: ('{"verdict":"pass","reasons":[]}', 1)
+        # Keep the mutation gate real, including its zero-mutants rejection.
+        with patch.object(c, "_run_mutation", return_value=result) as run:
+            self.assertEqual(c.step(), "worked")
+        run.assert_called_once()
+        self.assertFalse(result.passed)
+        self.assertEqual(result.survivors, [])
+        failures = [e for e in Ledger(self.state).events()
+                    if e["action"] == "fail" and e["contract_id"] == "T1"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["payload"]["gate"], "mutation")
+        self.assertEqual(failures[0]["payload"]["mutation"], result.as_dict())
+        task = self.queue_task("T1")
+        self.assertEqual(task["status"], "todo")
+        feedback = self.feedback_text(task)
+        with self.subTest(check="nonempty feedback"):
+            self.assertTrue(feedback)
+        with self.subTest(check="mutation reason reaches writer"):
+            self.assertTrue(result.reason)
+            self.assertIn(result.reason, feedback)
+
+    def test_incomplete_mutation_budget_without_survivors_reports_gate_reason(self):
+        self.assert_mutation_feedback_without_survivors(MutationResult(
+            total=1, killed=0, not_run=["feat.py:2:constant"], complete=False,
+            passed=False, reason="incomplete: budget ran out, 1 of 1 mutants not run"))
+
+    def test_zero_mutants_reports_gate_reason(self):
+        self.assert_mutation_feedback_without_survivors(MutationResult(total=0, killed=0))
+
+    def test_review_feedback_identifies_failed_gate_and_reasons(self):
+        reasons = ["Assert the integer return type.", "Prove covers 1.1."]
+        c = self.start_evidence(strong=True, review_reasons=reasons)
+        self.build_attempt(c, mutation_passes=True, verdict="fail")
+        feedback = self.feedback_text(self.queue_task("T1"))
+        with self.subTest(check="gate identified"):
+            self.assertIn("review failed", feedback.lower())
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                self.assertIn(reason, feedback)
 
     def test_fourth_evidence_failure_blocks_after_three_returns(self):
         c = self.start_evidence()

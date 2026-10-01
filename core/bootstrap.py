@@ -2063,7 +2063,7 @@ class Conductor:
             self._block(tid, reason)
             return
         self._update(tid, status="todo", tests_commit=None, test_rejects=0, evidence_rewrites=n + 1,
-                     test_feedback=[str(x)[:NOTE_CAP] for x in feedback][:40])
+                     troubleshoot_pending=None, test_feedback=[str(x)[:NOTE_CAP] for x in feedback][:40])
 
     @staticmethod
     def _test_feedback_text(t: dict) -> str:
@@ -2319,16 +2319,23 @@ class Conductor:
             sig = (hashlib.sha256(("mutation:" + "|".join(sorted(ids))).encode("utf-8")).hexdigest()
                    if mres.complete else "mutation-incomplete")
             self._update(tid, review_feedback=survivor_feedback + given)
-            fail(reason, sig, self._survivor_listing(mres), submitted=True,
-                 payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "mutation"})
-            return self._evidence_rewrite(tid, reason, [f"{m.file}:{m.line} {m.original} -> {m.replacement} (surviving mutant {m.id})"
+            try:
+                fail(reason, sig, self._survivor_listing(mres), submitted=True,
+                     payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "mutation"})
+            finally:  # R65: even when a deferred troubleshooter run is interrupted (Capped/NotReady)
+                self._evidence_rewrite(tid, reason, [reason] + [f"{m.file}:{m.line} {m.original} -> {m.replacement} (surviving mutant {m.id})"
                                                         for m in mres.survivors] + given)
+            return
         if verdict != "pass":
             reasons = given or ["no reasons given"]
             self._update(tid, review_feedback=survivor_feedback + reasons)
-            fail("review failed: " + "; ".join(reasons), "review:" + "|".join(reasons), submitted=True,
-                 payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "review"})
-            return self._evidence_rewrite(tid, "review failed: " + "; ".join(reasons), reasons)
+            try:
+                fail("review failed: " + "; ".join(reasons), "review:" + "|".join(reasons), submitted=True,
+                     payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "review"})
+            finally:  # R65: as above
+                self._evidence_rewrite(tid, "review failed: " + "; ".join(reasons),
+                                       ["review failed"] + reasons)
+            return
 
         # Reviewed: hand S to the crash-safe finalizer. The ledger pass is applied only there, after the push.
         # The evidence is exactly the pass payload the build stage prepares (P1B1): verdict, reasons, mutation.
@@ -2759,7 +2766,7 @@ class Conductor:
                 d0 = drift_mod.load(self.state)
                 trig = ((d0 or {}).get("stall") or {}).get("trigger") or "drift check"
                 if d0 is not None:  # the stall is consumed: fresh window, no immediate re-fire
-                    d0["stall"] = None
+                    d0["stall"], d0["auto_replans"] = None, 0
                     drift_mod.restart_window(d0, self._activity().total())
                     drift_mod.save(self.state, d0)
                 self._fyi("the drift check keeps failing",
@@ -2779,6 +2786,8 @@ class Conductor:
                 drift_mod.new_replan(d, ([f"stall rule: {trigger}"] if trigger else []) + reasons,
                                      trigger or "drift keeper")
             d["stall"] = None
+            if not use_manager:  # R66a: the event is consumed with a notice, not handed to a Manager
+                d["auto_replans"] = 0
             drift_mod.restart_window(d, self._activity().total())
             drift_mod.save(self.state, d)  # durable before drift_due is cleared: a crash never loses the re-plan
             self._crash("after:replan-pending")

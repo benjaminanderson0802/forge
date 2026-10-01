@@ -88,6 +88,11 @@ class NoReplanPauseTests(DriftHarness):
         self.assertEqual(c.step(), "worked")
         self.assertEqual(c.step(), "worked")
         self.assertTrue(self.queue()["drift_due"])
+        # Count the merge before seeding: its coverage gain resets this counter.
+        c._drift_bookkeeping(self.queue())
+        d = self.dstate()
+        d["auto_replans"] = 2
+        drift.save(self.state, d)
         c.team.drift_keeper.script = lambda p, cwd: ("not json", 1)
         for failures in (1, 2):
             self.assertEqual(c.step(), "worked")
@@ -99,6 +104,7 @@ class NoReplanPauseTests(DriftHarness):
                 # stall must also be consumed by the unusable-output fallback.
                 c._activity().add(7201)
         self.assertEqual(self.dstate()["stall"]["trigger"], "no merge in 2 active hours")
+        self.assertEqual(self.dstate()["auto_replans"], 2)
         self.assertEqual(c.step(), "worked")
         self.assertEqual(len(c.team.drift_keeper.prompts), 3)
         self.assert_notice_without_pause("no merge in 2 active hours", "3")
@@ -115,6 +121,14 @@ class NoReplanPauseTests(DriftHarness):
         self.keeper = {"status": "replan", "reasons": ["missing coverage for beta"]}
         c = self.conductor(btask("T1", ["1.1"]), btask("T2", ["2.1"]), manager=False)
         self.assertIsNone(c.manager)
+        self.assertEqual(c.step(), "worked")
+        self.assertEqual(c.step(), "worked")
+        self.assertTrue(self.queue()["drift_due"])
+        c._drift_bookkeeping(self.queue())
+        d = self.dstate()
+        d["auto_replans"] = 2
+        drift.save(self.state, d)
+        self.assertEqual(self.dstate()["auto_replans"], 2)
         self.finish(c, "T1")
         self.assert_notice_without_pause("drift keeper", "missing coverage for beta")
         self.assert_window_restarted(c)
