@@ -3,7 +3,8 @@
 Plain code, standard library only, no imports from core.bootstrap. Every git call runs without a shell,
 with no stdin and (on Windows) no window.
 
-    work/tasks/<tid>   the task's own worktree, on branch forge-task/<tid>
+    work/tasks/<tid>   the task's own worktree, on branch forge-task/<tid> (main lane) or forge-lane/<lane>/<tid>
+                       (any other lane, R60: two lanes may both have a task T1)
     work/tmp/<12 hex>  a throwaway worktree, detached at one exact commit
 """
 from __future__ import annotations
@@ -54,9 +55,12 @@ def _unlock(fn, path, _exc) -> None:
 
 
 class Worktrees:
-    def __init__(self, repo: Path, work: Path):
+    def __init__(self, repo: Path, work: Path, branch_prefix: str = "forge-task/"):
         self.repo = Path(repo)
         self.work = Path(work)
+        # R60: main keeps forge-task/<tid>; another lane uses forge-lane/<lane>/<tid>. Not forge-task/<lane>/<tid>:
+        # git can't hold both a branch forge-task/p2 (a main task named p2) and forge-task/p2/T1.
+        self.prefix = branch_prefix
 
     # ------------------------------------------------------------------ names
     @staticmethod
@@ -69,7 +73,7 @@ class Worktrees:
         return self.work / "tasks" / self._check(tid)
 
     def task_branch(self, tid: str) -> str:
-        return f"forge-task/{self._check(tid)}"
+        return f"{self.prefix}{self._check(tid)}"
 
     # ------------------------------------------------------------------ git helpers
     def _commit(self, ref: str) -> str:
@@ -110,7 +114,7 @@ class Worktrees:
 
     # ------------------------------------------------------------------ task worktrees
     def prepare_task(self, tid: str, base: str) -> Path:
-        """Make task_path(tid) a clean worktree on forge-task/<tid> whose HEAD is exactly `base`."""
+        """Make task_path(tid) a clean worktree on task_branch(tid) whose HEAD is exactly `base`."""
         path, branch = self.task_path(tid), self.task_branch(tid)
         sha = self._commit(base)
         if self._registered(path) and (path / ".git").exists():
@@ -183,9 +187,9 @@ class Worktrees:
                 except (OSError, RuntimeError):
                     pass
         # a crash between removing a task folder and deleting its branch leaves an orphan branch
-        out = _run(self.repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/forge-task/").stdout or ""
-        for branch in out.split():
-            tid = branch[len("forge-task/"):]
+        out = _run(self.repo, "for-each-ref", "--format=%(refname:short)", f"refs/heads/{self.prefix}").stdout or ""
+        for branch in out.split():  # only this lane's own namespace (another lane's tid holds a "/", never matches)
+            tid = branch[len(self.prefix):]
             if tid in keep or tid in seen or not TID_RE.fullmatch(tid):
                 continue
             if not self._registered(self.work / "tasks" / tid):

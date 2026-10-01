@@ -7,6 +7,10 @@ localhost on its port (DNS rebinding), refuses cross-site POSTs, and forbids fra
 files and never writes them, with one exception: the Stop button creates `state/KILL` (D-024). Answers are not
 applied here; they go to the conductor through the answer drop folder (core.channel), which checks each one exactly
 like an email reply. Standard library only.
+
+R60 lanes: with the shared folder (state/shared) the usage bars are the shared meter's and mail budget's (every lane
+together), Stop also writes the global KILL that stops every lane, and a "Lanes" section shows each other lane's
+queue and current task. Answers on this page are for the main lane's questions; other lanes are answered by email.
 """
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
-from core import channel, readiness
+from core import channel, lanes, readiness
 from core.usage import Meter
 
 PORT = 8765
@@ -62,7 +66,10 @@ def _e(x) -> str:
 
 def _mail_used(state: Path, now: datetime) -> tuple[int, int]:
     hour = day = 0
-    for x in _read(state, "mail_log.json", {}).get("sent", []):
+    folder = Path(state) / "mail"  # R60: with lanes, every lane's own mail file in state/shared/mail/
+    logs = [_read(folder, f.name, {}) for f in sorted(folder.glob("*.json")) if not f.name.startswith(".")] \
+        if folder.is_dir() else [_read(state, "mail_log.json", {})]
+    for x in [x for log in logs for x in log.get("sent", [])]:
         try:
             age = (now - datetime.fromisoformat(x)).total_seconds()
         except (TypeError, ValueError):
@@ -94,9 +101,37 @@ def progress(forge_root: Path, tasks: list[dict]) -> dict:
             "overall": ((done + frac) / len(phases)) if phases else 0.0}
 
 
-def render(state: Path, limits: dict, now: datetime | None = None, *, local_tz=None) -> str:
-    """The whole page as HTML. Pure apart from reading state files; every value is escaped."""
+def _lanes_html(state_root: Path) -> str:
+    """R60: each lane other than main: its layer, current task, flags and queue."""
+    out = []
+    for name in lanes.listed(state_root)[1:]:
+        st = lanes.state_dir(state_root, name)
+        q = _read(st, "queue.json", {})
+        tasks = [t for t in q.get("tasks", []) if isinstance(t, dict)]
+        current = next((t for t in tasks if t.get("status") in ("todo", "tests_ok")), None)
+        flags = [f for f in ("KILL", "PAUSED") if (st / f).exists()]
+        done = sum(1 for t in tasks if t.get("status") == "done")
+        open_q = len(channel.queue_items(_read(st, "questions.json", {})))
+        head = (f"<div class=card><div><strong>Lane {_e(name)}</strong> <span class=muted>"
+                f"{_e(q.get('layer') or 'no queue')} &middot; {done} of {len(tasks)} done"
+                f"{' &middot; ' + _e(', '.join(flags)) + ' set' if flags else ''}"
+                f"{f' &middot; {open_q} question(s) for you (answer by email)' if open_q else ''}</span></div>")
+        now_line = (f"<p>Now: <strong>{_e(current.get('id'))}</strong> {_e(current.get('title', ''))} "
+                    f"<span class=muted>({_e(current.get('status'))})</span></p>") if current else ""
+        rows = "".join(f"<tr><td>{_e(t.get('id'))}</td><td>{_e(t.get('title', ''))}</td>"
+                       f"<td>{_e(t.get('status'))}</td></tr>" for t in tasks)
+        table = (f"<div class=row><table><tr><th>Task</th><th>Title</th><th>Status</th></tr>{rows}</table></div>"
+                 if tasks else "<p class=muted>No tasks queued.</p>")
+        out.append(head + now_line + table + "</div>")
+    return ("<h2>Lanes</h2>" + "".join(out)) if out else ""
+
+
+def render(state: Path, limits: dict, now: datetime | None = None, *, local_tz=None,
+           shared: Path | None = None) -> str:
+    """The whole page as HTML. Pure apart from reading state files; every value is escaped.
+    R60: with `shared`, usage is every lane's together and the other lanes are listed."""
     state = Path(state)
+    mail_state = Path(shared) if shared is not None else state
     now = now or datetime.now(timezone.utc)
     local = channel.to_local(now, local_tz)
     out = [f"<h1>Forge status</h1><p class=muted>{_e(local.strftime('%A %d %B %Y, %H:%M'))} "
@@ -109,7 +144,11 @@ def render(state: Path, limits: dict, now: datetime | None = None, *, local_tz=N
                         f"{pr['done']} of {pr['phases']} phases done; now: {pr['current'] or 'all done'}"))
     out.append(_bar("Current phase's queue", pr["tasks_done"], pr["tasks"] or 1,
                     f"{pr['tasks_done']} of {pr['tasks']} tasks done"))
-    meter0 = Meter(state, clock=lambda: now)
+    if shared is not None:
+        from core.service import shared_meter
+        meter0 = shared_meter(Path(shared), lambda: now)
+    else:
+        meter0 = Meter(state, clock=lambda: now)
     reset = channel.to_local(now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1), local_tz)
     out.append("<h2>Usage today</h2>")
     for p in PROVIDERS:
@@ -124,10 +163,10 @@ def render(state: Path, limits: dict, now: datetime | None = None, *, local_tz=N
         except Exception:  # noqa: BLE001 - the page never breaks on a counter
             runs = 0
         out.append(_bar("Agent runs", runs, rcap, f"{runs} of {rcap}", usage=True))
-    mh0, md0 = _mail_used(state, now)
+    mh0, md0 = _mail_used(mail_state, now)
     out.append(_bar("Email to you", md0, limits.get("mail_per_day", 30),
                     f"{md0} of {limits.get('mail_per_day', 30)} today, {mh0} this hour", usage=True))
-    if (state / "KILL").exists():
+    if (state / "KILL").exists() or (shared is not None and (Path(shared) / "KILL").exists()):
         out.append("<div class='banner stop'>Forge is stopped (KILL is set). It restarts only when you clear the "
                    "stop yourself.</div>")
     if (state / "PAUSED").exists():
@@ -177,17 +216,19 @@ def render(state: Path, limits: dict, now: datetime | None = None, *, local_tz=N
     else:
         out.append("<p class=muted>No tasks queued.</p>")
 
-    meter = Meter(state, clock=lambda: now)
+    meter = meter0
     rows = []
     for p in PROVIDERS:
         cap = limits.get(f"{p}_daily_token_cap")
         rows.append(f"<tr><td>{p} tokens today</td><td>{meter.used_today(p)} of {_e(cap if cap is not None else '-')}"
                     "</td></tr>")
-    mh, md = _mail_used(state, now)
+    mh, md = _mail_used(mail_state, now)
     rows.append(f"<tr><td>email</td><td>{mh} of {_e(limits.get('mail_per_hour', 6))} this hour, "
                 f"{md} of {_e(limits.get('mail_per_day', 30))} today</td></tr>")
     out.append("<h2>Caps</h2><div class=row><table>" + "".join(rows) + "</table></div>")
 
+    if shared is not None:
+        out.append(_lanes_html(Path(shared).parent))
     caps = _read(state, "capabilities.json", {})
     out.append("<h2>Capabilities</h2>")
     if not caps:
@@ -249,7 +290,8 @@ class AnswerOutbox:
 
 
 def make_server(state: Path, channel_dir: Path, limits: dict, host: str = "127.0.0.1", port: int = PORT,
-                local_tz=None, outbox: "AnswerOutbox | None" = None) -> ThreadingHTTPServer:
+                local_tz=None, outbox: "AnswerOutbox | None" = None,
+                shared: Path | None = None) -> ThreadingHTTPServer:
     """A server bound to the loopback address only (D-022). port=0 picks a free port (tests)."""
     if host not in LOOPBACK:
         raise ValueError(f"the status page binds 127.0.0.1 only, not {host!r}")
@@ -301,7 +343,7 @@ def make_server(state: Path, channel_dir: Path, limits: dict, host: str = "127.0
             if self.path.split("?", 1)[0] != "/":
                 return self._send(404, "Not found")
             try:
-                page = render(state, limits, local_tz=local_tz)
+                page = render(state, limits, local_tz=local_tz, shared=shared)
             except Exception as e:  # noqa: BLE001 - a broken file never takes the page down
                 page = f"<!doctype html><title>Forge status</title><p>Could not read Forge's state: {_e(e)}</p>"
             self._send(200, page)
@@ -328,6 +370,8 @@ def make_server(state: Path, channel_dir: Path, limits: dict, host: str = "127.0
             form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace")).items()}
             if path == "/stop":  # D-024: one of the three equal ways to stop Forge
                 (state / "KILL").write_text("stopped from the status page\n", encoding="utf-8")
+                if shared is not None:  # R60: the global KILL stops every lane
+                    (Path(shared) / "KILL").write_text("stopped from the status page\n", encoding="utf-8")
                 return self._send(303, "", location="/")
             qid, code, answer = form.get("qid", ""), form.get("code", ""), form.get("answer", "").strip()
             if form.get("approve") == "y":  # the gate's Approve button: the same "y" an email reply would carry
@@ -362,7 +406,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--port", type=int, default=PORT)
     a = ap.parse_args(argv)
     state = forge / "state" / "bootstrap"  # the conductor's state (core.bootstrap main)
-    srv = make_server(state, state.parent / "channel", load_limits(forge), port=a.port)
+    srv = make_server(state, state.parent / "channel", load_limits(forge), port=a.port,
+                      shared=lanes.shared_dir(state.parent))
     print(f"Forge status page: http://127.0.0.1:{srv.server_address[1]}")
     try:
         srv.serve_forever()
