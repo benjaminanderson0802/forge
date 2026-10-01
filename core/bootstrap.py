@@ -45,6 +45,7 @@ TASK_FIELDS = ("id", "title", "section", "files_in_scope", "test_files", "test_c
 NOTE_CAP, NOTES_KEEP, BODY_CAP = 2000, 30, 20000  # R19
 MIN_SECTION_CHARS = 600  # R41: a task's section is its builder's only instructions
 PLAN_REVIEW_MAX = 200_000  # R44: the plan reviewer sees the whole plan, up to this size
+JUDGE_TIMEOUT_S = 2400  # R55: a judge command (drills, the parallel suite) may run this long
 PLAN_ATTEMPTS = 3  # R45: a plan task is blocked after this many rejections
 PLAN_MEMORY_NOTES, PLAN_MEMORY_CHARS = 10, 12000  # R47
 SUBJECT_CAP, CLOSED_KEEP, SENT_IDS_KEEP = 300, 50, 500  # R26, R28
@@ -109,7 +110,8 @@ S_TROUBLE = _obj({"kind": {"type": "string", "enum": ["fix", "dead_end", "sugges
 S_DRIFT = _obj({"status": {"type": "string", "enum": ["ok", "replan"]}, "reasons": _STRS}, ["status"])
 S_PLAN = _obj({"tasks": {"type": "array", "items": _obj(
     {"id": _STR, "title": _STR, "section": _STR, "files_in_scope": _STRS, "test_files": _STRS, "test_cmd": _STR,
-     "needs": {"type": "array", "items": {"type": "string"}}},
+     "needs": {"type": "array", "items": {"type": "string"}},
+     "depends_on": {"type": "array", "items": {"type": "string"}}},
     list(TASK_FIELDS))}}, ["tasks"])
 
 
@@ -799,7 +801,9 @@ class Conductor:
         """Runnable tasks in the order they should run: pending troubleshooting first (troubleshooter's
         requirements only), then todo/tests_ok tasks in queue order. Unready tasks record waiting_on and are
         skipped; self._waiting says whether anything was skipped for readiness."""
-        tasks = [t for t in q["tasks"] if t["status"] in ("todo", "tests_ok")]
+        done = {t["id"] for t in q["tasks"] if t.get("status") == "done"}
+        tasks = [t for t in q["tasks"] if t["status"] in ("todo", "tests_ok")
+                 and all(d in done for d in (t.get("depends_on") or []))]  # R55: dependencies first
         pending = [t for t in tasks if t["status"] == "tests_ok" and t.get("troubleshoot_pending")]
         rest = [t for t in tasks if t not in pending]
         for t in pending + rest:
@@ -1716,7 +1720,8 @@ class Conductor:
 
     def _run_cmd_timed(self, cmd: str, cwd: Path | None = None) -> tuple[int, str]:
         try:
-            code, out, why = run_tree(_cmd_args(cmd), cwd or self.wt, int(self.limits.get("test_timeout_s", 600)),
+            code, out, why = run_tree(_cmd_args(cmd), cwd or self.wt,  # R55: the whole suite needs longer
+                                      int(self.limits.get("judge_timeout_s", JUDGE_TIMEOUT_S)),
                                       should_stop=self._stop_requested)
         except (OSError, ValueError) as e:  # not runnable (missing program, bad quoting): a failed judge
             return 127, f"command could not start: {cmd}: {e!r}"
@@ -2575,6 +2580,9 @@ class Conductor:
                            "Each task may also list \"needs\": capability names from the capability map (git, github, "
                            "claude, codex, gmail, docker, n8n, ollama, python_libs, browser, or a new name) that its "
                            "Builder needs beyond git and its own AI.\n"
+                           "Each task may also list \"depends_on\": ids of earlier tasks in this plan whose code it "
+                           "uses. It is not started (tests or build) until those are done and merged, and its "
+                           "builder works on top of their code (R55).\n"
                            "IMPORTANT (R41): each task's section is the ONLY instruction the test writer and the "
                            "builder will see. Make it complete and self-contained: what to build, exact interfaces "
                            "and signatures, behaviour, edge cases, dependencies on earlier tasks, and the acceptance "
@@ -2657,6 +2665,9 @@ class Conductor:
             nt["kind"], nt["status"] = "build", "todo"
             if isinstance(x.get("needs"), list):
                 nt["needs"] = list(x["needs"])
+            deps = x.get("depends_on")
+            if isinstance(deps, list):  # R55: built only after these tasks are done (merged)
+                nt["depends_on"] = [str(d) for d in deps if isinstance(d, str) and d != nt["id"]]
             q["tasks"].append(nt)
         self._save_queue(q)
         self._push()
@@ -3001,7 +3012,7 @@ def main(argv: list[str]) -> int:
     c = Conductor(forge, Path(a.work), state, real_team(limits), limits, owner_email=a.owner,
                   mailer=gmail_mailer(a.owner), inbox=gmail_inbox(a.owner, state), gh=gh_cli(forge),
                   manager=real_manager(limits),
-                  judge_cmds=["python drills/run_drills.py", "python -m unittest discover -s tests/core"])
+                  judge_cmds=["python drills/run_drills.py", "python -m core.suite"])
     if a.cmd == "init":
         c.init_queue(a.layer, json.loads(Path(a.tasks).read_text(encoding="utf-8")))
         print("queue ready")
