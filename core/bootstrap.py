@@ -2235,6 +2235,10 @@ class Conductor:
         t0 = self.clock()
         try:
             mres = self._run_mutation(root, changed, t, timeout, baseline)
+            if t.get("evidence") is True and mres.total == 0:  # R63: no mutants proves nothing
+                mres.passed = False
+                mres.reason = ("evidence task: no mutants were generated from the in-scope code its tests "
+                               "name, so the tests prove nothing about it")
         finally:
             self._activity().add(self._since(t0))  # T1C4: judges are active work
         if self._changed(cwd=root) or _git(root, "rev-parse", "HEAD") != sha:
@@ -2255,6 +2259,11 @@ class Conductor:
         out: dict[str, set[int]] = {f: set(lines) for f, lines in changed_lines(diff).items() if in_scope(f)}
         if t.get("evidence") is not True:
             return out
+
+        def is_test(f: str) -> bool:  # R63: evidence never mutates any test file, this task's or another's
+            return f.startswith("tests/") or "/tests/" in f or Path(f).name.startswith("test_")
+
+        out = {f: lines for f, lines in out.items() if not is_test(f)}
         words = set()
         for f in tests:
             try:
@@ -2262,7 +2271,7 @@ class Conductor:
             except (OSError, UnicodeDecodeError):
                 pass
         files = [_norm(x) for x in _git(root, "ls-files").splitlines() if x.strip()]
-        files = [f for f in files if f.endswith(".py") and in_scope(f)]
+        files = [f for f in files if f.endswith(".py") and in_scope(f) and not is_test(f)]
         named: dict[str, set[int]] = {}
         texts: dict[str, str] = {}
         for f in files:

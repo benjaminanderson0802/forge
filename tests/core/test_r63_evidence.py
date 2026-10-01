@@ -171,12 +171,12 @@ class EvidenceTestsStageTests(DriftHarness):
 
 
 class EvidenceBuildTests(Pipeline):
-    def run_empty_diff_mutation(self, assertion):
+    def run_empty_diff_mutation(self, assertion, source="def value():\n    return 42\n"):
         self.agents["builder"] = lambda prompt, cwd: ('{"status":"done"}', 1)
         c = self.conductor()
         task = self.task(evidence=True, covers=["1.1"])
         c.init_queue(self.layer, [task])
-        (c.wt / "feat.py").write_bytes(b"def value():\n    return 42\n")
+        (c.wt / "feat.py").write_bytes(source.encode())
         path = c.wt / task["test_files"][0]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(("import unittest\nimport feat\n"
@@ -217,6 +217,25 @@ class EvidenceBuildTests(Pipeline):
             self.assertEqual({(m.file, m.line) for m in result.survivors}, {("feat.py", 2)})
             self.assertFalse(result.passed)
         with self.subTest(check="mutation overrides passing reviewer"):
+            self.assertNotEqual(self.queue_task("T1")["status"], "done")
+            self.assertEqual(self.passes("T1"), [])
+            failures = [e for e in Ledger(self.state).events() if e["action"] == "fail"]
+            self.assertTrue(failures)
+            self.assertEqual(failures[-1]["payload"]["verdict"], "pass")
+            self.assertEqual(failures[-1]["payload"]["gate"], "mutation")
+            self.assertEqual(failures[-1]["payload"]["mutation"], result.as_dict())
+
+    def test_empty_diff_evidence_with_zero_mutants_cannot_finish(self):
+        result, head = self.run_empty_diff_mutation(
+            "self.assertIsNotNone(feat.value())",
+            source="VALUE = 42\ndef value():\n    return VALUE\n")
+        self.assertEqual(result.total, 0)
+        self.assertEqual(result.killed, 0)
+        self.assertEqual(result.survivors, [])
+        self.assertEqual(result.not_run, [])
+        with self.subTest(check="zero mutants fail the mutation judge"):
+            self.assertFalse(result.passed, result.as_dict())
+        with self.subTest(check="passing reviewer cannot complete the task"):
             self.assertNotEqual(self.queue_task("T1")["status"], "done")
             self.assertEqual(self.passes("T1"), [])
             failures = [e for e in Ledger(self.state).events() if e["action"] == "fail"]
@@ -356,6 +375,42 @@ class EvidenceMutationTargetTests(Harness):
         c, task, head = self.target_fixture(names="value_suffix prefix_read unused_suffix")
         self.assertEqual(self.targets(c, task, head, head),
                          {"feat.py": set(range(1, 12)), "extra.py": {1, 2}})
+
+    def test_evidence_broad_scope_excludes_all_test_files_in_every_selection_path(self):
+        c, task, _ = self.target_fixture(names="value")
+        other_tests = ("tests/core/test_other.py", "tests/helpers.py",
+                       "test_other.py", "support/test_other.py")
+        for name in other_tests:
+            self.assertNotIn(name, task["test_files"])
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"def value():\n    return 17\n")
+        git(self.repo, "add", *other_tests)
+        git(self.repo, "commit", "-q", "-m", "unrelated tracked test functions")
+        head = git(self.repo, "rev-parse", "HEAD")
+        with self.subTest(selection="named definitions"):
+            self.assertEqual(self.targets(c, task, head, head), {"feat.py": {2, 3, 4}})
+
+        proof = self.repo / task["test_files"][0]
+        proof.write_bytes(b"# no matching names\ndef test_proof():\n    assert True\n")
+        git(self.repo, "add", task["test_files"][0])
+        git(self.repo, "commit", "-q", "-m", "evidence requiring all-lines fallback")
+        base = git(self.repo, "rev-parse", "HEAD")
+        with self.subTest(selection="all-lines fallback"):
+            self.assertEqual(self.targets(c, task, base, base),
+                             {"feat.py": set(range(1, 12)), "extra.py": {1, 2}})
+
+        # Name production code again, but change unnamed functions in every
+        # unrelated test file so only the changed-lines union could select them.
+        proof.write_bytes(b"# value\ndef test_proof():\n    assert True\n")
+        for name in other_tests:
+            (self.repo / name).write_bytes(b"def unrelated():\n    return 18\n")
+        (self.repo / "feat.py").write_bytes(self.SOURCE.replace("TOP = 10", "TOP = 11").encode())
+        git(self.repo, "add", "feat.py", task["test_files"][0], *other_tests)
+        git(self.repo, "commit", "-q", "-m", "change production and unrelated test lines")
+        sha = git(self.repo, "rev-parse", "HEAD")
+        with self.subTest(selection="changed-lines union"):
+            self.assertEqual(self.targets(c, task, base, sha), {"feat.py": {1, 2, 3, 4}})
 
     def test_ordinary_targets_only_changed_lines_even_when_tests_name_functions(self):
         c, task, base = self.target_fixture(evidence=False)
