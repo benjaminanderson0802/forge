@@ -469,6 +469,113 @@ Fixes made when 1B, the R42–R48 amendments, 1C, 1D and 1E were merged into one
 
 - **R59 A task's judges skip tests of layer tasks not built yet** (found by Forge's own troubleshooter in the gate run, 2026-10-01). Stage A writes and commits a task's acceptance tests before earlier tasks merge, so the layer branch holds tests whose code doesn't exist yet. The suite judge therefore failed every earlier task, every time. Now each per-task suite judge gets `--exclude <file>` for every test file of another build task in the layer that isn't `done`. A task's own test files are never excluded. A module that isn't excluded still fails the suite as before. The layer gate, where every task is done, and CI run everything.
 
+## Lanes amendment (2026-10-01)
+
+Module: `core/lanes.py`, with hooks in `core/bootstrap.py`, `core/usage.py`, `core/service.py`, `core/status_page.py` and `scripts/start_conductor.ps1`. Tests: `tests/core/test_lanes.py`. This amendment was requested as "R56"; R56 and R57 were already taken above, so it is numbered **R60**.
+
+- **R60 Lanes: parallel conductors with shared caps.** Within one conductor agents can't run at the same time: the after-run tamper check (R9/R14) would see the conductor's own writes for another task. A lane is a separate conductor process with its own state, so lanes run side by side and each lane's tamper check sees only its own state.
+  - **Command line:** `python -m core.bootstrap <cmd> --lane NAME`. The default lane, `main`, keeps today's paths.
+    - **State:** `state/bootstrap/` for main, `state/lanes/<NAME>/` for every other lane: its own lock (R11), queue, questions, runs, capabilities, ledger and notices.
+    - **Worktrees:** `Forge-work/` for main, `Forge-work/lanes/<NAME>/` for the others.
+    - **Layer branch:** set per lane by `init --layer`. `init` refuses a layer branch that another lane's queue already uses, and adds the lane to `state/lanes.json` (a list of names; main is implied).
+    - **Names:** a lowercase letter, then up to 23 lowercase letters, digits or `_`. No `-` (a question id's lane prefix must be unambiguous). Question kinds, `main` and the state and service folder names are reserved.
+  - **Shared by every lane, in `state/shared/`:**
+    - the token meter (`meter.json`) and holds (`holds.json`), through `Meter(shared, lock=…, runs_dirs=…)`;
+    - the runs-per-day count (R51), counted over every lane's `runs/` folder;
+    - the mail log and budget (`mail_log.json`, R20/R25): `_send` reserves a send in one locked read-modify-write;
+    - `inbox_seen.json` (R26);
+    - the global `KILL`.
+  - **Locking:** every read-modify-write of a shared file holds `state/shared/shared.lock` (`msvcrt.locking` on Windows, `fcntl.flock` elsewhere, non-blocking with retries, `TimeoutError` after 60 s). Writes go to a `.tmp-*` file beside the target and are replaced atomically. On Windows a replace is retried while a reader has the file open.
+  - **Migration:** on any `core.bootstrap` start, if `state/shared/meter.json` doesn't exist, the main lane's `meter.json`, `holds.json`, `mail_log.json` and `inbox_seen.json` are copied into `state/shared/` (the meter last, as the done-marker). The old copies are left in place. Each later start raises the shared meter to the old file's count for any day and provider where the old one is higher, so an older conductor that kept writing the old file can't reset a cap. A count is never lowered.
+  - **KILL:**
+    - **Global KILL** (`state/shared/KILL`) stops every lane: `step()`, `_send`, the service sleep, the watchdog and R49's mid-run stop all check it.
+    - **Lane KILL** (`<lane state>/KILL`) stops one lane.
+    - **These write the global KILL** (plus the writing lane's own KILL): a STOP by email or by the status page, the Stop Forge shortcut, `python -m core.service stop` (`--lane NAME` stops one lane), and a tamper alarm in any lane (the lanes share caps and state, so a tamper alarm stops them all).
+    - **A global KILL appearing during a run** is a stop under R42, not tampering.
+    - **Start Forge** clears every KILL and runs the watchdog, which starts every lane.
+  - **Tamper fingerprint (R9/R14/R15, per lane):** a lane fingerprints its own state folder (as before), its own answer drop folder, and every file in `state/shared/` except:
+    - the accumulate files (`meter.json`, `holds.json`, `mail_log.json`, `inbox_seen.json`);
+    - `shared.lock`;
+    - `.tmp-*` replace temporaries.
+
+    Other lanes' conductors write the accumulate files at any time, and only plain conductor code writes them. An agent writing them is the new risk. So instead of a fingerprint they get a **never-decreases check** around every agent run (`lanes.shrunk`). Each of these is tampering:
+    - any meter count for any day and provider decreasing or disappearing;
+    - a hold shortened or removed;
+    - a send younger than 23 hours, or a recent Message-ID, removed from the mail log;
+    - a handled Message-ID removed from `inbox_seen.json` while the list is under its cap;
+    - a file that was readable becoming missing or unreadable.
+
+    Additions are never tampering.
+  - **Not fingerprinted by a lane:**
+    - other lanes' state folders, written by their own conductors at any time;
+    - `state/lanes.json`, written by Ben's `init`;
+    - `state/service/`: heartbeats.
+  - **Known limit:** an agent in lane A that edits lane B's state (its queue, its questions) is caught only if lane B has an agent run in progress at that moment (B's own fingerprint). Lane A can't tell an agent's write to B's folder from B's conductor's own writes. The strong fix is the one already planned for Layer 3: agents run as a separate Windows user that can't write Forge's state at all.
+  - **Ben's email:**
+    - **Only the main lane reads the mailbox.** Other lanes send through the same `_send`, under the shared budget.
+    - **Question ids:** a non-main lane's question ids carry its name as a prefix (`p2-blocked-3`).
+    - **Routing:** when main reads an owner's reply whose subject names a lane-prefixed question of a listed lane, it doesn't answer it. It appends the reply (from, subject, cleaned body) to `state/bootstrap/routed/<lane>.json` (last 50). That file is in main's own state, written between main's agent runs.
+    - **The lane's inbox:** it reads that file, keeps what it has read in its own `routed_seen.json`, and never writes main's folder. It then handles each reply exactly like an email: owner check, question code, kind.
+    - **STOP** is handled by main itself and writes the global KILL.
+  - **Service and watchdog:**
+    - **Heartbeats:** each lane beats in `state/service/` (main, as before) or `state/service/<lane>/`.
+    - **Watchdog:** `python -m core.service watchdog` checks main and every lane in `state/lanes.json` (R53 per lane: its heartbeat, its lock, its task `Forge conductor <lane>`; main keeps `Forge conductor`).
+    - **`scripts/start_conductor.ps1`** registers one conductor task per listed lane.
+  - **Status page:** the usage bars are the shared meter, runs and mail budget (every lane together). A "Lanes" section shows each other lane's layer, current task, flags and queue. Answers on the page are for main's questions; other lanes' questions are answered by email.
+
+- **R61 Each layer is built against its own design.** `init --spec <file>` records `spec_file` in the lane's queue. The drift keeper and the coverage map read that design. Without it they read `limits["spec_file"]`, else the Layer 1 design. A Phase 2 lane therefore drifts against `docs/specs/phase-2-design.md`, not Layer 1's.
+
+## R60 review round 1 (Codex review, 2026-10-01; overrides R60 where they differ)
+
+- **R60a Launch admission is atomic.** Under the shared lock, one transaction does all of this before the lock is released:
+  - checks this lane's own accounting and the shared accounting;
+  - checks the provider's token cap, holds and runs per day;
+  - reserves the launch by creating its run folder, which every lane's runs-per-day count sees.
+
+  `_admit`, called by `_guarded_run`, does this for every launch, probes included. Two lanes can never both take the last run of the day.
+- **R60b Shared usage can't be lost or lowered silently.** The single shared `meter.json`, `holds.json` and `mail_log.json` are replaced by one file per lane: `state/shared/meter/<lane>.json`, `holds/<lane>.json` and `mail/<lane>.json`.
+  - **Writing:** each lane writes only its own files, under the lock.
+  - **Totals:** the meter and the mail budget are summed over every lane's file; a hold is the latest over every lane's file.
+  - **No lost updates:** no lane ever rewrites a file that another lane increments, so a concurrent increment can't be overwritten by a stale copy.
+  - **Protection:**
+    - **Own files** are fingerprinted by their lane, like the rest of its state.
+    - **Other lanes' files** may only grow during this lane's agent runs (`lanes.shrunk`).
+    - **Expected-content check:** the owning conductor remembers exactly what it last wrote, and checks before every write, every launch and every step (`OwnFiles.verify`). Any difference is a tamper alarm (KILL for every lane and a halt question). An agent that writes back a stale copy of another lane's counter is therefore caught by the lane that owns it, even when the running lane's before/after comparison can't see it.
+    - **While the owning lane isn't running,** its file doesn't change, so any decrease is below the running lane's snapshot and that lane catches it.
+  - **`inbox_seen.json`** is the main lane's own file: main fingerprints it, and the other lanes check it only grows.
+- **R60c Unreadable accounting fails closed.** Shared accounting is read strictly: a missing marker, a missing main meter, unreadable files, invalid JSON, or invalid shapes all count as unreadable.
+  - Every `step()` checks it. If it can't be trusted: nothing is launched, `step()` returns `"not_ready"`, the problem is logged, and Ben is asked once (question kind `accounting`, a halt question).
+  - `Meter.over` reports capped.
+  - A meter or mail file that can't be read is never overwritten.
+  - `_send` sends nothing while the mail accounting can't be read.
+  - Before a run, an unreadable accounting file means the agent is not launched. After a run, a file that became unreadable is tampering.
+- **R60d Migration happens once, with a marker.** The first start copies the old main-lane files into `meter/main.json`, `holds/main.json`, `mail/main.json` and `inbox_seen.json`, then writes `state/shared/migrated.json`. Every start calls `migrate` (the CLI and every `Conductor` with lanes), but a marked folder is never migrated again: a meter missing after that is unreadable accounting (R60c), never a reset. The R60 meter top-up is dropped.
+- **R60e `init` never replaces a queue silently.** `init` refuses (exit 2) when the lane's queue still has tasks, unless `--force` is given. The Phase 2 start command is `python -m core.bootstrap init --lane p2 --layer phase-2 --tasks docs/specs/phase-2-queue.json --spec docs/specs/phase-2-design.md`.
+- **R60f The mailbox reader outlives main's own stop.** When main is stopped by its own KILL alone (no global KILL) and other lanes exist, main stays up as the mailbox reader (`_mail_reader_only`). It does nothing else:
+  - its `step()` reads the mailbox;
+  - a STOP still writes the global KILL;
+  - replies to other lanes' questions are still routed;
+  - replies to main's own questions wait in `inbox_pending.json` until main restarts (R35);
+  - nothing is sent and nothing else runs.
+
+  The run loop and the service sleep continue, and the watchdog keeps main running. Only the global KILL stops the mailbox reader.
+
+## R60 review round 2 (Codex review, 2026-10-01; overrides R60 and R60a–f where they differ)
+
+- **R60g Accounting manifest.** `state/shared/accounting.json` lists every accounting file that must exist. Migration registers main's files. A lane registers its own `meter/`, `holds/` or `mail/` file, under the shared lock, before it first writes that file.
+  - **Entries are never removed.** A registered file that is missing, unreadable or invalid is unreadable accounting (R60c): every lane fails closed, `Meter.over` reports capped, and `_send` sends nothing. A lost file is never read as zero usage.
+  - **Tamper protection:** any lane may add to the manifest at any time, so no lane fingerprints it. Instead it is checked like the other accounting files: during an agent run its entries may only grow.
+- **R60h No migration over existing accounting.** Migration happens only when `state/shared` has no accounting at all (no manifest, no `inbox_seen.json`, no file in `meter/`, `holds/` or `mail/`).
+  - **The marker:** `migrated.json` is written as `{"state": "migrating"}` before the copy and `{"state": "done"}` after it. The next start finishes an interrupted migration, and no conductor runs until it is done.
+  - **A lost marker:** if the marker is missing or unreadable while accounting exists, every lane fails closed (R60c) and nothing is migrated.
+  - **Read-only commands never migrate:** `python -m core.bootstrap status`, `core.service status` and the status page.
+- **R60i Smoke folders per lane.** `main run` and `smoke` run the smoke test in the lane's own work root.
+  - **Folder names:** with lanes they are `forge-smoke-<lane>-<role>-<hex>`.
+  - **The R39 sweep** removes only this lane's own folders, and only those older than an hour (`SMOKE_SWEEP_AGE_S`), best effort. Another process's folder is never touched.
+- **R60j Task branches per lane.** Main keeps `forge-task/<tid>`. Any other lane uses `forge-lane/<lane>/<tid>` (`Worktrees(branch_prefix=…)`). Preparing, cleaning up, recovering and finalizing a task all go through it.
+  - **Why not `forge-task/<lane>/<tid>`:** git can't hold both that and a main task branch `forge-task/<lane>`.
+  - **A lane's sweep** removes orphan branches only in its own namespace.
+  - **Task ids are unique across lanes:** `init` refuses a task id that another lane's queue already has (exit 2).
 - **R62 Planned tasks name the spec requirements they cover** (found 2026-10-01: the drift keeper paused Forge after the gate project's three merges raised coverage by 0 of 40). The plan stage dropped `covers`, so no planned task could ever raise spec coverage, so every planned layer was bound to stall on "no coverage gain in 3 merges". Now:
   - **The planner sees the requirements.** When the layer spec (`spec_file`) has requirements, the planner prompt lists them (`id: text`, from `core.coverage.parse_requirements`) and asks each task for `covers`: the requirement ids the task's acceptance tests prove. `S_PLAN` allows `covers` (a list of strings).
   - **Validation.** Unless the plan task sets `"no_coverage": true`, every returned task must have a non-empty `covers` of known requirement ids with no repeats; otherwise the plan is rejected with `plan rejected: covers ...` naming the task and problem (it counts toward R45's attempts like any rejection). With `no_coverage` (a gate or toy project that implements no spec requirement), `covers` is optional and ignored. With no usable spec, `covers` is not required, and any given is ignored.
@@ -482,3 +589,9 @@ Fixes made when 1B, the R42–R48 amendments, 1C, 1D and 1E were merged into one
   - **Mutation targets.** An evidence task's diff is usually empty, so changed lines can't be the mutation targets. For an evidence task the targets are the changed in-scope lines (if any) plus every line of each in-scope function or method (a `def` in a tracked in-scope `.py` file, test files excluded) whose name appears as a word in the task's test files: the code the tests say they prove. If that selects nothing, every line of the in-scope `.py` files is targeted (so a test that names no in-scope code can't pass on an empty mutation run; with large modules it runs out of budget and fails, which is the honest result). Test files (anything under `tests/` or named `test_*.py`, any task's) are never targeted. A run that generates no mutants fails an evidence task (it proves nothing). The mutation budget, `mutation_min` and the incomplete-run rule are unchanged.
   - **Credit.** A passed evidence task is verified done like any other, so `core.coverage` credits its `covers`.
   - **Planner.** The planner prompt says when to use `evidence`: for requirements the existing code already meets. Requirements it doesn't meet get ordinary tasks.
+
+## R60 review round 3 (Codex review, 2026-10-01; the last round, D-036)
+
+- **R60k A lost accounting folder is not an empty one.** When `state/shared/meter/`, `holds/` or `mail/` is missing, its registered files (R60g) are still checked: a registered file in a lost folder is unreadable accounting (R60c), so `_send` sends nothing and the caps fail closed.
+- **R60l Run history that can't be listed fails closed.** For admission (`Meter.over`), a lane's `runs/` folder that exists but can't be listed (permission or other OS error) means the runs per day can't be counted: the provider counts as capped. A `runs/` folder that doesn't exist counts 0 (a lane that never ran). The status page and `core.service status` still show a best-effort count.
+  - **Not changed:** a deleted `runs/` folder (or run folders inside it) still lowers the count. Within one lane that is unchanged from before lanes; across lanes it is R60's known limit (an agent in lane A editing lane B's state), whose strong fix is Layer 3's separate Windows user. Durable per-lane run counters were not added in this last round.
