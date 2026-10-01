@@ -2053,6 +2053,24 @@ class Conductor:
                 "tests below don't prove every requirement in covers." + self._covers_text(t) +
                 "\nTESTS:\n" + "\n".join(text)[:40000] + "\n")
 
+    def _evidence_rewrite(self, tid: str, reason: str, feedback: list) -> None:
+        """R65: an evidence task's tests are what failed, so it goes back to its test writer (at most 3 times)."""
+        t = self._task(tid)
+        if t.get("evidence") is not True or t.get("status") == "blocked":
+            return
+        n = int(t.get("evidence_rewrites", 0))
+        if n >= 3:
+            self._block(tid, reason)
+            return
+        self._update(tid, status="todo", tests_commit=None, test_rejects=0, evidence_rewrites=n + 1,
+                     test_feedback=[str(x)[:NOTE_CAP] for x in feedback][:40])
+
+    @staticmethod
+    def _test_feedback_text(t: dict) -> str:
+        fb = t.get("test_feedback") or []
+        return ("\nTEST FEEDBACK (R65): your earlier tests for this task were not strong enough. Write stronger tests "
+                "that catch every item below:\n" + "\n".join(f"- {x}" for x in fb) + "\n") if fb else ""
+
     def _tests_stage(self, tid: str) -> None:
         t = self._task(tid)
         self._reset_wt()
@@ -2062,7 +2080,8 @@ class Conductor:
                 "emptied." + self._covers_text(t) if evidence else " The tests must fail until the feature exists.")
         prompt = (role_text(self.repo, "test_writer") + "\n\nWrite only these files: " + ", ".join(t["test_files"]) +
                   "." + goal + " Do not write any other file.\n\n" +
-                  self._task_prompt(t) + "\nAnswer with JSON: {\"files\": [...], \"summary\": \"...\"}")
+                  self._task_prompt(t) + self._test_feedback_text(t) +
+                  "\nAnswer with JSON: {\"files\": [...], \"summary\": \"...\"}")
         try:
             r = self._call("test_writer", prompt, S_TESTS)
         except (Capped, NotReady):
@@ -2102,7 +2121,10 @@ class Conductor:
                 self._block(tid, reason)
             return
         sha = self._commit(changed, f"{tid}: acceptance tests")
-        self._update(tid, status="tests_ok", tests_commit=sha, fails_since=0, fail_signatures=[])
+        if t.get("evidence_rewrites"):  # R65: a rewrite keeps the failure history the troubleshooter rules use
+            self._update(tid, status="tests_ok", tests_commit=sha, test_feedback=[])
+        else:
+            self._update(tid, status="tests_ok", tests_commit=sha, fails_since=0, fail_signatures=[], test_feedback=[])
 
     # ------------------------------------------------------------------ stage B: build
     def _ledger(self) -> Ledger:
@@ -2300,13 +2322,28 @@ class Conductor:
             sig = (hashlib.sha256(("mutation:" + "|".join(sorted(ids))).encode("utf-8")).hexdigest()
                    if mres.complete else "mutation-incomplete")
             self._update(tid, review_feedback=survivor_feedback + given)
-            return fail(reason, sig, self._survivor_listing(mres), submitted=True,
-                        payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "mutation"})
+            fb = [reason] + [f"{m.file}:{m.line} {m.original} -> {m.replacement} (surviving mutant {m.id})"
+                                                        for m in mres.survivors] + given
+            try:
+                fail(reason, sig, self._survivor_listing(mres), submitted=True,
+                     payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "mutation"})
+            except (Capped, NotReady):  # R65: recorded; only the deferred troubleshooter was interrupted
+                self._evidence_rewrite(tid, reason, fb)
+                raise
+            self._evidence_rewrite(tid, reason, fb)
+            return
         if verdict != "pass":
             reasons = given or ["no reasons given"]
             self._update(tid, review_feedback=survivor_feedback + reasons)
-            return fail("review failed: " + "; ".join(reasons), "review:" + "|".join(reasons), submitted=True,
-                        payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "review"})
+            why = "review failed: " + "; ".join(reasons)
+            try:
+                fail(why, "review:" + "|".join(reasons), submitted=True,
+                     payload={"verdict": verdict, "reasons": given, "mutation": mutation, "gate": "review"})
+            except (Capped, NotReady):  # R65: as above
+                self._evidence_rewrite(tid, why, ["review failed"] + reasons)
+                raise
+            self._evidence_rewrite(tid, why, ["review failed"] + reasons)
+            return
 
         # Reviewed: hand S to the crash-safe finalizer. The ledger pass is applied only there, after the push.
         # The evidence is exactly the pass payload the build stage prepares (P1B1): verdict, reasons, mutation.
@@ -2526,7 +2563,8 @@ class Conductor:
                             [sys.executable, "-m", "unittest", *(parse_test_cmd(t["test_cmd"], t["test_files"]) or [])],
                             mutation_min=float(self.limits.get("mutation_min", 0.8)),
                             budget_s=float(self.limits.get("mutation_budget_s", self.limits.get("test_timeout_s", 600))),
-                            per_mutant_timeout_s=min(timeout, max(5.0, 3 * baseline)))
+                            per_mutant_timeout_s=min(timeout, max(5.0, 3 * baseline)),
+                            max_mutants=int(self.limits.get("mutation_max_mutants", 25)))
 
     @staticmethod
     def _survivor_listing(mres) -> str:
@@ -2731,11 +2769,18 @@ class Conductor:
         if status not in ("ok", "replan"):  # R6: unusable result, retry; escalate after 3
             q["drift_failures"] = q.get("drift_failures", 0) + 1
             self._save_queue(q)
-            if q["drift_failures"] >= 3:
-                (self.state / "PAUSED").write_text("drift keeper failed 3 times\n")
-                self._ask("replan", "Forge paused: the drift check keeps failing",
-                          f"The drift keeper returned unusable output 3 times (last error: {r.error}).\n\n"
-                          "Reply with guidance to resume.")
+            if q["drift_failures"] >= 3:  # R66a: tell Ben, keep building; the next merge brings the check back
+                q["drift_failures"], q["drift_due"] = 0, False
+                self._save_queue(q)
+                d0 = drift_mod.load(self.state)
+                trig = ((d0 or {}).get("stall") or {}).get("trigger") or "drift check"
+                if d0 is not None:  # the stall is consumed: fresh window, no immediate re-fire
+                    d0["stall"], d0["auto_replans"] = None, 0
+                    drift_mod.restart_window(d0, self._activity().total())
+                    drift_mod.save(self.state, d0)
+                self._fyi("the drift check keeps failing",
+                          f"The drift keeper returned unusable output 3 times (last error: {r.error}). Forge keeps "
+                          "building; the drift check runs again after the next merge.", trigger=trig)
             return
         reasons = (r.data or {}).get("reasons") or []
         if isinstance(reasons, str):
@@ -2750,17 +2795,19 @@ class Conductor:
                 drift_mod.new_replan(d, ([f"stall rule: {trigger}"] if trigger else []) + reasons,
                                      trigger or "drift keeper")
             d["stall"] = None
+            if not use_manager:  # R66a: the event is consumed with a notice, not handed to a Manager
+                d["auto_replans"] = 0
             drift_mod.restart_window(d, self._activity().total())
             drift_mod.save(self.state, d)  # durable before drift_due is cleared: a crash never loses the re-plan
             self._crash("after:replan-pending")
         q = self._queue()
         q["drift_due"], q["drift_failures"] = False, 0
         self._save_queue(q, durable=True)
-        if replan and not use_manager:  # no Manager configured: pause and ask Ben, as before
-            (self.state / "PAUSED").write_text("drift keeper asked for a re-plan\n")
-            self._ask("replan", "Forge paused: the drift keeper wants a re-plan",
+        if replan and not use_manager:  # R66a: no Manager configured: tell Ben, keep building
+            self._fyi("the drift keeper wants a re-plan",
                       ("Stall rule: " + trigger + "\n\n" if trigger else "") + "Reasons:\n" +
-                      "\n".join(f"- {x}" for x in reasons) + "\n\nReply with guidance to resume.")
+                      "\n".join(f"- {x}" for x in reasons) + "\n\nForge keeps building; the supervisor re-cuts the plan.",
+                      trigger=trigger or "drift keeper")
 
     # ------------------------------------------------------------------ coverage, stall rules, re-plans (T1C5)
     def _spec_rel(self) -> str:
@@ -2935,15 +2982,25 @@ class Conductor:
             return self._escalate_replan(d, "the Manager's proposals were rejected twice")
         drift_mod.save(self.state, d)
 
+    def _fyi(self, what: str, body: str, trigger=None) -> None:
+        """R66a: a notice to Ben that asks for nothing. Logged with its trigger, then sent through the capped mailer."""
+        self._log(f"FYI (no pause): {what}" + (f" (trigger: {trigger})" if trigger else ""))
+        try:
+            self._send(f"[Forge] FYI: {what}", body + "\n\nForge is continuing with every task it can; the supervisor follows up "
+                       "(re-cuts the plan or fixes the check). No reply needed.")
+        except Exception as e:  # noqa: BLE001 - a notice never stops the build
+            self._log(f"FYI mail failed: {e}")
+
     def _escalate_replan(self, d: dict, why: str) -> None:
-        """PAUSED and a replan question to Ben; the pending re-plan is cleared only after both exist."""
+        """R66a: tell Ben (no PAUSED, no question) and keep building; the pending re-plan is cleared after the
+        notice is recorded."""
         rp = d.get("replan") or {}
-        (self.state / "PAUSED").write_text("a re-plan needs Ben\n")
-        self._ask("replan", "Forge paused: a re-plan needs you",
-                  f"Forge needs a re-plan and can't make one itself: {why}.\n\nTrigger: {rp.get('trigger')}\n\n"
+        self._fyi("a re-plan didn't pass review",
+                  f"Forge couldn't make a re-plan itself: {why}.\n\nTrigger: {rp.get('trigger')}\n\n"
                   "Reasons:\n" + "\n".join(f"- {x}" for x in rp.get("reasons") or []) +
                   ("\n\nRejected proposals:\n" + "\n".join(f"- {x}" for x in rp.get("notes") or []) if rp.get("notes") else "") +
-                  "\n\nReply with guidance to resume.")
+                  "\n\nForge keeps building every task it can; the supervisor re-cuts the plan. Nothing for you to do.",
+                  trigger=rp.get("trigger"))
         d["replan"] = None
         d["auto_replans"] = 0
         drift_mod.restart_window(d, self._activity().total())
