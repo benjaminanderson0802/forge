@@ -239,29 +239,30 @@ class SelfFixMixin:
 
     # ---------------------------------------------------------------- migration (R66h)
     def _sf_migrate(self) -> None:
+        """R66h, once per lane. Every replacement action runs before its legacy question is closed, and the marker is
+        written last, so an interruption anywhere is simply redone on the next step (review round 3)."""
         if self._read("r66.json", {}).get("done"):
             return
         bs = _bs()
-        qs = self._read("questions.json", {})
         now = self.clock().isoformat()
-        blocked_tasks, replans = [], []
-        for qid, q in qs.items():
-            if not isinstance(q, dict) or q.get("status") != "open":
-                continue
-            kind = q.get("kind")
-            if kind in INTERNAL_KINDS and not q.get("auto"):
-                q.update(auto=True, hold=True, delivered=True)
-                if kind == "gate":
-                    q["merge_set"] = False
-            elif kind == "replan":
-                q.update(status="answered", answer="R66: re-plans no longer wait for you", closed_at=now)
-                replans.append(str(q.get("subject", "")))
-            elif kind == "blocked":
-                q.update(status="answered", answer="R66: Forge reopens blocked tasks itself", closed_at=now)
-                if q.get("task"):
-                    blocked_tasks.append((q["task"], str(q.get("subject", ""))))
-        self._write("questions.json", bs._prune_questions(qs))
-        paused = self.state / "PAUSED"
+        qs = self._read("questions.json", {})
+        opened = {k: q for k, q in qs.items() if isinstance(q, dict) and q.get("status") == "open"}
+        replans = [str(q.get("subject", "")) for q in opened.values() if q.get("kind") == "replan"]
+        if replans and getattr(self, "manager", None) is not None:  # 1. the replacement re-plan (idempotent)
+            d = drift_mod.load(self.state) or drift_mod.adopt([], [], False, self._activity().total())
+            if not d.get("replan"):
+                drift_mod.new_replan(d, [f"migrated from a re-plan question: {s}" for s in replans], "R66 migration")
+                drift_mod.save(self.state, d)
+        tasks = {t.get("id"): t for t in self._queue().get("tasks", [])}
+        for q in opened.values():  # 2. blocked tasks go through R66d (a reopened task is no longer blocked)
+            if q.get("kind") == "blocked" and (tasks.get(q.get("task")) or {}).get("status") == "blocked":
+                self._sf_block(str(q["task"]), f"migrated from an open question: {q.get('subject', '')}")
+        st = self._read("main_sync.json", {})  # 3. a sync conflict question hands over to R66f's resolver
+        c = st.get("conflict") if isinstance(st, dict) else None
+        if isinstance(c, dict) and c.get("qid") in opened:
+            c["qid"] = None
+            self._write("main_sync.json", st)
+        paused = self.state / "PAUSED"  # 4. only a pause Forge itself wrote for a re-plan
         try:
             text = paused.read_text(encoding="utf-8").strip()
         except OSError:
@@ -269,16 +270,23 @@ class SelfFixMixin:
         if text is not None and text in PAUSE_TEXTS:
             paused.unlink(missing_ok=True)
             self._log("R66: removed a re-plan pause; re-plans no longer wait for Ben")
-        if replans and getattr(self, "manager", None) is not None:
-            d = drift_mod.load(self.state) or drift_mod.adopt([], [], False, self._activity().total())
-            if not d.get("replan"):
-                drift_mod.new_replan(d, [f"migrated from a re-plan question: {s}" for s in replans], "R66 migration")
-                drift_mod.save(self.state, d)
-        tasks = {t.get("id"): t for t in self._queue().get("tasks", [])}
-        for tid, subject in blocked_tasks:
-            if (tasks.get(tid) or {}).get("status") == "blocked":
-                self._sf_block(tid, f"migrated from an open question: {subject}")
-        self._write("r66.json", {"done": True, "at": now})
+        qs = self._read("questions.json", {})  # 5. then the legacy questions are closed or made internal
+        for qid, q in qs.items():
+            if not isinstance(q, dict) or q.get("status") != "open":
+                continue
+            kind = q.get("kind")
+            if kind == "merge" and q.get("sync"):
+                q.update(status="answered", answer="R66: Forge resolves sync conflicts itself", closed_at=now)
+            elif kind in INTERNAL_KINDS and not q.get("auto"):
+                q.update(auto=True, hold=True, delivered=True)
+                if kind == "gate":
+                    q["merge_set"] = False
+            elif kind == "replan":
+                q.update(status="answered", answer="R66: re-plans no longer wait for you", closed_at=now)
+            elif kind == "blocked":
+                q.update(status="answered", answer="R66: Forge reopens blocked tasks itself", closed_at=now)
+        self._write("questions.json", bs._prune_questions(qs))
+        self._write("r66.json", {"done": True, "at": now})  # 6. last
 
     # ---------------------------------------------------------------- blocked tasks (R66d)
     def _sf_reopen(self, tid: str, note: str | None, reopens: int) -> None:
@@ -657,13 +665,23 @@ class SelfFixMixin:
             self._write("main_sync.json", st)
             self._sf_sync_exhausted(rec, layer, files, limit)
             return "conflict"
+        rprov = getattr(getattr(self.team, "reviewer", None), "provider", None)
+        tprov = getattr(getattr(self.team, "troubleshooter", None), "provider", None)
+        if any(p and self.meter.over(p, self.limits) for p in (rprov, tprov)):
+            self._write("main_sync.json", st)
+            return "conflict"  # a capped or held agent: wait, nothing counted
         res["tries"] = int(res.get("tries", 0)) + 1
         st["resolve"] = res
         self._write("main_sync.json", st)  # the try counts before anything runs (a crash can't loop)
         self.blockers.attempt(rec["id"])
+        self._sf_trouble_ran = False
         try:
             problem = self._sf_resolve_merge(layer, wt, main, head)
-        except (bs.Capped, bs.NotReady):  # a cap or stop is not a failed try
+        except (bs.Capped, bs.NotReady):  # a cap or stop before the troubleshooter ran is not a failed try
+            if self._sf_trouble_ran:
+                if int(res["tries"]) >= limit:
+                    self._sf_sync_exhausted(rec, layer, files, limit)
+                return "conflict"  # the work was spent: the try counts (review round 3)
             st = self._read("main_sync.json", {})
             (st.get("resolve") or {})["tries"] = max(0, int((st.get("resolve") or {}).get("tries", 1)) - 1)
             self._write("main_sync.json", st)
@@ -718,6 +736,7 @@ class SelfFixMixin:
                           "checks and commits the result, then the judges and the reviewer check it.\n"
                           "Answer with JSON: {\"kind\": \"fix\" | \"dead_end\", \"notes\": \"...\", \"alternative\": \"...\"}")
                 r = self._call("troubleshooter", prompt, bs.S_TROUBLE, cwd=tw, scratch=True)
+                self._sf_trouble_ran = True
                 if not r.ok:
                     return f"troubleshooter failed: {r.error}"
                 if git(tw, "rev-parse", "HEAD") != head:
