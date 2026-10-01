@@ -138,7 +138,7 @@ class TreeKillTests(Harness):
     def setUp(self):
         super().setUp()
         self.c = self.make_conductor(limits={"claude_daily_token_cap": 10**9, "codex_daily_token_cap": 10**9,
-                                             "test_timeout_s": 2})
+                                             "test_timeout_s": 2, "judge_timeout_s": 2})  # R55: judges have their own limit
         self.dir = Path(self.tmp.name) / "cmd"
         self.dir.mkdir()
         (self.dir / "spawn.py").write_text(GRANDCHILD, encoding="utf-8")
