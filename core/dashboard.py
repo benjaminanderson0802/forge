@@ -693,9 +693,14 @@ def snapshot(forge_root, now: datetime | None = None) -> dict:
         cp["eta_s"] = cp["remaining_work_s"] / on_layer
         if on_layer > 1:
             cp["eta_basis"] += f"; / {on_layer} lanes running on {lane['layer']}"
+    try:  # R66i: the Blockers panel; never takes the dashboard down
+        from core import blockers as blockers_mod
+        blockers_out = blockers_mod.snapshot_items(state_root, names, now)
+    except Exception:  # noqa: BLE001
+        blockers_out = []
     return {"generated_at": _iso(now), "lanes": lanes_out, "project": _project(forge_root, lanes_out, running),
             "tokens": tokens, "timeline": _timeline(names, runs_by_lane, lanes_out, now), "stage_medians": med,
-            "attempts": attempts}
+            "attempts": attempts, "blockers": blockers_out}
 
 
 def main(argv: list[str]) -> int:
