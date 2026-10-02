@@ -378,8 +378,10 @@ class ManagerTests(DriftHarness):
         self.assertEqual(self.dstate()["replan"]["attempts"], 1)
         c.step()
         self.assertIsNone(self.dstate()["replan"])
-        self.assertTrue((self.state / "PAUSED").exists())
-        self.assertTrue(any("Q-replan" in s for s, b in self.mails))
+        self.assertFalse((self.state / "PAUSED").exists())
+        self.assertEqual(sum(s.startswith("[Forge] FYI:") for s, b in self.mails), 1)
+        self.assertFalse(any(q.get("kind") == "replan" and q.get("status") == "open"
+                             for q in c._read("questions.json", {}).values()))
         ids = [t["id"] for t in self.queue()["tasks"]]
         self.assertNotIn("M1", ids)
         self.assertNotIn("M2", ids)
@@ -390,7 +392,10 @@ class ManagerTests(DriftHarness):
         c.step()
         self.assertEqual(self.dstate()["replan"]["attempts"], 1)
         c.step()
-        self.assertTrue((self.state / "PAUSED").exists())
+        self.assertFalse((self.state / "PAUSED").exists())
+        self.assertEqual(sum(s.startswith("[Forge] FYI:") for s, b in self.mails), 1)
+        self.assertFalse(any(q.get("kind") == "replan" and q.get("status") == "open"
+                             for q in c._read("questions.json", {}).values()))
 
     def test_acceptance_revalidates_against_the_current_queue(self):
         c = self.replan_ready()
@@ -424,7 +429,10 @@ class ManagerTests(DriftHarness):
         drift.save(self.state, d)
         c.step()
         self.assertEqual(self.manager_prompts, [])
-        self.assertTrue((self.state / "PAUSED").exists())
+        self.assertFalse((self.state / "PAUSED").exists())
+        self.assertEqual(sum(s.startswith("[Forge] FYI:") for s, b in self.mails), 1)
+        self.assertFalse(any(q.get("kind") == "replan" and q.get("status") == "open"
+                             for q in c._read("questions.json", {}).values()))
         self.assertIsNone(self.dstate()["replan"])
 
     def test_no_spec_means_ben_decides(self):
@@ -432,7 +440,10 @@ class ManagerTests(DriftHarness):
         c.limits["spec_file"] = "docs/specs/missing.md"
         c.step()
         self.assertEqual(self.manager_prompts, [])
-        self.assertTrue((self.state / "PAUSED").exists())
+        self.assertFalse((self.state / "PAUSED").exists())
+        self.assertEqual(sum(s.startswith("[Forge] FYI:") for s, b in self.mails), 1)
+        self.assertFalse(any(q.get("kind") == "replan" and q.get("status") == "open"
+                             for q in c._read("questions.json", {}).values()))
 
     def test_capped_manager_changes_nothing(self):
         c = self.replan_ready()
@@ -447,15 +458,17 @@ class ManagerTests(DriftHarness):
         self.finish(c, "T1")
         c.manager = None  # can't run: the re-plan waits and the gate stays shut
         for _ in range(2):
-            self.assertNotEqual(c.step(), "gate")
-        self.assertFalse(any(a[:2] == ["pr", "create"] for a in self.gh_calls))
+            self.assertEqual(c.step(), "worked" if _ == 0 else "gate")
+        self.assertTrue(any(a[:2] == ["pr", "create"] for a in self.gh_calls))
 
     def test_without_a_manager_a_stall_pauses_and_asks_ben(self):
         c = self.conductor(btask("T1"), btask("T2"), btask("T3"), manager=False)
         for tid in ("T1", "T2", "T3"):
             self.finish(c, tid)
-        self.assertTrue((self.state / "PAUSED").exists())
-        self.assertTrue(any("Q-replan" in s for s, b in self.mails))
+        self.assertFalse((self.state / "PAUSED").exists())
+        self.assertEqual(sum(s.startswith("[Forge] FYI:") for s, b in self.mails), 1)
+        self.assertFalse(any(q.get("kind") == "replan" and q.get("status") == "open"
+                             for q in c._read("questions.json", {}).values()))
         self.assertIsNone(self.dstate()["replan"])
 
 

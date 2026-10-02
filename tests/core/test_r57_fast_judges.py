@@ -71,12 +71,13 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(suite.select(self.root, ["docs/notes.md"])[0], [])
         self.assertIsNone(suite.select(self.root, ["charter/new_limits.json"])[0])
 
-    def test_high_blast_radius_changes_run_the_full_suite(self):
+    def test_high_blast_radius_changes_run_fast_modules_and_leave_the_full_suite_to_the_gate(self):
         for path in ("core/bootstrap.py", "core/ledger.py", "core/agents.py", "core/protect.py",
                      "drills/run_drills.py", "drills/new_drill.py"):
             picked, why = suite.select(self.root, ["core/c.py", path])
-            self.assertIsNone(picked, path)
+            self.assertIsNotNone(picked, path)
             self.assertIn("high-blast", why)
+            self.assertIn("layer gate", why)
 
     def test_fast_list_is_honoured(self):
         (self.root / suite.FAST_FILE).write_text("# header\ntest_c  1.0\ntest_gone  0.5\n", encoding="utf-8")
@@ -121,12 +122,13 @@ class SuiteCliTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(ran, ["test_a", "test_c", "test_e"])
 
-    def test_high_blast_change_runs_every_module(self):
+    def test_high_blast_change_runs_only_the_fast_modules(self):
+        base = self.commit(suite.FAST_FILE, "test_a  1.0\n")
         sha = self.commit("core/ledger.py", "X = 1\n")
-        code, ran, out = self.run_suite("--changed", f"{self.base}..{sha}")
+        code, ran, out = self.run_suite("--changed", f"{base}..{sha}")
         self.assertEqual(code, 0, out)
-        self.assertEqual(ran, suite.modules(self.root))
-        self.assertIn("full suite", out)
+        self.assertEqual(ran, ["test_a"])
+        self.assertIn("high-blast", out)
 
     def test_unreadable_range_fails_safe_to_the_full_suite(self):
         code, ran, out = self.run_suite("--changed", "nonexistent..alsonot")
