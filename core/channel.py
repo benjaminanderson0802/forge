@@ -27,7 +27,7 @@ INSTANT_KINDS = frozenset({"gate", "replan", "capability", "spend", "customer", 
 
 # Live-run P1: answers that approve something (a merge to main via human-approved, a blocked merge, a spend) are
 # accepted only by email from the owner, never from the drop folder, which anything on this PC can write to.
-EMAIL_ONLY_KINDS = frozenset({"gate", "merge", "spend"})
+EMAIL_ONLY_KINDS = frozenset({"gate", "merge", "spend", "unpark"})  # R66d: unpark is Ben's own email
 
 # D-023: every question comes with the default Forge uses while Ben hasn't answered.
 DEFAULTS = {
@@ -84,8 +84,8 @@ def queue_items(questions: dict) -> list[dict]:
     single source of truth; this is a view of it."""
     out = []
     for qid, q in (questions.items() if isinstance(questions, dict) else []):
-        if not isinstance(q, dict) or q.get("status") != "open":
-            continue
+        if not isinstance(q, dict) or q.get("status") != "open" or q.get("auto"):
+            continue  # R66: internal items (auto) are blockers, never questions for Ben
         kind = str(q.get("kind", ""))
         out.append({"id": str(qid), "kind": kind, "question": str(q.get("subject", ""))[:SUBJECT_CAP],
                     "default": str(q.get("default") or default_for(kind)), "deadline": q.get("deadline"),
@@ -104,7 +104,8 @@ def write_queue(path: Path, questions: dict) -> None:
 
 # ---------------------------------------------------------------------- digest
 def build_digest(questions: dict, tasks: list[dict], *, owner: str, local_now: datetime,
-                 mail_used: tuple[int, int], mail_caps: tuple[int, int], page_url: str) -> tuple[str, str]:
+                 mail_used: tuple[int, int], mail_caps: tuple[int, int], page_url: str,
+                 extra_lines: list[str] | None = None) -> tuple[str, str]:
     """The daily digest (D-023): every open question with its default and how to answer, then a short status.
     Never carries a reply code in its subject, so it can't itself be answered by accident."""
     items = queue_items(questions)
@@ -130,6 +131,7 @@ def build_digest(questions: dict, tasks: list[dict], *, owner: str, local_now: d
                       f"  To answer: send an email with the subject {tag} and your answer in the body",
                       f"  ({mailto}), or use the status page."]
             lines += block + [""]
+    lines += [str(x) for x in (extra_lines or [])]  # R66g: the blockers section
     counts: dict[str, int] = {}
     for t in tasks or []:
         if isinstance(t, dict):
