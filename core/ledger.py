@@ -35,6 +35,14 @@ Rules enforced:
     the log, never the contract cache
   * merge evidence: a "pass" may carry task_commit, final_sha and merges,
     each merge backed by a CI run recorded for its exact sha
+  * challenges: only the core records a "challenge" (target, claimant,
+    verdict, proof, route, run_ids, outcomes, each validated); it never
+    changes a contract, run, report or the spec state and never adds a note.
+    Its contract must exist, except a "capability:" dead-end challenge
+  * evidence-backed rescue: the core may unpark a parked contract only by
+    naming an earlier, not yet used "blocked" challenge on the same contract
+    whose verdict is "overturned", plus 1-6 extra attempts added on top of
+    the attempts already made
 """
 from __future__ import annotations
 
@@ -57,7 +65,8 @@ ACTIONS = {
     "fail":     ({"auditor"}, {"submitted"}, "failed"),
     "reopen":   ({"manager"}, {"failed"}, "open"),
     "park":     ({"manager", "human", "core"}, {"open", "claimed", "submitted", "failed"}, "parked"),
-    "unpark":   ({"human"}, {"parked"}, "open"),
+    # a core unpark needs an overturned "blocked" challenge as evidence (see _check_rescue)
+    "unpark":   ({"human", "core"}, {"parked"}, "open"),
     "usage":    ({"executor", "core"}, {"claimed", "submitted"}, None),
     "test_run": ({"ci"}, None, None),
     # written by the runner (plain code), never by an agent
@@ -69,7 +78,19 @@ ACTIONS = {
     "withdraw": ({"core"}, {"claimed", "submitted"}, "open"),
     # only you can freeze (or re-freeze) the spec
     "approve_spec": ({"human"}, None, None),
+    # the core's record of a challenged claim; never changes a contract
+    "challenge": ({"core"}, None, None),
 }
+
+CHALLENGE_TARGETS = {"blocker", "dead_end", "blocked"}
+CHALLENGE_CLAIMANTS = {"builder", "troubleshooter"}
+CHALLENGE_VERDICTS = {"overturned", "stands", "unconfirmed"}
+CHALLENGE_PROOFS = {"patch", "capability"}
+CHALLENGE_OUTCOMES = {"verified_overturn", "unverified_overturn", "stands",
+                      "stands_no_evidence", "unusable", "interrupted"}
+CHALLENGE_ROUTE_MAX = 2000
+CHALLENGE_RUNS_MAX = 10
+RESCUE_EXTRA_MAX = 6
 
 SPEC_FILE = "spec/spec.md"
 
@@ -158,6 +179,12 @@ class Ledger:
     def false_claims(self, contract_id: str | None = None) -> int:
         return sum(1 for e in self.events() if e.get("note") == "false_claim"
                    and (contract_id is None or e["contract_id"] == contract_id))
+
+    def challenges(self, contract_id: str | None = None) -> list[dict]:
+        """Every "challenge" event in log order, optionally for one contract."""
+        return [{"proposal_id": e["proposal_id"], "contract_id": e["contract_id"], **e["payload"]}
+                for e in self.events() if e.get("action") == "challenge"
+                and (contract_id is None or e["contract_id"] == contract_id)]
 
     def role_of(self, identity: str) -> str:
         roles = self._read_json(self.roles_path, {})
@@ -279,12 +306,20 @@ class Ledger:
             reports[cid] = {"attempt": c["attempts"], "run_id": payload["run_id"], "claim": payload.get("claim"),
                             "commit": payload.get("commit"), "changed": payload["changed"],
                             "violations": payload["violations"], "out_of_scope": payload["out_of_scope"]}
+        elif action == "challenge":
+            self._check_challenge(payload)
+            # a Troubleshooter capability-job dead end has no task contract
+            if cid not in contracts and not (cid.startswith("capability:") and payload["target"] == "dead_end"):
+                raise Rejected(f"no contract {cid}")
         else:
             if cid not in contracts:
                 raise Rejected(f"no contract {cid}")
             c = dict(contracts[cid])
             if from_states and c["status"] not in from_states:
                 raise Rejected(f"cannot {action} a contract that is {c['status']}")
+            if action == "unpark" and role == "core":
+                self._check_rescue(cid, payload)
+                c["max_attempts"] = c["attempts"] + payload["extra_attempts"]
             if action == "submit":
                 if not isinstance(payload.get("commit"), str):
                     raise Rejected("submit needs the commit sha")
@@ -355,6 +390,50 @@ class Ledger:
             f.write(json.dumps(event, sort_keys=True) + "\n")
             f.flush()
             os.fsync(f.fileno())
+
+    @staticmethod
+    def _check_challenge(payload: dict) -> None:
+        """A challenge payload: each field is checked, and a bad one is named."""
+        def one_of(field: str, allowed: set) -> None:
+            v = payload.get(field)
+            if not isinstance(v, str) or v not in allowed:
+                raise Rejected(f"challenge {field} must be one of {sorted(allowed)}")
+
+        one_of("target", CHALLENGE_TARGETS)
+        one_of("claimant", CHALLENGE_CLAIMANTS)
+        one_of("verdict", CHALLENGE_VERDICTS)
+        proof = payload.get("proof")
+        if proof is not None and (not isinstance(proof, str) or proof not in CHALLENGE_PROOFS):
+            raise Rejected(f"challenge proof must be one of {sorted(CHALLENGE_PROOFS)} or null")
+        route = payload.get("route", "")
+        if not isinstance(route, str) or len(route) > CHALLENGE_ROUTE_MAX:
+            raise Rejected(f"challenge route must be text of at most {CHALLENGE_ROUTE_MAX} characters")
+        run_ids = payload.get("run_ids")
+        if (not isinstance(run_ids, list) or not 1 <= len(run_ids) <= CHALLENGE_RUNS_MAX
+                or not all(isinstance(r, str) for r in run_ids)):
+            raise Rejected(f"challenge run_ids must be a list of 1 to {CHALLENGE_RUNS_MAX} texts")
+        if "outcomes" in payload:
+            outcomes = payload["outcomes"]
+            if (not isinstance(outcomes, list) or len(outcomes) != len(run_ids)
+                    or not all(isinstance(o, str) and o in CHALLENGE_OUTCOMES for o in outcomes)):
+                raise Rejected(f"challenge outcomes must be one of {sorted(CHALLENGE_OUTCOMES)} per run_ids entry")
+
+    def _check_rescue(self, cid: str, payload: dict) -> None:
+        """A core unpark needs an earlier, unused, overturned "blocked" challenge on this contract."""
+        ref = payload.get("challenge")
+        extra = payload.get("extra_attempts")
+        if not isinstance(ref, str):
+            raise Rejected("core unpark needs the proposal_id of a challenge")
+        if not isinstance(extra, int) or isinstance(extra, bool) or not 1 <= extra <= RESCUE_EXTRA_MAX:
+            raise Rejected(f"core unpark needs extra_attempts, an int from 1 to {RESCUE_EXTRA_MAX}")
+        # the log holds exactly the earlier events, during replay too
+        events = self.events()
+        found = next((e for e in events if e["proposal_id"] == ref), None)
+        if (found is None or found["action"] != "challenge" or found["contract_id"] != cid
+                or found["payload"].get("target") != "blocked" or found["payload"].get("verdict") != "overturned"):
+            raise Rejected(f"core unpark needs an overturned 'blocked' challenge on {cid}")
+        if any(e["action"] == "unpark" and e["payload"].get("challenge") == ref for e in events):
+            raise Rejected(f"challenge {ref} was already used to unpark")
 
     @staticmethod
     def _check_merge_evidence(cid: str, c: dict, payload: dict, runs: dict) -> None:
