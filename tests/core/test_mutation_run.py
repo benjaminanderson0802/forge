@@ -347,7 +347,7 @@ class SafetyTests(Base):
         data = res.as_dict()
         text = json.dumps(data)
         self.assertEqual(set(data), {"total", "killed", "score", "complete", "passed",
-                                     "reason", "not_run", "survivors"})
+                                     "reason", "not_run", "survivors", "sampled"})  # R67 adds sampled
         self.assertEqual(len(data["survivors"]), 1)
         self.assertEqual(set(data["survivors"][0]),
                          {"id", "file", "line", "original", "replacement"})

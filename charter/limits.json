@@ -1,6 +1,6 @@
 {
-  "claude_daily_token_cap": 20000000,
-  "codex_daily_token_cap": 10000000,
+  "claude_daily_token_cap": 1000000000,
+  "codex_daily_token_cap": 1000000000,
   "agent_timeout_s": 1800,
   "check_timeout_s": 60,
   "ai_check_ttl_h": 6,
@@ -9,6 +9,6 @@
   "max_parallel_idle": 3,
   "mail_per_hour": 3,
   "mail_per_day": 10,
-  "agent_runs_per_day": 150,
+  "agent_runs_per_day": 100000,
   "self_fix": true
 }

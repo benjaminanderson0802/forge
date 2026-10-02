@@ -45,7 +45,7 @@ _QUOTED_PATH = re.compile(r"[\"'](?:[A-Za-z]:[\\/]|\\\\|~[\\/]|%[A-Za-z]+%)")
 
 
 def has_secret(text) -> bool:
-    """True when the text looks like it carries a secret value (R66a: kits never do)."""
+    """True when the text looks like it carries a secret value (R66j: kits never do)."""
     s = str(text or "")
     return any(r.search(s) for r in _SECRET_RES)
 
@@ -116,7 +116,7 @@ def read_json(path: Path, default):
 
 
 class Blockers:
-    """One lane's blocker records (R66a)."""
+    """One lane's blocker records (R66j)."""
 
     def __init__(self, state: Path, lane: str = "main", clock=None):
         self.state, self.lane = Path(state), str(lane)
