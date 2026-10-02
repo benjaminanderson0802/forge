@@ -29,7 +29,7 @@ SLEEP_ON_NONE = ("import time, unittest\nimport feat\n"
                  "class T(unittest.TestCase):\n"
                  " def test_value(self):\n"
                  "  if feat.value() is None:\n"
-                 "   time.sleep(5)\n"
+                 "   time.sleep(60)\n"
                  "  self.assertEqual(feat.value(), 4244)\n")
 STRONG = ("import unittest\nimport feat\n"
           "class T(unittest.TestCase):\n"
@@ -137,7 +137,7 @@ class WeakEmptyTests(Harness):
     def test_c_timeout_on_empty_implementation_is_never_accepted(self):
         c = self.init(agents={"test_writer": lambda p, cwd: write_test(cwd, SLEEP_ON_NONE)},
                       limits={"claude_daily_token_cap": 10 ** 9, "codex_daily_token_cap": 10 ** 9,
-                              "test_timeout_s": 1})
+                              "test_timeout_s": 20})
         self.commit_on_layer(c, {"feat.py": MODULE})
         self.assertEqual(c.step(), "worked")
         t = self.queue_task()
