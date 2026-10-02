@@ -35,6 +35,9 @@ Rules enforced:
     the log, never the contract cache
   * merge evidence: a "pass" may carry task_commit, final_sha and merges,
     each merge backed by a CI run recorded for its exact sha
+  * audits never undo "done": an "audit" event only records the auditor's
+    report or a finding's confirmation; it never changes the contract, and
+    the fix for a confirmed finding is new work
 """
 from __future__ import annotations
 
@@ -69,7 +72,14 @@ ACTIONS = {
     "withdraw": ({"core"}, {"claimed", "submitted"}, "open"),
     # only you can freeze (or re-freeze) the spec
     "approve_spec": ({"human"}, None, None),
+    # an independent audit of finished work: recorded, never a transition (an audit never undoes done)
+    "audit":    ({"auditor"}, {"done"}, None),
 }
+
+AUDIT_KINDS = ("report", "invalid", "confirmed", "unconfirmed")
+AUDIT_SEVERITIES = ("blocker", "major", "minor")
+AUDIT_FINDINGS_MAX = 30
+AUDIT_TEXT_MAX = 2000
 
 SPEC_FILE = "spec/spec.md"
 
@@ -310,6 +320,8 @@ class Ledger:
                 c["commit"] = None
                 if reports.get(cid, {}).get("attempt") == c["attempts"]:
                     del reports[cid]  # this attempt's report can never back a later pass
+            if action == "audit":
+                self._check_audit(payload)
             if action == "usage":
                 t = payload.get("tokens")
                 if not isinstance(t, int) or t < 0:
@@ -401,6 +413,78 @@ class Ledger:
             run = runs.get(m["run_id"])
             if not run or run["contract_id"] != cid or run["commit"] != m["sha"] or run["passed"] is not True:
                 bad(f"merge {i} needs a CI-recorded passing test run for {m['sha']}")
+
+    @staticmethod
+    def _check_audit(payload: dict) -> None:
+        """Validate an audit payload. Every string anywhere in it is capped at AUDIT_TEXT_MAX."""
+        def bad(why: str):
+            raise Rejected(f"audit rejected: {why}")
+
+        def text(v) -> bool:
+            return isinstance(v, str) and v != ""
+
+        def capped(v, where: str) -> None:
+            if isinstance(v, str):
+                if len(v) > AUDIT_TEXT_MAX:
+                    bad(f"{where} is longer than {AUDIT_TEXT_MAX} characters")
+            elif isinstance(v, dict):
+                for k, x in v.items():
+                    capped(k, f"{where} key")
+                    capped(x, f"{where}.{k}")
+            elif isinstance(v, list):
+                for i, x in enumerate(v):
+                    capped(x, f"{where}[{i}]")
+
+        capped(payload, "payload")
+        kind = payload.get("kind")
+        if not isinstance(kind, str) or kind not in AUDIT_KINDS:
+            bad(f"kind must be one of {list(AUDIT_KINDS)}")
+        if kind == "report":
+            if not text(payload.get("run_id")):
+                bad("report needs a non-empty run_id")
+            commit = payload.get("commit")
+            if not isinstance(commit, str) or _SHA40.fullmatch(commit) is None:
+                bad("report commit must be a 40-character lowercase hex sha")
+            verdict = payload.get("verdict")
+            if not isinstance(verdict, str) or verdict not in ("clean", "findings"):
+                bad("report verdict must be 'clean' or 'findings'")
+            findings = payload.get("findings")
+            if not isinstance(findings, list):
+                bad("report findings must be a list")
+            if len(findings) > AUDIT_FINDINGS_MAX:
+                bad(f"report has more than {AUDIT_FINDINGS_MAX} findings")
+            for i, f in enumerate(findings):
+                if not isinstance(f, dict):
+                    bad(f"finding {i} must be an object")
+                for field in ("id", "file", "summary", "evidence"):
+                    if not text(f.get(field)):
+                        bad(f"finding {i} needs a non-empty {field}")
+                severity = f.get("severity")
+                if not isinstance(severity, str) or severity not in AUDIT_SEVERITIES:
+                    bad(f"finding {i} severity must be one of {list(AUDIT_SEVERITIES)}")
+                line = f.get("line")
+                if line is not None and (not isinstance(line, int) or isinstance(line, bool)):
+                    bad(f"finding {i} line must be an int or null")
+                ref = f.get("contract_ref")
+                if ref is not None and not isinstance(ref, str):
+                    bad(f"finding {i} contract_ref must be text or null")
+            if (verdict == "findings") != bool(findings):
+                bad("report verdict must be 'findings' exactly when findings is non-empty")
+            dropped = payload.get("dropped")
+            if not isinstance(dropped, int) or isinstance(dropped, bool) or dropped < 0:
+                bad("report needs dropped, an int >= 0")
+        elif kind == "invalid":
+            if not text(payload.get("run_id")):
+                bad("invalid needs a non-empty run_id")
+            if not text(payload.get("reason")):
+                bad("invalid needs a non-empty reason")
+        else:
+            if not text(payload.get("of")):
+                bad(f"{kind} needs a non-empty of (the audited task id)")
+            if not text(payload.get("finding")):
+                bad(f"{kind} needs a non-empty finding (the finding id)")
+            if "task" in payload and not isinstance(payload["task"], str):
+                bad(f"{kind} task must be text (the fix task id)")
 
     # ---------- recovery ----------
     def _read_head(self):
