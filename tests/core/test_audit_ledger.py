@@ -10,6 +10,7 @@ from core.ledger import Ledger, Rejected
 
 
 SHA = "0123456789abcdef" * 2 + "01234567"
+_UNSET = object()
 ROLES = {
     "forge-manager": "manager", "forge-executor": "executor",
     "forge-auditor": "auditor", "forge-core": "core",
@@ -22,8 +23,9 @@ def finding(**changes):
                 summary="An edge case fails", evidence="Input zero raises", **changes)
 
 
-def report(findings=None, **changes):
-    items = [] if findings is None else findings
+def report(findings=_UNSET, **changes):
+    # Omission means a clean report; explicit null must reach validation.
+    items = [] if findings is _UNSET else findings
     payload = dict(kind="report", run_id="audit-run", commit=SHA,
                    verdict="findings" if items else "clean", findings=items, dropped=0)
     payload.update(changes)
@@ -113,7 +115,7 @@ class AuditLedgerTests(unittest.TestCase):
         self.assertEqual(getattr(ledger_mod, "AUDIT_TEXT_MAX", None), 2000)
 
     def test_clean_and_findings_reports_preserve_completed_contract(self):
-        for payload in (report(), report([finding()], dropped=2)):
+        for payload in (report(), report(findings=[]), report([finding()], dropped=2)):
             with self.subTest(verdict=payload["verdict"]):
                 event = self.assert_audit_applied(payload)
                 self.assertEqual(event["payload"]["dropped"], payload["dropped"])
