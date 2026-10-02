@@ -243,7 +243,7 @@ class JudgePipelineTests(Harness):
         self.assertEqual(feat, "VALUE = 42\n")
         self.assertFalse(root.exists())
         self.assertEqual(changed, {"feat.py": {1}})
-        self.assertEqual(argv[1:], ["-m", "unittest", "tests/core/test_feat.py"])
+        self.assertEqual(argv[1:], ["-m", "unittest", "-f", "tests/core/test_feat.py"])
         self.assertEqual(kw["mutation_min"], 0.5)
         self.assertEqual(kw["budget_s"], 100.0)
         self.assertGreaterEqual(kw["per_mutant_timeout_s"], 5.0)
