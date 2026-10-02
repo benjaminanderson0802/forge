@@ -9,5 +9,6 @@
   "max_parallel_idle": 3,
   "mail_per_hour": 3,
   "mail_per_day": 10,
-  "agent_runs_per_day": 100000
+  "agent_runs_per_day": 100000,
+  "self_fix": true
 }

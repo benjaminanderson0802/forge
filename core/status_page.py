@@ -31,7 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
-from core import channel, dashboard, lanes, readiness
+from core import blockers, channel, dashboard, lanes, readiness
 from core.usage import Meter
 
 PORT = 8765
@@ -426,6 +426,42 @@ def _live_coverage(lanes_: list[dict]) -> str:
                            "<span><i style=\"border:1px solid var(--line)\"></i>no task yet</span></div>")
 
 
+def _live_blockers(items) -> str:
+    """R66i: what blocks Forge, what it is fixing itself, and the ready fix kits (Copy, Do it)."""
+    items = [b for b in (items or []) if isinstance(b, dict)]
+    if not items:
+        return "<p class=muted>No blockers: nothing is stuck and nothing needs you.</p>"
+    chips = {"fixing": ("fixing", "warn"), "ready_for_ben": ("ready for you", "bad"), "fixed": ("fixed", "ok")}
+    out = []
+    for b in items:
+        label, cls = chips.get(b.get("status"), (str(b.get("status")), "muted"))
+        age = _dur(b.get("age_s")) if isinstance(b.get("age_s"), (int, float)) else "?"
+        part = [f"<div class='card blocker'><div><span class='chip {cls}'>{_e(label)}</span> "
+                f"<strong>{_e(b.get('summary'))}</strong> <span class=muted>({_e(b.get('lane'))}, {_e(b.get('kind'))}, "
+                f"{_e(b.get('id'))}, opened {_e(age)} ago, {_e(b.get('attempts'))} tries)</span></div>"]
+        kit = b.get("kit") if isinstance(b.get("kit"), dict) else None
+        if b.get("status") == "ready_for_ben" and kit:
+            part.append(f"<div>Why it needs you: {_e(kit.get('why'))}</div>")
+            part.append(f"<div>{_e(kit.get('where'))}: <code class=paste>{_e(kit.get('paste'))}</code> "
+                        f"<button type=button data-copy=\"{_e(kit.get('paste'))}\">Copy</button></div>")
+            if kit.get("script_text"):
+                part.append("<div class=muted>Do it runs exactly this prepared script (hidden, logged):</div>"
+                            f"<pre>{_e(kit.get('script_text'))}</pre>"
+                            "<form method=post action=\"/fix\">"
+                            f"<input type=hidden name=lane value=\"{_e(b.get('lane'))}\">"
+                            f"<input type=hidden name=id value=\"{_e(b.get('id'))}\">"
+                            f"<input type=hidden name=sha value=\"{_e(kit.get('script_sha256'))}\">"
+                            "<button type=submit>Do it</button></form>")
+            part.append(f"<div class=muted>When it's fixed: {_e(kit.get('expect'))}</div>")
+        run = b.get("run") if isinstance(b.get("run"), dict) else None
+        if run:
+            state = "running" if not run.get("finished_at") else f"finished (exit {run.get('exit')})"
+            part.append(f"<div class=muted>Do it run: {_e(state)}. Forge checks the result itself.</div>"
+                        + (f"<pre>{_e(run.get('log'))}</pre>" if run.get("log") else ""))
+        out.append("".join(part) + "</div>")
+    return "".join(out)
+
+
 def live_section(snap: dict, local_tz=None) -> str:
     """The live dashboard (R64) as one <section id=live>: the page embeds it and the script swaps it in place."""
     try:
@@ -434,7 +470,8 @@ def live_section(snap: dict, local_tz=None) -> str:
         upd = _clock(snap.get("generated_at"), local_tz, "%H:%M:%S")
         body = (f"<h2>Live</h2><p class='muted small'>Updated {_e(upd)} &middot; every ETA is an estimate from this "
                 "PC's own run history</p><div class=lanes>" + "".join(_live_lane(x, med, local_tz) for x in lanes_)
-                + "</div><h2>Whole project</h2>" + _live_project(snap.get("project") or {})
+                + "</div><h2>Blockers</h2>" + _live_blockers(snap.get("blockers"))
+                + "<h2>Whole project</h2>" + _live_project(snap.get("project") or {})
                 + "<h2>Tokens today</h2>" + _live_tokens(snap.get("tokens") or {}, snap.get("generated_at"), local_tz)
                 + "<h2>Who did what (last 12 hours)</h2>" + _live_gantt(snap.get("timeline") or {}, local_tz)
                 + "<h2>Spec coverage</h2>" + _live_coverage(lanes_))
@@ -463,6 +500,9 @@ var el=document.getElementById('live');if(el&&t.indexOf('<section id=live')===0)
 if(lost)lost.hidden=true;tick();var n=document.getElementById('live');
 if(n&&q0!==null&&n.getAttribute('data-questions')!==q0){if(!typing())location.reload();else if(qnote)qnote.hidden=false;}}).catch(function(){if(lost)lost.hidden=false;})
 .then(function(){busy=false;});}
+document.addEventListener('click',function(e){var b=e.target&&e.target.closest?e.target.closest('[data-copy]'):null;
+if(!b)return;var t=b.getAttribute('data-copy');if(navigator.clipboard)navigator.clipboard.writeText(t).then(function(){
+b.textContent='Copied';},function(){b.textContent='Select and copy the line';});});
 setInterval(poll,3000);setInterval(tick,1000);tick();})();"""
 
 
@@ -650,7 +690,7 @@ class AnswerOutbox:
 
 
 def make_server(state: Path, channel_dir: Path, limits: dict, host: str = "127.0.0.1", port: int = PORT,
-                local_tz=None, outbox: "AnswerOutbox | None" = None,
+                local_tz=None, outbox: "AnswerOutbox | None" = None, fix_runner=None,
                 shared: Path | None = None, forge_root: Path | None = None) -> ThreadingHTTPServer:
     """A server bound to the loopback address only (D-022). port=0 picks a free port (tests)."""
     if host not in LOOPBACK:
@@ -726,7 +766,7 @@ def make_server(state: Path, channel_dir: Path, limits: dict, host: str = "127.0
             if not self._host_ok() or not self._same_origin():
                 return self._send(403, "Forbidden")
             path = self.path.split("?", 1)[0]
-            if path not in ("/stop", "/answer"):
+            if path not in ("/stop", "/answer", "/fix"):
                 return self._send(404, "Not found")
             try:
                 n = int(self.headers.get("Content-Length") or 0)
@@ -746,6 +786,12 @@ def make_server(state: Path, channel_dir: Path, limits: dict, host: str = "127.0
                 (state / "KILL").write_text("stopped from the status page\n", encoding="utf-8")
                 if shared is not None:  # R60: the global KILL stops every lane
                     (Path(shared) / "KILL").write_text("stopped from the status page\n", encoding="utf-8")
+                return self._send(303, "", location="/")
+            if path == "/fix":  # R66i: Ben's Do it; runs only the exact prepared script he was shown
+                ok, msg = blockers.run_fix(state.parent, form.get("lane", ""), form.get("id", ""),
+                                           form.get("sha", ""), runner=fix_runner)
+                if not ok:
+                    return self._send(409, f"Not run: {_e(msg)}. Reload the page.")
                 return self._send(303, "", location="/")
             qid, code, answer = form.get("qid", ""), form.get("code", ""), form.get("answer", "").strip()
             if form.get("approve") == "y":  # the gate's Approve button: the same "y" an email reply would carry
