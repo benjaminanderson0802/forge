@@ -8,6 +8,8 @@ R57: per-task judges run python -m core.suite --changed <base>..<sha>, which run
   - every tests/core module that imports (directly or through other repo modules) a module the range changed,
   - the task's own test files (--include) and test modules the range itself changed,
   - every module listed in tests/core/FAST_MODULES.txt (regenerate with --write-fast).
+The very slow modules (DEFER_SLOW) are left out of --changed runs unless they are included or changed by the
+range; the layer gate and CI run them in the full suite.
 A change to a high-blast-radius path (HIGH_BLAST), or one the selection can't account for, runs the fast, included and changed-test modules per task (HIGH_BLAST); an unaccountable change runs the full suite."""
 from __future__ import annotations
 
@@ -144,6 +146,14 @@ def read_fast(root: Path) -> list[str]:
     return out
 
 
+# R57: modules that take many minutes (the first is also in SLOW_MODULES below). A per-task judge defers them to the
+# layer gate and CI (both run the full suite, with no --changed) unless the task includes them or its range changes them.
+DEFER_SLOW = frozenset({
+    "test_merge_pipeline", "test_planning_drift", "test_r63_evidence", "test_r65_evidence_rewrite",
+    "test_r66_blockers", "test_r66a_no_replan_pause", "test_readiness_cycle", "test_readiness_gating",
+})
+
+
 def _is_test_module(rel: str) -> bool:
     return bool(re.fullmatch(r"tests/core/test_\w+\.py", rel))
 
@@ -197,9 +207,15 @@ def select(root: Path, changed: list[str], include: list[str] | None = None) -> 
         if stem in all_tests:
             picked.add(stem)
     picked |= set(read_fast(root)) & all_tests
+    direct = {Path(c).stem for c in changed if _is_test_module(c)} | {
+        Path(i.replace("\\", "/")).stem for i in include or []}
+    deferred = sorted((picked & DEFER_SLOW) - direct)
+    picked -= set(deferred)
     why = f"{len(changed)} changed file(s), {len(picked)} of {len(all_tests)} modules selected"
     if high:
         why += f"; high-blast-radius change ({high[0]}): fast, included and changed-test modules only, the full suite runs at the layer gate and in CI"
+    if deferred:
+        why += "\nR57 deferred to gate/CI: " + ", ".join(deferred)
     return sorted(picked), why
 
 
