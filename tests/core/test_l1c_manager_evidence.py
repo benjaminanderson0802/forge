@@ -1,6 +1,7 @@
 """R63 evidence for design 2.1: Claude, read-only, schema-checked plans."""
 import json
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -149,6 +150,134 @@ class ManagerSchemaEvidence(unittest.TestCase):
             self.assertTrue(rows["PASSED"]["completed"])
             self.assertEqual(rows["CACHE_ONLY"]["status"], "done")
             self.assertFalse(rows["CACHE_ONLY"]["completed"])
+
+
+class ManagerBoundaryEvidence(unittest.TestCase):
+    requirements = {"1.2": "second alpha thing"}
+    ledger_header = "\n\nLEDGER (every contract; completed means the ledger holds its pass):\n"
+
+    class RecordingCoverage:
+        def __init__(self):
+            self.limits = []
+
+        def report(self, limit=None):
+            self.limits.append(limit)
+            return "COVREPORT"
+
+    @staticmethod
+    def rows(count, title="t"):
+        return [{"id": f"C{i:04d}", "title": title, "spec_ref": "s",
+                 "status": "open", "attempts": 0, "completed": False}
+                for i in range(count)]
+
+    def ledger_text(self, prompt):
+        return prompt.split(self.ledger_header, 1)[1].split("\n\nSPEC:\n", 1)[0]
+
+    def test_task_count_accepts_the_exact_limit(self):
+        self.assertEqual(manager.MAX_TASKS, 12)
+        for count in (manager.MAX_TASKS - 1, manager.MAX_TASKS,
+                      manager.MAX_TASKS + 1):
+            with self.subTest(count=count):
+                data = proposal(*(f"M{i}" for i in range(count)))
+                clean, problems = manager.validate_proposal(data, self.requirements, set())
+                if count <= manager.MAX_TASKS:
+                    self.assertEqual(clean, data["tasks"])
+                    self.assertEqual(len(clean), count)
+                    self.assertEqual(problems, [])
+                else:
+                    self.assertEqual(clean, [])
+                    self.assertTrue(problems)
+
+    def test_problem_report_is_capped_at_thirty(self):
+        invalid = {"id": "bad id!", "title": "", "section": "", "covers": [],
+                   "files_in_scope": [], "test_files": [], "test_cmd": "x", "zz": 1}
+        clean, problems = manager.validate_proposal(
+            {"tasks": [dict(invalid) for _ in range(manager.MAX_TASKS)]},
+            self.requirements, set())
+        self.assertEqual(clean, [])
+        self.assertEqual(len(problems), 30)
+
+        # Each task has three independent errors, giving exactly 29, 30 or 31.
+        for count in (29, 30, 31):
+            with self.subTest(problem_count=count):
+                data = proposal(*(f"M{i}" for i in range(10)))
+                for task in data["tasks"]:
+                    task.update(title="", section="", zz=1)
+                if count == 29:
+                    del data["tasks"][-1]["zz"]
+                elif count == 31:
+                    data["tasks"][-1]["covers"] = []
+                clean, problems = manager.validate_proposal(data, self.requirements, set())
+                self.assertEqual(clean, [])
+                self.assertEqual(len(problems), min(count, 30))
+
+    def test_ledger_attempts_default_to_zero_and_preserve_recorded_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = types.SimpleNamespace(
+                events_path=Path(tmp) / "no-such-events.jsonl",
+                contracts=lambda: {"C1": {}, "C2": {"attempts": 0},
+                                   "C3": {"attempts": 1}, "C4": {"attempts": 7}})
+            rows = manager.ledger_rows(ledger)
+        self.assertEqual([row["id"] for row in rows], ["C1", "C2", "C3", "C4"])
+        self.assertEqual([row["attempts"] for row in rows], [0, 0, 1, 7])
+        self.assertTrue(all(row["completed"] is False for row in rows))
+
+    def test_prompt_includes_at_most_four_hundred_ledger_rows(self):
+        for count in (399, 400, 401):
+            with self.subTest(count=count):
+                prompt = manager.build_prompt("spec", self.RecordingCoverage(),
+                                              self.rows(count), [])
+                ledger = self.ledger_text(prompt)
+                self.assertEqual(len(ledger.splitlines()), min(count, 400))
+                for i in range(min(count, 400)):
+                    self.assertIn(f"C{i:04d}", ledger)
+                self.assertNotIn("C0400", prompt)
+
+    def test_prompt_includes_at_most_twenty_reasons(self):
+        for count in (19, 20, 21):
+            with self.subTest(count=count):
+                reasons = [f"reason-{i:02d}" for i in range(count)]
+                prompt = manager.build_prompt("spec", self.RecordingCoverage(), [], reasons)
+                for reason in reasons[:20]:
+                    self.assertIn(reason, prompt)
+                self.assertNotIn("reason-20", prompt)
+                self.assertEqual(prompt.count("reason-"), min(count, 20))
+
+    def test_prompt_requests_thirty_thousand_coverage_characters(self):
+        cov = self.RecordingCoverage()
+        prompt = manager.build_prompt("spec", cov, [], [])
+        self.assertEqual(cov.limits, [30000])
+        self.assertIn("COVREPORT", prompt)
+
+    def test_prompt_ledger_character_limit(self):
+        # Measure the visible fixed row text, then fill titles to reach each
+        # boundary without triggering the independent row or title limits.
+        rows = self.rows(170, title="")
+        baseline = manager.build_prompt("spec", self.RecordingCoverage(), rows, [])
+        fixed_length = len(self.ledger_text(baseline))
+        for length in (39999, 40000, 40001):
+            with self.subTest(length=length):
+                rows = self.rows(170, title="")
+                remaining = length - fixed_length
+                self.assertGreater(remaining, 0)
+                for row in rows:
+                    added = min(remaining, 200)
+                    row["title"] = "x" * added
+                    remaining -= added
+                self.assertEqual(remaining, 0)
+                prompt = manager.build_prompt("spec", self.RecordingCoverage(), rows, [])
+                self.assertEqual(len(self.ledger_text(prompt)), min(length, 40000))
+
+    def test_prompt_spec_character_limit(self):
+        for length in (59999, 60000, 60001):
+            with self.subTest(length=length):
+                spec = "x" * (length - 1) + "Z"
+                prompt = manager.build_prompt(spec, self.RecordingCoverage(), [], [])
+                visible = prompt.split("\n\nSPEC:\n", 1)[1].split(
+                    "\n\nAnswer with JSON:", 1)[0]
+                self.assertEqual(visible, spec[:60000])
+                self.assertEqual(len(visible), min(length, 60000))
+                self.assertEqual("Z" in visible, length <= 60000)
 
 
 class ManagerConductorEvidence(DriftHarness):
