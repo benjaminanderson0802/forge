@@ -1,4 +1,4 @@
-"""Run the core test suite fast: each tests/core/test_*.py module in its own process, several at once.
+﻿"""Run the core test suite fast: each tests/core/test_*.py module in its own process, several at once.
 
 The full suite (python -m core.suite) runs at the layer gate and in CI. Run sequentially it takes about 20
 minutes on Ben's PC; in parallel it is bounded by its slowest module. Exit code 0 only if every module passed;
@@ -205,7 +205,17 @@ def changed_files(root: Path, rng: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------- running
+# Modules that take ~11 min alone and far longer under full parallel load get a longer limit, so a
+# whole-suite judge (high-blast changes) is not failed by load alone.
+SLOW_MODULES = {"test_merge_pipeline": 3.0}
+
+
+def module_timeout(name: str, timeout_s: float) -> float:
+    return timeout_s * SLOW_MODULES.get(name, 1.0)
+
+
 def run_module(root: Path, name: str, timeout_s: float) -> tuple[str, bool, str]:
+    timeout_s = module_timeout(name, timeout_s)
     try:
         p = subprocess.run([sys.executable, "-m", "unittest", f"tests.core.{name}"], cwd=str(root),
                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
