@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from core import suite
 from core.bootstrap import task_judge_cmds
@@ -86,6 +87,46 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(suite.select(self.root, ["core/a.py"])[0], ["test_a", "test_b", "test_c", "test_d", "test_s"])
 
 
+class DeferSlowTests(unittest.TestCase):
+    """A per-task judge defers the very slow modules to the layer gate and CI unless it must run them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        sample(self.root)
+        patcher = mock.patch.object(suite, "DEFER_SLOW", frozenset({"test_b", "test_c"}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_slow_modules_in_the_closure_are_deferred_and_named(self):
+        picked, why = suite.select(self.root, ["core/a.py"])
+        self.assertEqual(picked, ["test_a", "test_d", "test_s"])  # test_b is slow: deferred
+        self.assertIn("R57 deferred to gate/CI: test_b", why)
+
+    def test_included_and_changed_slow_modules_still_run(self):
+        picked, why = suite.select(self.root, ["core/a.py"], include=["tests/core/test_b.py"])
+        self.assertIn("test_b", picked)
+        self.assertNotIn("deferred", why)
+        picked, why = suite.select(self.root, ["tests/core/test_c.py"])
+        self.assertEqual(picked, ["test_c", "test_e"])
+        self.assertNotIn("deferred", why)
+
+    def test_high_blast_change_defers_slow_fast_listed_modules_too(self):
+        (self.root / suite.FAST_FILE).write_text("test_a  1.0\ntest_b  1.0\n", encoding="utf-8")
+        picked, why = suite.select(self.root, ["core/ledger.py"])
+        self.assertEqual(picked, ["test_a"])
+        self.assertIn("R57 deferred to gate/CI: test_b", why)
+
+    def test_nothing_deferred_without_slow_modules(self):
+        with mock.patch.object(suite, "DEFER_SLOW", frozenset()):
+            picked, why = suite.select(self.root, ["core/a.py"])
+        self.assertEqual(picked, ["test_a", "test_b", "test_d", "test_s"])
+        self.assertNotIn("deferred", why)
+
+
 class SuiteCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -129,6 +170,22 @@ class SuiteCliTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(ran, ["test_a"])
         self.assertIn("high-blast", out)
+
+    def test_changed_run_prints_the_deferred_line_and_skips_slow_modules(self):
+        base = self.commit(suite.FAST_FILE, "test_e  0.2\n")
+        sha = self.commit("core/a.py", "VALUE = 9\n")
+        with mock.patch.object(suite, "DEFER_SLOW", frozenset({"test_b"})):
+            code, ran, out = self.run_suite("--changed", f"{base}..{sha}")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(ran, ["test_a", "test_d", "test_e", "test_s"])
+        self.assertIn("R57 deferred to gate/CI: test_b", out)
+
+    def test_full_suite_without_changed_still_runs_slow_modules(self):
+        with mock.patch.object(suite, "DEFER_SLOW", frozenset({"test_b"})):
+            code, ran, out = self.run_suite()
+        self.assertEqual(ran, suite.modules(self.root))
+        self.assertIn("test_b", ran)
+        self.assertNotIn("deferred", out)
 
     def test_unreadable_range_fails_safe_to_the_full_suite(self):
         code, ran, out = self.run_suite("--changed", "nonexistent..alsonot")
