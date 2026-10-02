@@ -48,6 +48,7 @@ TASK_FIELDS = ("id", "title", "section", "files_in_scope", "test_files", "test_c
 NOTE_CAP, NOTES_KEEP, BODY_CAP = 2000, 30, 20000  # R19
 MIN_SECTION_CHARS = 600  # R41: a task's section is its builder's only instructions
 PLAN_REVIEW_MAX = 200_000  # R44: the plan reviewer sees the whole plan, up to this size
+MUTATION_BUDGET_MAX_S = 1800  # R68: the most the default mutation budget grows to
 JUDGE_TIMEOUT_S = 2400  # R55: a judge command (drills, the parallel suite) may run this long
 PLAN_ATTEMPTS = 3  # R45: a plan task is blocked after this many rejections
 PLAN_MEMORY_NOTES, PLAN_MEMORY_CHARS = 10, 12000  # R47
@@ -2292,11 +2293,14 @@ class Conductor(SelfFixMixin):
             try:
                 results = [("task tests", *self._run_tests(t, cwd=jw)[:2])]
                 baseline = time.monotonic() - started
+                stage_s = [("task tests", baseline)]  # R68: where a judge's time goes, logged below
                 for cmd in task_judge_cmds(self.judge_cmds, base, sha, t.get("test_files") or [],
                                            self._unbuilt_test_files(t["id"])):
                     if results[-1][1] != 0:
                         break
+                    t_cmd = time.monotonic()
                     results.append((cmd, *self._run_cmd(cmd, cwd=jw)))
+                    stage_s.append((cmd.split(" --")[0][:40], time.monotonic() - t_cmd))
             except Stopped:  # R42/R49: KILL during a judge: undone exactly like a stopped reviewer, never a failure
                 self._apply(f"{tag}-withdraw", "withdraw", cid, "forge-core")
                 self._reset_to(twt, base)
@@ -2311,7 +2315,10 @@ class Conductor(SelfFixMixin):
                     return fail(f"judge failed: {cmd}", sig, tail, submitted=True)
             self._apply(f"{tag}-ci", "test_run", cid, "ci", {"run_id": f"{tag}-ci", "commit": sha, "passed": True})
             # D-038: always before the reviewer, on the builder's own lines, at exactly S (never the layer checkout)
+            t_mut = time.monotonic()
             mres = self._mutation_judge(t, base, sha, baseline, jw)
+            stage_s.append(("mutation", time.monotonic() - t_mut))
+            self._log(f"judge timing {tid}: " + "; ".join(f"{n} {d:.0f}s" for n, d in stage_s))  # R68
         mutation = mres.as_dict()
 
         diff = _git(twt, "diff", f"{base}..{sha}")
@@ -2580,13 +2587,25 @@ class Conductor(SelfFixMixin):
             out.setdefault(f, set()).update(lines)
         return out
 
+    def _mutation_budget(self, baseline: float, max_mutants: int) -> float:
+        """R68: the total mutation budget. An explicit mutation_budget_s limit is used as is. Otherwise it is the
+        test timeout, grown (up to MUTATION_BUDGET_MAX_S) so that a task whose tests take minutes can finish its
+        sampled mutants: an incomplete run fails the attempt and costs a whole new judge."""
+        if "mutation_budget_s" in self.limits:
+            return float(self.limits["mutation_budget_s"])
+        floor = float(self.limits.get("test_timeout_s", 600))
+        return max(floor, min(MUTATION_BUDGET_MAX_S, 0.6 * max_mutants * baseline))
+
     def _run_mutation(self, root: Path, changed: dict, t: dict, timeout: float, baseline: float):
+        max_mutants = int(self.limits.get("mutation_max_mutants", 25))
+        # R68: -f (failfast). A mutant is killed by any failing test, so stopping at the first failure gives the
+        # same verdict as running them all, and a killed mutant costs seconds instead of the whole test run.
         return run_mutation(root, changed,
-                            [sys.executable, "-m", "unittest", *(parse_test_cmd(t["test_cmd"], t["test_files"]) or [])],
+                            [sys.executable, "-m", "unittest", "-f", *(parse_test_cmd(t["test_cmd"], t["test_files"]) or [])],
                             mutation_min=float(self.limits.get("mutation_min", 0.8)),
-                            budget_s=float(self.limits.get("mutation_budget_s", self.limits.get("test_timeout_s", 600))),
+                            budget_s=self._mutation_budget(baseline, max_mutants),
                             per_mutant_timeout_s=min(timeout, max(5.0, 3 * baseline)),
-                            max_mutants=int(self.limits.get("mutation_max_mutants", 25)))
+                            max_mutants=max_mutants)
 
     @staticmethod
     def _survivor_listing(mres) -> str:
