@@ -8,7 +8,7 @@ R57: per-task judges run python -m core.suite --changed <base>..<sha>, which run
   - every tests/core module that imports (directly or through other repo modules) a module the range changed,
   - the task's own test files (--include) and test modules the range itself changed,
   - every module listed in tests/core/FAST_MODULES.txt (regenerate with --write-fast).
-A change to a high-blast-radius path (HIGH_BLAST), or one the selection can't account for, runs the full suite."""
+A change to a high-blast-radius path (HIGH_BLAST), or one the selection can't account for, runs the fast, included and changed-test modules per task (HIGH_BLAST); an unaccountable change runs the full suite."""
 from __future__ import annotations
 
 import argparse
@@ -26,7 +26,7 @@ NOWIN = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {
 
 FAST_FILE = "tests/core/FAST_MODULES.txt"
 FAST_LIMIT_S = 20.0
-# R57: a change to any of these runs the full suite (they reach nearly everything, often without an import).
+# R57: these reach nearly everything without an import; per-task judges run only the fast, included and changed-test modules for them, and the layer gate and CI run the full suite.
 HIGH_BLAST = ("core/bootstrap.py", "core/ledger.py", "core/agents.py", "core/protect.py", "drills/")
 # Paths no test can depend on through code: changes here select nothing by themselves.
 INERT = ("docs/", ".github/")
@@ -152,9 +152,11 @@ def select(root: Path, changed: list[str], include: list[str] | None = None) -> 
     """R57: the test modules to run for these changed paths. (None, why) means run the full suite."""
     root = Path(root)
     changed = sorted({c.replace("\\", "/").strip() for c in changed if c and c.strip()})
+    high: list[str] = []
     for c in changed:
         if any(c == h or (h.endswith("/") and c.startswith(h)) for h in HIGH_BLAST):
-            return None, f"high-blast-radius change: {c}"
+            high.append(c)
+            continue
         if c.endswith(".py") and not (root / c).exists():  # a deleted module: its importers are unknowable now
             return None, f"deleted module: {c}"
     graph, srcs = import_graph(root)
@@ -162,6 +164,8 @@ def select(root: Path, changed: list[str], include: list[str] | None = None) -> 
     changed_mods: set[str] = set()
     picked: set[str] = set()
     for c in changed:
+        if c in high:  # per-task judges skip the full-suite closure; the layer gate and CI run everything
+            continue
         name = _mod_of(c)
         if name is not None:
             changed_mods.add(name)
@@ -193,7 +197,10 @@ def select(root: Path, changed: list[str], include: list[str] | None = None) -> 
         if stem in all_tests:
             picked.add(stem)
     picked |= set(read_fast(root)) & all_tests
-    return sorted(picked), f"{len(changed)} changed file(s), {len(picked)} of {len(all_tests)} modules selected"
+    why = f"{len(changed)} changed file(s), {len(picked)} of {len(all_tests)} modules selected"
+    if high:
+        why += f"; high-blast-radius change ({high[0]}): fast, included and changed-test modules only, the full suite runs at the layer gate and in CI"
+    return sorted(picked), why
 
 
 def changed_files(root: Path, rng: str) -> list[str]:
