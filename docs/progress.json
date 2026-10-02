@@ -1,12 +1,33 @@
 {
   "note": "Roadmap phases for the status page's progress bar. Update 'done' when a phase's gate passes (docs/ROADMAP.md).",
   "phases": [
-    {"name": "0. Trusted core", "done": true},
-    {"name": "1. Orchestrator loop", "done": false},
-    {"name": "2. Auditor + Challenger", "done": false},
-    {"name": "3. Account Factory + hands", "done": false},
-    {"name": "4. Learner", "done": false},
-    {"name": "5. Scout + Optimizer", "done": false},
-    {"name": "6. Venture runner", "done": false}
+    {
+      "name": "0. Trusted core",
+      "done": true
+    },
+    {
+      "name": "1. Orchestrator loop",
+      "done": true
+    },
+    {
+      "name": "2. Auditor + Challenger",
+      "done": false
+    },
+    {
+      "name": "3. Account Factory + hands",
+      "done": false
+    },
+    {
+      "name": "4. Learner",
+      "done": false
+    },
+    {
+      "name": "5. Scout + Optimizer",
+      "done": false
+    },
+    {
+      "name": "6. Venture runner",
+      "done": false
+    }
   ]
 }
