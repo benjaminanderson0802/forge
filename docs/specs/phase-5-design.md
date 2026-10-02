@@ -37,7 +37,7 @@ Marketplaces are a malware route (a fake email server copied every email to an a
 | Optimizer | Claude, read-only | `state/optimizer/proposal.json` only | `S_OPTIMIZE`: one proposed change with the metric it targets |
 | Applier, Rollbacker, Retirer | plain code | tunables overlay, tool install dir, skill status | none |
 
-- **Role instructions** live in protected files `agents/scout.md`, `agents/optimizer.md` and `agents/access_reviewer.md`, read through `core/roles.role_text`.
+- **Role instructions** live in protected files `agents/scout.md`, `agents/optimizer.md` and `agents/access_reviewer.md`, read through `core/roles.role_text`. **Registering the Scout, Optimizer and access reviewer:** each new role goes into `roles.EXTRA_ROLES` and `EXTRA_DEFAULTS`, onto `Team` as a plain class attribute defaulting to None (`scout = None`, and so on), and into `SMOKE_ROLES` (skipped when the member is None); `ROLE_NAMES`, `DEFAULTS` and the six `Team` fields are never changed (D-072; interface as written in `docs/specs/phase-3-design.md`, role `registrar`).
 - **Ledger identities** `forge-scout` (role `scout`) and `forge-optimizer` (role `optimizer`) are added to `roles.json` (protected). Vetter, trial runner, applier, rollbacker and retirer events are applied by `forge-core`. The Optimizer and the Scout never apply anything; they only propose.
 - **Engines are fixed by role (D-020).** The access reviewer is Codex and therefore independent of the Claude Scout whose candidate it reviews. When Codex is capped or held the review waits; it never falls back to Claude.
 
