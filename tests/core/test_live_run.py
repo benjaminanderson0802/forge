@@ -1509,7 +1509,17 @@ class R39SmokeCleanupTests(Harness):
                 raise PermissionError("R39 fake child process still holds this folder")
             return remove(path, *args, **kwargs)
 
-        with patch("shutil.rmtree", side_effect=busy_builder), patch("time.sleep") as sleep:
+        import threading
+        import time as _time
+        real_sleep, me, mine = _time.sleep, threading.current_thread(), []
+
+        def sleep_here(seconds):  # only this thread's sleeps count; background threads really sleep
+            if threading.current_thread() is me:
+                mine.append((seconds,))
+            else:
+                real_sleep(seconds)
+
+        with patch("shutil.rmtree", side_effect=busy_builder), patch("time.sleep", side_effect=sleep_here):
             problems = (bootstrap._guarded_smoke(c, self.work) if guarded
                         else bootstrap.smoke(team, self.work))
         with self.subTest(check="cleanup failure is not a smoke problem"):
@@ -1520,7 +1530,7 @@ class R39SmokeCleanupTests(Harness):
             self.assertEqual(len(attempts), 5)
             self.assertEqual(len(set(attempts)), 1)
         with self.subTest(check="two seconds between attempts"):
-            self.assertEqual([call.args for call in sleep.call_args_list], [(2,)] * 4)
+            self.assertEqual(mine, [(2,)] * 4)
         self.assertTrue(attempts[0].is_dir())
         if guarded:
             with self.subTest(check="conductor logs the leftover folder"):

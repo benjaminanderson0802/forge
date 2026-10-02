@@ -6,7 +6,7 @@
 
 ## Now
 
-- **Phase 1 (orchestrator loop) gate passed, 2026-10-01 (D-039).** Each roadmap gate item and its evidence on Ben's PC:
+- **Phase 1 (orchestrator loop) gate passed, 2026-10-01 (D-044).** Each roadmap gate item and its evidence on Ben's PC:
   - full cycle from the ledger alone: drills 5 (crash and restart mid-project) and 13 (a fresh Manager sees the ledger only) pass;
   - kill switch mid-cycle: drill 14 passes (and the R49 mid-run stop was exercised live today);
   - daily cap: drill 4 passes (over-budget work parked);

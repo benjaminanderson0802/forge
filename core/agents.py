@@ -350,7 +350,8 @@ class ClaudeAgent:
         if not base:
             return AgentResult("", 0, False, f"agent command not found: {self.cmd[0]}", None, "claude")
         sid = str(uuid.uuid4())  # R46: known up front, so a failed run can still be metered from its log
-        args = base + ["-p", "--output-format", "json", "--permission-mode", self.permission_mode, "--session-id", sid]
+        args = base + ["-p", "--output-format", "json", "--permission-mode", self.permission_mode, "--session-id", sid,
+                          "--strict-mcp-config"]  # no MCP servers: faster start, no helper windows or processes
         if self.allowed_tools:
             args += ["--allowedTools", ",".join(self.allowed_tools)]
         if schema:
