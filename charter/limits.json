@@ -6,6 +6,7 @@
   "readiness_fail_retry_s": 60,
   "ai_check_ttl_h": 6,
   "test_timeout_s": 600,
+  "mutation_budget_s": 2400,
   "mutation_min": 0.8,
   "max_parallel_idle": 3,
   "mail_per_hour": 3,
