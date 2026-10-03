@@ -35,6 +35,7 @@ Rules enforced:
     the log, never the contract cache
   * merge evidence: a "pass" may carry task_commit, final_sha and merges,
     each merge backed by a CI run recorded for its exact sha
+  * agent runs: the core records each completed agent run (role, run id, time) so scores have a ledger-backed denominator
 """
 from __future__ import annotations
 
@@ -60,6 +61,8 @@ ACTIONS = {
     "unpark":   ({"human"}, {"parked"}, "open"),
     "usage":    ({"executor", "core"}, {"claimed", "submitted"}, None),
     "test_run": ({"ci"}, None, None),
+    # one completed agent run, written by the conductor after the run; needs no contract
+    "agent_run": ({"core"}, None, None),
     # written by the runner (plain code), never by an agent
     "run_report": ({"core"}, {"claimed", "submitted"}, None),
     # a run that died: back to open, and the lost attempt still counts
@@ -262,6 +265,13 @@ class Ledger:
             if not isinstance(run_id, str) or not isinstance(commit, str) or not isinstance(passed, bool):
                 raise Rejected("test_run needs run_id, commit, passed")
             runs[run_id] = {"contract_id": cid, "commit": commit, "passed": passed}
+        elif action == "agent_run":
+            for field, limit in (("role", 60), ("run_id", 200)):
+                v = payload.get(field)
+                if not isinstance(v, str) or not v or len(v) > limit:
+                    raise Rejected(f"agent_run {field} must be non-empty text of at most {limit} characters")
+            if "at" in payload and (not isinstance(payload["at"], str) or len(payload["at"]) > 64):
+                raise Rejected("agent_run at must be text of at most 64 characters")
         elif action == "run_report":
             if cid not in contracts:
                 raise Rejected(f"no contract {cid}")
