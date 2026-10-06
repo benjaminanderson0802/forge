@@ -112,6 +112,9 @@ S_PLAN_REVIEW = _obj({"verdict": {"type": "string", "enum": ["pass", "fail"]}, "
 S_TROUBLE = _obj({"kind": {"type": "string", "enum": ["fix", "dead_end", "suggestion"]}, "notes": _STR,
                   "alternative": _STR}, ["kind", "notes"])
 S_DRIFT = _obj({"status": {"type": "string", "enum": ["ok", "replan"]}, "reasons": _STRS}, ["status"])
+# D-037 / P2B: only the verdict is shape-checked; plain code judges the missing fields later.
+S_CHALLENGE = _obj({"verdict": {"type": "string", "enum": ["overturned", "stands"]}, "route": _STR, "tried": _STRS,
+                    "error": _STR, "proof": {"type": "string", "enum": ["patch", "capability"]}}, ["verdict"])
 S_PLAN = _obj({"tasks": {"type": "array", "items": _obj(
     {"id": _STR, "title": _STR, "section": _STR, "files_in_scope": _STRS, "test_files": _STRS, "test_cmd": _STR,
      "needs": {"type": "array", "items": {"type": "string"}},
@@ -129,6 +132,9 @@ class Team:
     troubleshooter: object
     drift_keeper: object
     planner: object
+    # P2B extra member: a plain class attribute, not a dataclass field, so Team(<six roles>) and vars() are
+    # unchanged. None means every challenger feature is off and the conductor behaves as Layer 1.
+    challenger = None
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> str:
@@ -651,6 +657,7 @@ class Conductor(SelfFixMixin):
         provider = getattr(agent, "provider", None)
         self._raise_if_stopped()  # R42/R49: checked before every launch, probes included
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + role + "-" + uuid.uuid4().hex[:6]
+        self.last_run_id = run_id  # P2B: set before the agent is launched
         d = self.state / "runs" / run_id
         self._admit(provider, d)  # R60: check-and-reserve, atomic across lanes
         (d / "prompt.md").write_bytes(prompt.encode("utf-8"))
@@ -1328,7 +1335,7 @@ class Conductor(SelfFixMixin):
     def _prompt_blocks(self, role: str) -> str:
         """Appended to every prompt (never prepended): the capability map; dead ends for builder/troubleshooter."""
         out = "\n\n" + self._map_block() + "\n"
-        if role in ("builder", "troubleshooter"):
+        if role in ("builder", "troubleshooter", "challenger"):  # P2B: the challenger sees dead ends too
             dead = self._dead_block()
             if dead:
                 out += "\n" + dead + "\n"
@@ -2208,6 +2215,9 @@ class Conductor(SelfFixMixin):
             prompt += "\nREVIEW FEEDBACK:\n" + "\n".join(f"- {x}" for x in t["review_feedback"]) + "\n"
         if t.get("trouble_notes"):
             prompt += "\nTROUBLESHOOTER NOTES:\n" + "\n".join(t["trouble_notes"]) + "\n"
+        routes = t.get("challenger_routes") or []
+        if routes:  # P2B: the challenger's verified route(s), latest three
+            prompt += "\nCHALLENGER ROUTE:\n" + "\n".join(f"- {str(x)[:NOTE_CAP]}" for x in routes[-3:]) + "\n"
         prompt += ("\nAnswer with JSON: {\"status\": \"done\" | \"blocked\", \"summary\": \"...\"}. "
                    "A blocked answer must also include all four of: \"tried\" (at least 2 different routes you "
                    "actually tried), \"error\" (the real error output), \"capability\" (the capability-map name you "
@@ -2234,7 +2244,13 @@ class Conductor(SelfFixMixin):
         out_of_scope = [f for f in changed if not any(fnmatch.fnmatch(f, pat) for pat in t["files_in_scope"])]
 
         def fail(reason: str, sig: str, output: str = "", submitted: bool = False,
+                 suppress_handoff: bool = False,
                  payload: dict | None = None, handoff: bool = False, focus: bool = False) -> None:
+            try:  # P2B: the failed attempt's work is kept on the task for the challenger before the reset
+                diff = self._attempt_diff(twt, base)[:20000]
+            except (RuntimeError, OSError) as e:
+                diff = f"(diff unavailable: {e})"
+            self._update(tid, last_attempt_diff=diff)
             self._reset_to(twt, base)
             if submitted:
                 self._apply(f"{tag}-fail", "fail", cid, "forge-auditor", payload)
@@ -2242,7 +2258,8 @@ class Conductor(SelfFixMixin):
                 self._apply(f"{tag}-release", "release", cid, "forge-core")
             if self._ledger().contracts().get(cid, {}).get("status") == "failed":
                 self._apply(f"{tag}-reopen", "reopen", cid, "forge-manager")
-            self._after_failure(tid, reason, sig, output, handoff=handoff, focus=focus)
+            self._after_failure(tid, reason, sig, output, handoff=handoff, focus=focus,
+                                suppress_handoff=suppress_handoff)
 
         if committed is not None:  # Live-run P1: the commit was already undone; the attempt is out of scope
             hit = [f for f in committed if f in tests]
@@ -2704,11 +2721,14 @@ class Conductor(SelfFixMixin):
         return f"focus limit: {limit / 60:g} minutes of builder time without passing (D-026); handed to the Troubleshooter"
 
     def _after_failure(self, tid: str, reason: str, sig: str, output: str, handoff: bool = False,
+                       suppress_handoff: bool = False,
                        focus: bool = False) -> None:
         t = self._task(tid)
         sigs = t["fail_signatures"] + [sig]
         fails = t.get("fails_since", 0) + 1
         t = self._update(tid, fail_signatures=sigs, fails_since=fails, notes=t["notes"] + [reason])
+        if suppress_handoff:  # P2B: recorded as usual, but no Troubleshooter call and no block decision
+            return
         zero_progress = len(sigs) >= 2 and sigs[-1] == sigs[-2]
         rounds = t.get("troubleshoots", 0)
         if rounds >= 3:
@@ -3539,7 +3559,7 @@ def real_probes(limits: dict) -> dict:
 def real_team(limits: dict) -> Team:
     from core.agents import ClaudeAgent, CodexAgent
     t = limits.get("agent_timeout_s", 1800)
-    return Team(test_writer=CodexAgent(t, sandbox="workspace-write"),
+    team = Team(test_writer=CodexAgent(t, sandbox="workspace-write"),
                 builder=ClaudeAgent(t, permission_mode="acceptEdits",
                                     allowed_tools=["Read", "Edit", "Write", "Glob", "Grep", "Bash(python:*)"]),
                 reviewer=CodexAgent(t, sandbox="read-only"),
@@ -3549,6 +3569,8 @@ def real_team(limits: dict) -> Team:
                 drift_keeper=ClaudeAgent(t, permission_mode="plan", allowed_tools=["Read", "Glob", "Grep"]),
                 planner=ClaudeAgent(t, permission_mode="acceptEdits",
                                     allowed_tools=["Read", "Edit", "Write", "Glob", "Grep"]))
+    team.challenger = CodexAgent(t, sandbox="workspace-write")  # P2B: always Codex, never replaced by Claude (D-020)
+    return team
 
 
 def real_manager(limits: dict):
@@ -3587,6 +3609,8 @@ SMOKE_ROLES = {  # role: (schema, writes a file?, example answer)
     "troubleshooter": (S_TROUBLE, None, '{"kind": "fix", "notes": "ok"}'),
     "drift_keeper": (S_DRIFT, False, '{"status": "ok", "reasons": []}'),
     "planner": (S_PLAN, True, '{"tasks": []}'),
+    "challenger": (S_CHALLENGE, True,
+                   '{"verdict": "stands", "route": "smoke", "tried": ["a", "b"], "error": "smoke", "proof": "patch"}'),
 }
 
 
@@ -3649,6 +3673,8 @@ def smoke(team: Team, workdir: Path, call: Callable | None = None,
                 pass
 
     for role, (schema, writes, example) in SMOKE_ROLES.items():
+        if getattr(team, role, None) is None:  # P2B: an absent extra member (e.g. no challenger) is not smoked
+            continue
         # Plain mkdir, not mkdtemp: on Windows mkdtemp locks the folder to this user, and Codex's sandbox runs as
         # a separate user, so files it wrote there could not be read back.
         root = Path(workdir) / f"forge-smoke-{tag}{role}-{uuid.uuid4().hex[:8]}"

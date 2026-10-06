@@ -45,11 +45,34 @@ DEFAULTS: dict[str, str] = {
 }
 
 
+# Roles beyond the six Layer 1 roles (P2B, D-037). They share the same file rules; a later extra role (an
+# auditor, for example) joins by adding its name here and its default to EXTRA_DEFAULTS.
+EXTRA_ROLE_NAMES = ("challenger",)
+EXTRA_ROLES = EXTRA_ROLE_NAMES  # D-072's name for the same list
+
+EXTRA_DEFAULTS: dict[str, str] = {
+    "challenger": (
+        "You are the CHALLENGER.\n"
+        "Another agent (the claimant) says a task is blocked or a route is a dead end. Your job is to find a "
+        "working route. You win only if plain code verifies it; your word alone counts for nothing.\n"
+        "You work only in your scratch worktree, which is discarded after your run. Never edit test files.\n"
+        "Answer \"overturned\" with proof \"patch\" when your edits make the task's tests pass (or fail less), "
+        "or with proof \"capability\" when the capability's readiness check passes now. Name the route you "
+        "used.\n"
+        "Otherwise answer \"stands\" with at least 2 routes you actually tried that differ from the claimant's, "
+        "plus the real error output.\n"
+        "Answer with JSON matching the schema given in the prompt."),
+}
+
+
 def role_text(repo: Path, role: str) -> str:
     """The standing instructions for `role`: <repo>/agents/<role>.md, or the built-in default."""
-    if role not in ROLE_NAMES:
+    if role in ROLE_NAMES:
+        default = DEFAULTS[role]
+    elif role in EXTRA_ROLE_NAMES:
+        default = EXTRA_DEFAULTS[role]
+    else:
         raise ValueError(f"unknown role {role!r}")
-    default = DEFAULTS[role]
     path = Path(repo) / "agents" / f"{role}.md"
     try:
         if not path.is_file():
